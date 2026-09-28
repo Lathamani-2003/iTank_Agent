@@ -147,7 +147,7 @@
     if(!key)return;
     try{
       sessionStorage.setItem(key,JSON.stringify({
-        route_draft_version:"orthogonal-flowchart-v74-arrow-endpoint-drag",
+        route_draft_version:"orthogonal-candidate-v82",
         routes:Object.values(routes).map(r=>({
           edge_id:String(r.edge_id||""),
           points:clonePoints(r.points)
@@ -169,9 +169,12 @@
     // Keep the current draft version and every existing movement behavior.
     // This fix only prevents a newly regenerated automatic route from being
     // combined with an older browser-local component position.
-    const restoreRoutes=saved.route_draft_version==="orthogonal-flowchart-v74-arrow-endpoint-drag";
+    const restoreRoutes=saved.route_draft_version==="orthogonal-candidate-v82";
     const savedRoutes=new Map((saved.routes||[]).map(r=>[String(r.edge_id||""),r]));
     const savedComponents=new Map((saved.components||[]).map(c=>[String(c.instance_id||""),c]));
+    const currentComponentIds=Object.keys(components).map(id=>String(id)).sort().join("|");
+    const savedComponentIds=[...savedComponents.keys()].sort().join("|");
+    const sameComponentSet=currentComponentIds===savedComponentIds;
 
     // Capture the server-generated component boxes and the exact port reference
     // used by each fresh route BEFORE restoring any browser-local movement.
@@ -195,13 +198,15 @@
 
     Object.values(routes).forEach(r=>{
       delete r.arrow_control;
-      if(!restoreRoutes)return;
+      if(!restoreRoutes || !sameComponentSet)return;
       const s=savedRoutes.get(String(r.edge_id||""));
       if(!s)return;
       if(Array.isArray(s.points)&&s.points.length>=2)r.points=clonePoints(s.points);
     });
 
-    if(restoreRoutes){
+    if(restoreRoutes && !sameComponentSet){
+      try{sessionStorage.removeItem(key);}catch(_){}
+    }else if(restoreRoutes){
       Object.values(components).forEach(c=>{
         const s=savedComponents.get(String(c.instance_id||""));
         if(s&&Array.isArray(s.box)&&s.box.length===4)c.box=cloneBox(s.box);

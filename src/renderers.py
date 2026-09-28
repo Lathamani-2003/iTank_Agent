@@ -4,6 +4,7 @@ import heapq
 import math
 import textwrap
 import threading
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1517,6 +1518,9 @@ def compute_layout_boxes(diagram: DiagramSpec):
 
         if not _layout_has_overlap(items, gap_x=0.10, gap_y=0.09):
             break
+
+    if selection_mode:
+        _realign_shared_diagram_axes(items)
 
     values = {
         item.node.id: (item.x - item.w / 2, item.y - item.h / 2, item.w, item.h)
@@ -4206,6 +4210,141 @@ def _build_selection_mode_edge_routes(diagram: DiagramSpec, boxes):
     return _selection_mode_repair_conflicts(diagram, boxes, routes)
 
 
+def _shared_trunk_has_branches(trunk_refs, segment_refs, eps: float) -> bool:
+    """True when overlapping collinear segments are a tapped manifold.
+
+    A vertical or horizontal trunk with two or more perpendicular branches is one
+    shared line. Separating those segments would turn that fan into parallel strokes.
+    """
+    del eps
+    if len(trunk_refs) < 2:
+        return False
+    orientation = trunk_refs[0]["ori"]
+    coordinate = float(trunk_refs[0]["coord"])
+    span_lo = min(float(ref["lo"]) for ref in trunk_refs)
+    span_hi = max(float(ref["hi"]) for ref in trunk_refs)
+    taps = set()
+    for ref in segment_refs:
+        if ref["ori"] == orientation:
+            continue
+        meets_trunk = (
+            abs(float(ref["lo"]) - coordinate) <= 0.05
+            or abs(float(ref["hi"]) - coordinate) <= 0.05
+        )
+        along = float(ref["coord"])
+        if meets_trunk and span_lo - 0.05 <= along <= span_hi + 0.05:
+            taps.add(round(along, 2))
+    return len(taps) >= 2
+
+
+def _repeated_stroke(refs) -> bool:
+    """Overlapping copies of one segment are the same backbone stroke."""
+    if len(refs) < 2:
+        return False
+    lo = min(float(ref["lo"]) for ref in refs)
+    hi = max(float(ref["hi"]) for ref in refs)
+    return all(abs(float(ref["lo"]) - lo) <= 0.05 and abs(float(ref["hi"]) - hi) <= 0.05 for ref in refs)
+
+
+def _cards_overlap(a, b, gap_x: float = 0.08, gap_y: float = 0.06) -> bool:
+    overlap_x = (a.w + b.w) / 2.0 + gap_x - abs(a.x - b.x)
+    overlap_y = (a.h + b.h) / 2.0 + gap_y - abs(a.y - b.y)
+    return overlap_x > 0 and overlap_y > 0
+
+
+def _realign_shared_diagram_axes(items) -> None:
+    """Put components that share a diagram row or column back on that line.
+
+    Collision spacing can nudge a stack sideways. The structured bus needs the
+    stack on one axis and a clear channel beside it.
+    """
+    if len(items) < 3:
+        return
+    for axis in ("x", "y"):
+        groups = defaultdict(list)
+        for item in items:
+            groups[round(float(getattr(item.node, axis)), 2)].append(item)
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            anchors = sorted(float(getattr(item, "desired_" + axis)) for item in group)
+            anchor = anchors[len(anchors) // 2]
+            saved = [(item, float(getattr(item, axis))) for item in group]
+            for item, _old in saved:
+                setattr(item, axis, anchor)
+                _clamp_center(item)
+            if any(
+                _cards_overlap(item, other)
+                for item, _old in saved
+                for other in items
+                if other is not item
+            ):
+                for item, old in saved:
+                    setattr(item, axis, old)
+                    _clamp_center(item)
+
+    columns = []
+    rows = []
+    by_x = defaultdict(list)
+    by_y = defaultdict(list)
+    for item in items:
+        by_x[round(float(item.node.x), 2)].append(item)
+        by_y[round(float(item.node.y), 2)].append(item)
+    for group in by_x.values():
+        if len(group) >= 2 and max(item.y for item in group) - min(item.y for item in group) >= 0.8:
+            columns.append(group)
+    for group in by_y.values():
+        if len(group) >= 2 and max(item.x for item in group) - min(item.x for item in group) >= 0.8:
+            rows.append(group)
+    if not columns or not rows:
+        return
+    column = max(columns, key=len)
+    row = max(rows, key=len)
+    if {item.node.id for item in column} & {item.node.id for item in row}:
+        return
+    col_right = max(item.x + item.w / 2.0 for item in column)
+    col_left = min(item.x - item.w / 2.0 for item in column)
+    row_left = min(item.x - item.w / 2.0 for item in row)
+    row_right = max(item.x + item.w / 2.0 for item in row)
+    col_cx = sum(item.x for item in column) / len(column)
+    row_cx = sum(item.x for item in row) / len(row)
+    needed = 0.95
+    if row_cx >= col_cx:
+        gap = row_left - col_right
+        shift = needed - gap
+        if shift <= 0.05:
+            return
+        room = min(CONTENT_RIGHT - (item.x + item.w / 2.0) for item in row)
+        shift = min(shift, max(0.0, room))
+        if shift <= 0.05:
+            return
+        saved = [(item, item.x) for item in row]
+        for item, _old in saved:
+            item.x += shift
+            _clamp_center(item)
+        if any(_cards_overlap(item, other) for item, _old in saved for other in items if other.node.id not in {member.node.id for member in row}):
+            for item, old in saved:
+                item.x = old
+                _clamp_center(item)
+    else:
+        gap = col_left - row_right
+        shift = needed - gap
+        if shift <= 0.05:
+            return
+        room = min((item.x - item.w / 2.0) - CONTENT_LEFT for item in row)
+        shift = min(shift, max(0.0, room))
+        if shift <= 0.05:
+            return
+        saved = [(item, item.x) for item in row]
+        for item, _old in saved:
+            item.x -= shift
+            _clamp_center(item)
+        if any(_cards_overlap(item, other) for item, _old in saved for other in items if other.node.id not in {member.node.id for member in row}):
+            for item, old in saved:
+                item.x = old
+                _clamp_center(item)
+
+
 def _visually_separate_shared_connection_segments(routes, lane_gap: float = 0.18):
     """Return visually separated copies of routed polylines.
 
@@ -4291,6 +4430,11 @@ def _visually_separate_shared_connection_segments(routes, lane_gap: float = 0.18
 
             edge_ids = sorted({refs[idx]["edge"] for idx in component})
             if len(edge_ids) < 2:
+                continue
+            chosen_refs = [refs[idx] for idx in component]
+            if _shared_trunk_has_branches(chosen_refs, segment_refs, eps):
+                continue
+            if _repeated_stroke(chosen_refs):
                 continue
             lane_by_edge = {
                 edge_id: (pos - (len(edge_ids) - 1) / 2.0) * float(lane_gap)

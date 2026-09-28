@@ -246,6 +246,70 @@ def layout_active_connections(
     return result
 
 
+def _node_kind(label: str) -> str:
+    text = str(label or "").lower()
+    if "oht" in text:
+        return "oht"
+    if "bore" in text or "well" in text:
+        return "bore"
+    if "sump" in text:
+        return "sump"
+    return ""
+
+
+def _box_of(box_map: dict, node_id: str):
+    box = box_map.get(node_id)
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None
+    try:
+        x, y, w, h = [float(value) for value in box]
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return [x, y, w, h]
+
+
+def _top(box) -> list[float]:
+    return [box[0] + box[2] / 2.0, box[1]]
+
+
+def _side_center(box, from_x: float) -> list[float]:
+    y = box[1] + box[3] / 2.0
+    if from_x >= box[0] + box[2] / 2.0:
+        return [box[0] + box[2], y]
+    return [box[0], y]
+
+
+def _cluster_sumps(box_map: dict, labels: dict[str, str], pinned: set[str]) -> None:
+    """Seat every unpinned sump in one bottom-left row, clear of the bore well."""
+    sumps = []
+    for node_id, label in labels.items():
+        if node_id in pinned or _node_kind(label) != "sump":
+            continue
+        box = _box_of(box_map, node_id)
+        if box is not None:
+            sumps.append((node_id, box))
+    if len(sumps) < 2:
+        return
+    sumps.sort(key=lambda item: (item[1][0], item[0]))
+    anchor = sumps[0][1]
+    x = anchor[0]
+    y = max(box[1] for _node_id, box in sumps)
+    gap = 0.28
+    for node_id, box in sumps:
+        box_map[node_id] = [x, y, box[2], box[3]]
+        x += box[2] + gap
+
+
+def _write_route(route: dict, points: list[list[float]]) -> None:
+    cleaned = _orthogonalize(points)
+    if len(cleaned) < 2:
+        return
+    route["points"] = cleaned
+    route["original_points"] = [list(point) for point in cleaned]
+
+
 def apply_worksheet_graph(
     routes: list[dict],
     box_map: dict,
@@ -255,54 +319,76 @@ def apply_worksheet_graph(
     pinned_ids: Iterable[str] = (),
     manual_edge_ids: Iterable[str] = (),
 ) -> None:
-    """Write the cached Graphviz layout into the live worksheet routes.
+    """Draw the worksheet pipes as the marked side bus.
 
-    Manual drag overrides are left untouched. A cache hit does no Graphviz work.
+    Sumps stay in one left-hand row. Each sump rises to a header and that
+    header enters the OHT from the side. The bore well rises above the row
+    and drops onto each sump top, so no pipe crosses a component image.
+    Dragged components and hand-edited routes are left unchanged.
     """
+    del canvas_width, canvas_height
     pinned = {str(node_id) for node_id in pinned_ids}
     manual = {str(edge_id) for edge_id in manual_edge_ids}
-    active = []
+    _cluster_sumps(box_map, labels, pinned)
+
+    kinds = {node_id: _node_kind(label) for node_id, label in labels.items()}
+    sump_boxes = []
+    for node_id, kind in kinds.items():
+        if kind != "sump":
+            continue
+        box = _box_of(box_map, node_id)
+        if box is not None:
+            sump_boxes.append(box)
+    if not sump_boxes:
+        return
+
+    sump_top = min(box[1] for box in sump_boxes)
+    header_y = sump_top - 0.62
+    feed_y = sump_top - 0.30
+
     for route in routes:
         if not isinstance(route, dict) or route.get("hidden") or route.get("dotted"):
             continue
+        edge_id = str(route.get("edge_id", "") or "")
+        if edge_id in manual:
+            continue
         source = str(route.get("source", "") or "")
         target = str(route.get("target", "") or "")
-        edge_id = str(route.get("edge_id", "") or "")
-        if not source or not target or not edge_id:
+        source_box = _box_of(box_map, source)
+        target_box = _box_of(box_map, target)
+        if source_box is None or target_box is None:
             continue
-        active.append((edge_id, source, target))
-    if not active:
-        return
+        source_kind = kinds.get(source) or _node_kind(source)
+        target_kind = kinds.get(target) or _node_kind(target)
 
-    node_ids = sorted({node for _edge, source, target in active for node in (source, target)})
-    nodes = [(node_id, str(labels.get(node_id) or node_id)) for node_id in node_ids]
-    layout = layout_active_connections(nodes, active, canvas_width, canvas_height)
-    if not layout:
-        return
-
-    for node_id, graph_box in layout["boxes"].items():
-        if node_id in pinned:
-            continue
-        current = box_map.get(node_id)
-        cx = float(graph_box[0]) + float(graph_box[2]) / 2.0
-        cy = float(graph_box[1]) + float(graph_box[3]) / 2.0
-        if isinstance(current, (list, tuple)) and len(current) == 4:
-            width, height = float(current[2]), float(current[3])
-        else:
-            width, height = float(graph_box[2]), float(graph_box[3])
-        box_map[node_id] = [cx - width / 2.0, cy - height / 2.0, width, height]
-
-    for route in routes:
-        edge_id = str(route.get("edge_id", "") or "")
-        if edge_id in manual or route.get("hidden") or route.get("dotted"):
-            continue
-        points = layout["routes"].get(edge_id)
-        source_box = box_map.get(str(route.get("source", "") or ""))
-        target_box = box_map.get(str(route.get("target", "") or ""))
-        if not points or not source_box or not target_box:
-            continue
-        snapped = _snap_endpoints(points, source_box, target_box)
-        if len(snapped) < 2:
-            continue
-        route["points"] = snapped
-        route["original_points"] = [list(point) for point in snapped]
+        if source_kind == "sump" and target_kind == "oht":
+            start = _top(source_box)
+            tank_face = _side_center(target_box, start[0])
+            riser_x = target_box[0] - 0.34 if start[0] <= tank_face[0] else target_box[0] + target_box[2] + 0.34
+            _write_route(route, [
+                start,
+                [start[0], header_y],
+                [riser_x, header_y],
+                [riser_x, tank_face[1]],
+                tank_face,
+            ])
+        elif source_kind == "bore" and target_kind == "sump":
+            start = _top(source_box)
+            end = _top(target_box)
+            _write_route(route, [
+                start,
+                [start[0], feed_y],
+                [end[0], feed_y],
+                end,
+            ])
+        elif source_kind == "bore" and target_kind == "oht":
+            start = _top(source_box)
+            tank_face = _side_center(target_box, start[0])
+            riser_x = target_box[0] - 0.34 if start[0] <= tank_face[0] else target_box[0] + target_box[2] + 0.34
+            _write_route(route, [
+                start,
+                [start[0], header_y],
+                [riser_x, header_y],
+                [riser_x, tank_face[1]],
+                tank_face,
+            ])

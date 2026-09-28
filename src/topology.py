@@ -153,11 +153,9 @@ def _distribution_points(
     """Create a clean reference-style manifold through a target field.
 
     This rule is universal and component-independent.  The target geometry decides
-    whether the manifold is horizontal or vertical.  The main trunk is placed on
-    the side of the target row/column *away from the feeder source*, leaving short
-    uniform branch drops/rises into the destinations.  That produces the clean
-    engineering structure shown in the user's reference without checking any
-    component name or type.
+    whether the manifold is horizontal or vertical.  The trunk sits on the side
+    of the target row or column that faces the feeder, with a short branch into
+    each destination and one elbow from the feeder into that trunk.
     """
     if not target_nodes:
         return []
@@ -175,15 +173,17 @@ def _distribution_points(
         ordered = sorted(target_nodes, key=lambda node: (node.x, node.y, node.id))
         target_y = median([float(node.y) for node in ordered])
         source_y = float(source_node.y)
-        away = -1.0 if source_y >= target_y else 1.0
-        trunk_y = _clamp(target_y + away * clearance)
+        # Keep the trunk between the target row and the feeder, so each branch
+        # is a short drop and the feeder meets that trunk with one elbow.
+        toward = 1.0 if source_y >= target_y else -1.0
+        trunk_y = _clamp(target_y + toward * clearance)
         return [(_clamp(float(node.x)), trunk_y) for node in ordered]
 
     ordered = sorted(target_nodes, key=lambda node: (node.y, node.x, node.id))
     target_x = median([float(node.x) for node in ordered])
     source_x = float(source_node.x)
-    away = -1.0 if source_x >= target_x else 1.0
-    trunk_x = _clamp(target_x + away * clearance)
+    toward = 1.0 if source_x >= target_x else -1.0
+    trunk_x = _clamp(target_x + toward * clearance)
     return [(trunk_x, _clamp(float(node.y))) for node in ordered]
 
 

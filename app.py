@@ -30,7 +30,6 @@ from dotenv import load_dotenv
 from google import genai
 
 from src.ai_pipeline import analyze_sketch, review_diagram
-from src.graphviz_schema import apply_worksheet_graph
 import src.component_catalog as component_catalog_module
 from src.component_catalog import (
     COMPONENT_CATALOG,
@@ -427,20 +426,24 @@ st.set_page_config(
 # version and invalidate only routing-geometry caches; no connection rules, UI,
 # arrow behavior, component behavior, or renderer styling are changed.
 def _activate_current_connection_router_runtime() -> None:
-    runtime_fix_key = "_connection_router_runtime_nonoverlap_v3_20260909"
+    global component_catalog_module, get_preview_route_geometry, renderers_module
+    runtime_fix_key = "_connection_router_runtime_orthogonal_candidates_v85"
     if st.session_state.get(runtime_fix_key):
         return
 
     try:
         connection_router_module = importlib.import_module("src.connection_router")
         connection_router_module = importlib.reload(connection_router_module)
+        topology_module = importlib.import_module("src.topology")
+        importlib.reload(topology_module)
+        component_catalog_module = importlib.reload(component_catalog_module)
+        renderers_module = importlib.reload(renderers_module)
 
         # build_edge_routes() resolves this global from src.renderers at call time.
-        # Rebinding it is enough to use the refreshed router without reloading or
-        # rewriting any renderer function.
         renderers_module.plan_connection_routes = (
             connection_router_module.plan_connection_routes
         )
+        get_preview_route_geometry = renderers_module.get_preview_route_geometry
 
         geometry_cache = getattr(
             renderers_module,
@@ -5629,6 +5632,27 @@ components.html(
       .includes('Select connection or control option...');
   }
 
+  function isComponentPairSelect(targetOrSelect) {
+    if (!targetOrSelect || targetOrSelect.nodeType !== 1) return false;
+
+    const keyed = targetOrSelect.closest?.(
+      '[class*="st-key-connection_from_"], [class*="st-key-connection_to_"]'
+    );
+    if (keyed) return true;
+
+    const selectEl = targetOrSelect.matches?.('[data-baseweb="select"]')
+      ? targetOrSelect
+      : targetOrSelect.closest?.('[data-baseweb="select"]');
+    if (!selectEl) return false;
+
+    const input = selectEl.querySelector('input');
+    const placeholder = String(input?.getAttribute('placeholder') || '').trim();
+    if (placeholder === 'Select Component') return true;
+
+    const ariaLabel = String(input?.getAttribute('aria-label') || '').trim();
+    return ariaLabel === 'Connect from' || ariaLabel === 'Connect to';
+  }
+
   function isSavedWorksheetPptSelect(targetOrSelect) {
     if (!targetOrSelect || targetOrSelect.nodeType !== 1) return false;
     return Boolean(
@@ -5672,10 +5696,9 @@ components.html(
       return;
     }
 
-    // 2A second dropdown: opening/touching the box is never a processing
-    // action. Arm the following portal option click, but keep the worksheet
-    // loading overlay hidden until an actual option is selected.
-    if (isConnectionConfigSelect(target)) {
+    // 2A dropdowns: opening the arrow is never a processing action.
+    // Keep the worksheet loading overlay hidden until an actual option is selected.
+    if (isConnectionConfigSelect(target) || isComponentPairSelect(target)) {
       state.selectArmedUntil = Date.now() + 10000;
       state.connectionConfigAwaitingChoice = true;
       hideOverlay();
@@ -5723,10 +5746,10 @@ components.html(
       return;
     }
 
-    // Second 2A box: a normal click is only opening/focusing the dropdown.
-    // Never show the worksheet loader here. The actual component/option click
-    // is handled exclusively by the [role="option"] pointerdown branch above.
-    if (isConnectionConfigSelect(target)) {
+    // Required-connection dropdowns: a normal click only opens the list.
+    // Never show the worksheet loader here. The actual option click is handled
+    // by the [role="option"] pointerdown branch above.
+    if (isConnectionConfigSelect(target) || isComponentPairSelect(target)) {
       state.selectArmedUntil = Date.now() + 10000;
       state.connectionConfigAwaitingChoice = true;
       hideOverlay();
@@ -10181,6 +10204,37 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
     component_overrides = dict(
         st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
     )
+    layout_signature = tuple(sorted(
+        str(getattr(node, "id", "") or "")
+        for node in (getattr(diagram, "nodes", []) or [])
+        if str(getattr(node, "node_type", "") or "") != "junction"
+    ))
+    layout_signature_key = f"_auto_layout_component_ids_{worksheet_id}"
+    layout_rule_key = f"_auto_layout_rule_{worksheet_id}"
+    layout_rule = "sumps-left-oht-top-v2"
+    if (
+        st.session_state.get(layout_signature_key) != layout_signature
+        or st.session_state.get(layout_rule_key) != layout_rule
+    ):
+        release_ids = [
+            str(getattr(node, "id", "") or "")
+            for node in (getattr(diagram, "nodes", []) or [])
+            if str(getattr(node, "node_type", "") or "") in {"sump", "oht"}
+        ]
+        if release_ids:
+            for node_id in release_ids:
+                saved = dict(component_overrides.get(node_id) or {})
+                if "box" not in saved:
+                    continue
+                saved.pop("box", None)
+                if saved:
+                    component_overrides[node_id] = saved
+                else:
+                    component_overrides.pop(node_id, None)
+            st.session_state[_manual_component_overrides_key(worksheet_id)] = component_overrides
+            st.session_state[f"_release_sump_layout_{worksheet_id}"] = True
+        st.session_state[layout_signature_key] = layout_signature
+        st.session_state[layout_rule_key] = layout_rule
     geometry, normal_base_png, normal_base_b64, normal_components = _get_cached_worksheet_render_bundle(
         diagram,
         worksheet_id,
@@ -10308,11 +10362,19 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                     existing["image_fit"] = recovered["image_fit"]
 
     saved_editor_state = st.session_state.get("editor_saved_state") or {}
+    release_sump_layout = bool(st.session_state.pop(f"_release_sump_layout_{worksheet_id}", False))
+    released_sump_ids = {
+        str(getattr(node, "id", "") or "")
+        for node in (getattr(diagram, "nodes", []) or [])
+        if str(getattr(node, "node_type", "") or "") in {"sump", "oht"}
+    } if release_sump_layout else set()
     if isinstance(saved_editor_state, dict):
         for item in list(saved_editor_state.get("components", []) or []):
             if not isinstance(item, dict):
                 continue
             node_id = str(item.get("instance_id", "") or "")
+            if node_id in released_sump_ids:
+                continue
             raw_box = item.get("box")
             if node_id and isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
                 try:
@@ -10321,6 +10383,235 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                     pass
             if node_id and bool(item.get("hidden", False)):
                 hidden.add(node_id)
+    # ------------------------------------------------------------------
+    # Targeted layout rule: 1 Bore Well + 2 Sumps + 1 OHT Tank
+    # ------------------------------------------------------------------
+    # Apply ONLY after the Required Connections for this exact pattern are
+    # active. Initial component-only placement remains unchanged. Existing
+    # manual component moves still win because nodes with a saved box override
+    # are not forced back to this default layout.
+    _black_layout_active = False
+    _black_layout_ids = {}
+
+    # ------------------------------------------------------------------
+    # Targeted layout rule: 1 Bore Well + 1 Sump + N OHT Tanks (N >= 2)
+    # ------------------------------------------------------------------
+    # Layout matches the hand-drawn sketch:
+    #
+    #   [OHT1]  [OHT2]  [OHT3]  [OHT4]   <- spread across top
+    #     |       |       |       |        <- vertical drops from header
+    #     +-------+-------+-------+        <- horizontal header bus
+    #             |                        <- vertical riser from Sump
+    #   [Sump1] <---------------[Bore1]   <- horizontal at bottom
+    #
+    _moht_layout_active = False
+    _moht_layout_ids = {}   # {"sump": id, "borewell": id, "ohts": [id, ...]}
+
+    _layout_nodes = [
+        node for node in (getattr(diagram, "nodes", []) or [])
+        if str(getattr(node, "node_type", "") or "") != "junction"
+    ]
+    _layout_by_component = {}
+    for _layout_node in _layout_nodes:
+        _layout_component = _component_name_from_diagram_node(_layout_node)
+        _layout_by_component.setdefault(_layout_component, []).append(_layout_node)
+
+    _layout_sumps = list(_layout_by_component.get("Sump", []) or [])
+    _layout_borewells = list(_layout_by_component.get("Bore Well", []) or [])
+    _layout_ohts = list(_layout_by_component.get("OHT Tank", []) or [])
+
+    # Positions stay where the worksheet already placed them. Routes come from
+    # the geometry router, not from a fixed component template.
+    if False and len(_layout_sumps) == 2 and len(_layout_borewells) == 1 and len(_layout_ohts) == 1:
+        def _instance_order(_node):
+            _label = str(getattr(_node, "label", "") or "")
+            _match = re.search(r"(\d+)\s*$", _label)
+            return int(_match.group(1)) if _match else 10**9
+
+        _layout_sumps.sort(key=_instance_order)
+        _sump1_id = str(getattr(_layout_sumps[0], "id", "") or "")
+        _sump2_id = str(getattr(_layout_sumps[1], "id", "") or "")
+        _borewell_id = str(getattr(_layout_borewells[0], "id", "") or "")
+        _oht_id = str(getattr(_layout_ohts[0], "id", "") or "")
+
+        _expected_pairs = {
+            (_borewell_id, _sump1_id),
+            (_borewell_id, _sump2_id),
+            (_sump1_id, _oht_id),
+            (_sump2_id, _oht_id),
+        }
+        _diagram_pairs = {
+            (
+                str(getattr(_edge, "source", "") or ""),
+                str(getattr(_edge, "target", "") or ""),
+            )
+            for _edge in (getattr(diagram, "edges", []) or [])
+        }
+        _route_pairs = {
+            (
+                str(_route.get("source", "") or ""),
+                str(_route.get("target", "") or ""),
+            )
+            for _route in dict(geometry.get("routes", {}) or {}).values()
+            if isinstance(_route, dict)
+        }
+
+        # Some generated graphs include routing junctions, so use the direct
+        # rendered/diagram pairs when available and fall back to the selected
+        # Required Connection count for this exact four-node case.
+        _selected_required_count = len(
+            list(st.session_state.get("selected_connections", []) or [])
+        )
+        _black_layout_active = (
+            _expected_pairs.issubset(_diagram_pairs | _route_pairs)
+            or _selected_required_count >= 3
+        )
+
+        if _black_layout_active:
+            _black_layout_ids = {
+                "sump1": _sump1_id,
+                "sump2": _sump2_id,
+                "borewell": _borewell_id,
+                "oht": _oht_id,
+            }
+
+            # Exact black-sketch composition:
+            #   Sump 2       ------------------------> OHT Tank 1
+            #                 |
+            #   Sump 1        |                 <----- Bore Well 1
+            #
+            # Keep good margins from the worksheet edges and preserve each
+            # component's existing width/height.
+            _target_centres = {
+                _sump2_id: (0.19 * canvas_width, 0.31 * canvas_height),
+                _sump1_id: (0.19 * canvas_width, 0.69 * canvas_height),
+                _oht_id: (0.82 * canvas_width, 0.31 * canvas_height),
+                _borewell_id: (0.82 * canvas_width, 0.52 * canvas_height),
+            }
+
+            for _node_id, (_cx, _cy) in _target_centres.items():
+                _box = box_map.get(_node_id)
+                if not _valid_component_box(_box):
+                    continue
+                _bx, _by, _bw, _bh = [float(_v) for _v in _box]
+                _margin = 0.20
+                _nx = max(_margin, min(canvas_width - _bw - _margin, _cx - _bw / 2.0))
+                _ny = max(_margin, min(canvas_height - _bh - _margin, _cy - _bh / 2.0))
+                box_map[_node_id] = [_nx, _ny, _bw, _bh]
+
+            # Keep sprite metadata aligned with the new renderer boxes.
+            for _item in list(normal_components or []):
+                if not isinstance(_item, dict):
+                    continue
+                _iid = str(_item.get("instance_id", "") or "")
+                if _iid in _target_centres and _valid_component_box(box_map.get(_iid)):
+                    _item["box"] = list(box_map[_iid])
+
+    # ------------------------------------------------------------------
+    # Targeted layout: 1 Bore Well + 1 Sump + N OHT Tanks  (N >= 2)
+    # Only applies when the 2-sump layout is NOT active.
+    # ------------------------------------------------------------------
+    elif False and len(_layout_sumps) == 1 and len(_layout_borewells) == 1 and len(_layout_ohts) >= 2:
+        def _instance_order_moht(_node):
+            _label = str(getattr(_node, "label", "") or "")
+            _m = re.search(r"(\d+)\s*$", _label)
+            return int(_m.group(1)) if _m else 10**9
+
+        _layout_ohts.sort(key=_instance_order_moht)
+        _moht_sump_id = str(getattr(_layout_sumps[0], "id", "") or "")
+        _moht_bwid = str(getattr(_layout_borewells[0], "id", "") or "")
+        _moht_oht_ids = [str(getattr(_n, "id", "") or "") for _n in _layout_ohts]
+
+        # The layout activates once every Sump->OHT and Bore->Sump
+        # connection is selected (or when >= 2 connections are active).
+        _moht_expected = (
+            {(_moht_bwid, _moht_sump_id)}
+            | {(_moht_sump_id, _oid) for _oid in _moht_oht_ids}
+        )
+        _moht_diagram_pairs = {
+            (
+                str(getattr(_edge, "source", "") or ""),
+                str(getattr(_edge, "target", "") or ""),
+            )
+            for _edge in (getattr(diagram, "edges", []) or [])
+        }
+        _moht_route_pairs = {
+            (
+                str(_route.get("source", "") or ""),
+                str(_route.get("target", "") or ""),
+            )
+            for _route in dict(geometry.get("routes", {}) or {}).values()
+            if isinstance(_route, dict)
+        }
+        _moht_selected_count = len(
+            list(st.session_state.get("selected_connections", []) or [])
+        )
+        _moht_layout_active = (
+            _moht_expected.issubset(_moht_diagram_pairs | _moht_route_pairs)
+            or _moht_selected_count >= 2
+        )
+
+        if _moht_layout_active:
+            _moht_layout_ids = {
+                "sump": _moht_sump_id,
+                "borewell": _moht_bwid,
+                "ohts": _moht_oht_ids,
+            }
+
+            # Position components:
+            #   OHT Tanks  - spread evenly across the top band
+            #   Sump       - bottom-left
+            #   Bore Well  - bottom-right
+            _n_ohts = len(_moht_oht_ids)
+            _margin_moht = 0.15
+            _top_y = 0.22 * canvas_height
+            _bot_y = 0.75 * canvas_height
+
+            _x_lo = _margin_moht
+            _x_hi = canvas_width - _margin_moht
+
+            for _idx, _oht_id_m in enumerate(_moht_oht_ids):
+                if _n_ohts == 1:
+                    _cx = (canvas_width / 2.0)
+                else:
+                    _cx = _x_lo + (_x_hi - _x_lo) * (_idx / (_n_ohts - 1))
+                _box = box_map.get(_oht_id_m)
+                if not _valid_component_box(_box):
+                    continue
+                _bx, _by, _bw, _bh = [float(_v) for _v in _box]
+                _nx = max(_margin_moht, min(canvas_width - _bw - _margin_moht, _cx - _bw / 2.0))
+                _ny = max(_margin_moht, min(canvas_height - _bh - _margin_moht, _top_y - _bh / 2.0))
+                box_map[_oht_id_m] = [_nx, _ny, _bw, _bh]
+
+            # Sump: bottom-left
+            _sump_box = box_map.get(_moht_sump_id)
+            if _valid_component_box(_sump_box):
+                _sbx, _sby, _sbw, _sbh = [float(_v) for _v in _sump_box]
+                _sump_cx = 0.18 * canvas_width
+                _sump_cy = _bot_y
+                _nx = max(_margin_moht, min(canvas_width - _sbw - _margin_moht, _sump_cx - _sbw / 2.0))
+                _ny = max(_margin_moht, min(canvas_height - _sbh - _margin_moht, _sump_cy - _sbh / 2.0))
+                box_map[_moht_sump_id] = [_nx, _ny, _sbw, _sbh]
+
+            # Bore Well: bottom-right
+            _bore_box = box_map.get(_moht_bwid)
+            if _valid_component_box(_bore_box):
+                _bbx, _bby, _bbw, _bbh = [float(_v) for _v in _bore_box]
+                _bore_cx = 0.82 * canvas_width
+                _bore_cy = _bot_y
+                _nx = max(_margin_moht, min(canvas_width - _bbw - _margin_moht, _bore_cx - _bbw / 2.0))
+                _ny = max(_margin_moht, min(canvas_height - _bbh - _margin_moht, _bore_cy - _bbh / 2.0))
+                box_map[_moht_bwid] = [_nx, _ny, _bbw, _bbh]
+
+            # Keep sprite metadata aligned with repositioned boxes.
+            _moht_all_moved = set(_moht_oht_ids) | {_moht_sump_id, _moht_bwid}
+            for _item in list(normal_components or []):
+                if not isinstance(_item, dict):
+                    continue
+                _iid = str(_item.get("instance_id", "") or "")
+                if _iid in _moht_all_moved and _valid_component_box(box_map.get(_iid)):
+                    _item["box"] = list(box_map[_iid])
+
     hotspots = []
     for node in (getattr(diagram, "nodes", []) or []):
         node_id = str(getattr(node, "id", "") or "")
@@ -10342,83 +10633,240 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
     # movement in the normal Worksheet. Existing click-to-connect, + duplicate,
     # delete, rendering, export and Edit Mode behavior remain unchanged.
     normal_routes = []
+
+    def _route_payload(_edge_id, _route, _points):
+        _route_is_dotted = bool(_route.get("dotted", False))
+        _worksheet_route_color = "#000000" if _route_is_dotted else "#123DBD"
+        return {
+            "edge_id": str(_edge_id),
+            "points": _points,
+            "original_points": _points,
+            "color": _worksheet_route_color,
+            "dotted": _route_is_dotted,
+            "direction": _route.get("edge_direction", "source_to_target"),
+            "original_direction": _route.get(
+                "original_edge_direction",
+                _route.get("edge_direction", "source_to_target"),
+            ),
+            "source": str(_route.get("source", "") or ""),
+            "target": str(_route.get("target", "") or ""),
+            "hidden": bool(_route.get("hidden", False)),
+            "arrow_control": (
+                route_overrides.get(str(_edge_id), {}).get("arrow_control")
+            ),
+        }
+
+    _special_route_points = {}
+    if _black_layout_active and _black_layout_ids:
+        _sid1 = _black_layout_ids["sump1"]
+        _sid2 = _black_layout_ids["sump2"]
+        _bwid = _black_layout_ids["borewell"]
+        _oid = _black_layout_ids["oht"]
+
+        _b1 = box_map.get(_sid1)
+        _b2 = box_map.get(_sid2)
+        _bbw = box_map.get(_bwid)
+        _bo = box_map.get(_oid)
+
+        if all(_valid_component_box(_b) for _b in (_b1, _b2, _bbw, _bo)):
+            _x1, _y1, _w1, _h1 = [float(_v) for _v in _b1]
+            _x2, _y2, _w2, _h2 = [float(_v) for _v in _b2]
+            _xb, _yb, _wb, _hb = [float(_v) for _v in _bbw]
+            _xo, _yo, _wo, _ho = [float(_v) for _v in _bo]
+
+            # Ports sit on the facing edges. Nothing is drawn through an image.
+            _s1_r = [_x1 + _w1, _y1 + _h1 * 0.50]
+            _s2_r = [_x2 + _w2, _y2 + _h2 * 0.50]
+            _bw_l = [_xb, _yb + _hb * 0.50]
+            _o_l = [_xo, _yo + _ho * 0.50]
+            _bus_x = max(_s1_r[0], _s2_r[0]) + 0.35
+            _oht_y = _o_l[1]
+            _bore_y = _bw_l[1]
+
+            # Black sketch: one riser beside the stacked sumps, an upper run to
+            # the OHT, and a lower run to the bore well.
+            _special_route_points = {
+                (_sid2, _oid): [
+                    _s2_r,
+                    [_bus_x, _s2_r[1]],
+                    [_bus_x, _oht_y],
+                    _o_l,
+                ],
+                (_sid1, _oid): [
+                    _s1_r,
+                    [_bus_x, _s1_r[1]],
+                    [_bus_x, _oht_y],
+                    _o_l,
+                ],
+                (_bwid, _sid2): [
+                    _bw_l,
+                    [_bus_x, _bore_y],
+                    [_bus_x, _s2_r[1]],
+                    _s2_r,
+                ],
+                (_bwid, _sid1): [
+                    _bw_l,
+                    [_bus_x, _bore_y],
+                    [_bus_x, _s1_r[1]],
+                    _s1_r,
+                ],
+            }
+            for _edge in (getattr(diagram, "edges", []) or []):
+                _pair = (
+                    str(getattr(_edge, "source", "") or ""),
+                    str(getattr(_edge, "target", "") or ""),
+                )
+                _drawn = _special_route_points.get(_pair)
+                if _drawn is None:
+                    _drawn = _special_route_points.get((_pair[1], _pair[0]))
+                    if _drawn is not None:
+                        _drawn = list(reversed(_drawn))
+                if _drawn is not None:
+                    _special_route_points[("edge", str(getattr(_edge, "id", "") or ""))] = _drawn
+
+    elif _moht_layout_active and _moht_layout_ids:
+        # ------------------------------------------------------------------
+        # Route computation for 1 Bore Well + 1 Sump + N OHT Tanks layout
+        # ------------------------------------------------------------------
+        # Sketch topology:
+        #   Bore Well  ──(horizontal)──>  Sump (right face of bore, left face of sump)
+        #   Sump top   ──(riser up)──>  header_y
+        #   header_y   ──(horizontal to each OHT drop-x)──>  OHT top
+        # ------------------------------------------------------------------
+        _ms_id = _moht_layout_ids["sump"]
+        _mb_id = _moht_layout_ids["borewell"]
+        _mo_ids = _moht_layout_ids["ohts"]
+
+        _ms_box = box_map.get(_ms_id)
+        _mb_box = box_map.get(_mb_id)
+        _mo_boxes = [box_map.get(_oid_m) for _oid_m in _mo_ids]
+
+        if (
+            _valid_component_box(_ms_box)
+            and _valid_component_box(_mb_box)
+            and all(_valid_component_box(_b) for _b in _mo_boxes)
+        ):
+            _msx, _msy, _msw, _msh = [float(_v) for _v in _ms_box]
+            _mbx, _mby, _mbw, _mbh = [float(_v) for _v in _mb_box]
+
+            # Key ports
+            # Sump: top-centre for the riser, left-centre for bore connection
+            _sump_top = [_msx + _msw / 2.0, _msy]
+            _sump_left = [_msx, _msy + _msh / 2.0]
+            # Bore Well: right-centre going into Sump
+            _bore_right = [_mbx + _mbw, _mby + _mbh / 2.0]
+
+            # Horizontal header sits above the highest OHT tank
+            _header_y = min(
+                float(box_map.get(_oid_m, [0, 0, 0, 0])[1]) for _oid_m in _mo_ids
+            ) - 0.35
+            _header_y = max(_header_y, 0.08 * canvas_height)
+
+            # Riser x: use the left-centre x of the sump (or top-centre x)
+            _riser_x = _sump_top[0]
+
+            _special_route_points = {}
+
+            # Bore Well -> Sump  (horizontal at bottom)
+            _special_route_points[(_mb_id, _ms_id)] = [
+                _bore_right,
+                [_bore_right[0] + 0.10, _bore_right[1]],
+                [_sump_left[0] - 0.10, _sump_left[1]],
+                _sump_left,
+            ]
+
+            # Sump -> each OHT Tank
+            for _oid_m, _obox in zip(_mo_ids, _mo_boxes):
+                _ox, _oy, _ow, _oh = [float(_v) for _v in _obox]
+                # OHT entry: top-centre, pipe drops from header
+                _oht_drop_x = _ox + _ow / 2.0
+                _oht_top = [_oht_drop_x, _oy]
+                # Route: Sump top -> riser to header_y -> horizontal to drop_x -> OHT top
+                _special_route_points[(_ms_id, _oid_m)] = [
+                    _sump_top,
+                    [_riser_x, _header_y],
+                    [_oht_drop_x, _header_y],
+                    _oht_top,
+                ]
+
+            # Register routes by diagram edge id too
+            for _edge in (getattr(diagram, "edges", []) or []):
+                _pair = (
+                    str(getattr(_edge, "source", "") or ""),
+                    str(getattr(_edge, "target", "") or ""),
+                )
+                _drawn = _special_route_points.get(_pair)
+                if _drawn is None:
+                    _drawn = _special_route_points.get((_pair[1], _pair[0]))
+                    if _drawn is not None:
+                        _drawn = list(reversed(_drawn))
+                if _drawn is not None:
+                    _special_route_points[("edge", str(getattr(_edge, "id", "") or ""))] = _drawn
+
     for edge_id, route in dict(geometry.get("routes", {}) or {}).items():
         if not isinstance(route, dict):
             continue
-        # Keep the existing engineering relationship classification unchanged:
-        # renderer-dotted routes are unit/communication links; all other routes
-        # are water links. Wireless selection must not convert a water pipe into
-        # a unit-to-unit dotted line.
-        route_is_dotted = bool(route.get("dotted", False))
 
-        # Fixed visual standard only:
-        # water connection = blue solid; unit-to-unit = black dotted.
-        worksheet_route_color = "#000000" if route_is_dotted else "#123DBD"
+        _source_id = str(route.get("source", "") or "")
+        _target_id = str(route.get("target", "") or "")
+        _points = _special_route_points.get((_source_id, _target_id))
+        if _points is None:
+            _points = _special_route_points.get(("edge", str(edge_id)))
 
-        normal_routes.append(
-            {
-                "edge_id": str(edge_id),
-                "points": route.get("points", []),
-                "original_points": route.get("original_points", route.get("points", [])),
-                "color": worksheet_route_color,
-                "dotted": route_is_dotted,
-                "direction": route.get("edge_direction", "source_to_target"),
-                "original_direction": route.get(
-                    "original_edge_direction",
-                    route.get("edge_direction", "source_to_target"),
-                ),
-                "source": str(route.get("source", "") or ""),
-                "target": str(route.get("target", "") or ""),
-                "hidden": bool(route.get("hidden", False)),
-                "arrow_control": (
-                    route_overrides
-                    .get(str(edge_id), {})
-                    .get("arrow_control")
-                ),
-            }
+        # If a renderer reports a logically identical route in reverse endpoint
+        # order, reverse the prepared path while preserving its route metadata.
+        if _points is None:
+            _reverse_points = _special_route_points.get((_target_id, _source_id))
+            if _reverse_points is not None:
+                _points = list(reversed(_reverse_points))
+
+        if _points is None:
+            _points = route.get("points", [])
+
+        # Old automatic geometry stays at the previous component positions.
+        # For both targeted layouts, drop every route that is not one of
+        # the sketch paths so stale lines cannot remain.
+        _any_special_layout = (
+            (_black_layout_active or _moht_layout_active) and _special_route_points
         )
+        if _any_special_layout:
+            _matched = (
+                (_source_id, _target_id) in _special_route_points
+                or ("edge", str(edge_id)) in _special_route_points
+                or (_target_id, _source_id) in _special_route_points
+            )
+            if not _matched and not bool(route.get("dotted", False)):
+                _hidden_route = dict(route)
+                _hidden_route["hidden"] = True
+                normal_routes.append(_route_payload(edge_id, _hidden_route, _points))
+                continue
 
-    node_labels = {
-        str(getattr(node, "id", "") or ""): str(
-            getattr(node, "label", "") or getattr(node, "id", "") or ""
-        )
-        for node in (getattr(diagram, "nodes", []) or [])
-    }
-    saved_components = []
-    if isinstance(saved_editor_state, dict):
-        saved_components = list(saved_editor_state.get("components", []) or [])
-    pinned_ids = {
-        str(item.get("instance_id", "") or "")
-        for item in saved_components
-        if isinstance(item, dict)
-        and isinstance(item.get("box"), (list, tuple))
-        and len(item.get("box")) == 4
-    }
-    pinned_ids.update(
-        str(node_id)
-        for node_id, override in component_overrides.items()
-        if isinstance(override, dict) and isinstance(override.get("box"), (list, tuple))
-    )
-    manual_edge_ids = {
-        str(edge_id)
-        for edge_id, override in route_overrides.items()
-        if isinstance(override, dict) and override.get("points")
-    }
-    apply_worksheet_graph(
-        normal_routes,
-        box_map,
-        canvas_width,
-        canvas_height,
-        node_labels,
-        pinned_ids,
-        manual_edge_ids,
-    )
-    for hotspot in hotspots:
-        instance_id = str(hotspot.get("instance_id", "") or "")
-        placed = box_map.get(instance_id)
-        if not isinstance(placed, (list, tuple)) or len(placed) != 4:
-            continue
-        hotspot["left"], hotspot["top"], hotspot["width"], hotspot["height"] = placed
+        normal_routes.append(_route_payload(edge_id, route, _points))
+
+    if (_black_layout_active or _moht_layout_active) and _special_route_points:
+        _drawn_pairs = {
+            (str(item.get("source", "") or ""), str(item.get("target", "") or ""))
+            for item in normal_routes
+            if not item.get("hidden")
+        }
+        for (_src, _dst), _pts in list(_special_route_points.items()):
+            if not isinstance(_src, str) or _src == "edge":
+                continue
+            if (_src, _dst) in _drawn_pairs or (_dst, _src) in _drawn_pairs:
+                continue
+            normal_routes.append({
+                "edge_id": f"black__{_src}__{_dst}",
+                "points": _pts,
+                "original_points": _pts,
+                "color": "#123DBD",
+                "dotted": False,
+                "direction": "source_to_target",
+                "original_direction": "source_to_target",
+                "source": _src,
+                "target": _dst,
+                "hidden": False,
+                "arrow_control": None,
+            })
 
     # Wireless visual marker only. The Wi-Fi symbol follows the user's explicit
     # Wireless mode selection only. Automatic and Wired must never display it,
@@ -10670,6 +11118,8 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             f"{_worksheet_render_bundle_key(diagram, worksheet_id, route_overrides, component_overrides)}|"
             f"{view_key}|{pending_source_id or ''}|{int(wireless_active_for_worksheet)}|"
             f"{worksheet_display_name}|{lls_asset_revision}|"
+            f"black_layout={int(_black_layout_active)}|"
+            f"moht_layout={int(_moht_layout_active)}|"
             f"{canvas_width:.8f}|{canvas_height:.8f}|{saved_editor_signature}"
         ).encode("utf-8")
     ).hexdigest()
@@ -10700,7 +11150,15 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         pending_connection_source_id=pending_source_id,
         worksheet_title=str(renderers_module.get_display_title(diagram)),
         render_revision=normal_render_revision,
-        local_draft_key=f"worksheet_motion_v46_{worksheet_id}_{view_key}",
+        local_draft_key=(
+            f"worksheet_motion_black_layout_v1_{worksheet_id}_{view_key}"
+            if _black_layout_active
+            else (
+                f"worksheet_motion_moht_layout_v1_{worksheet_id}_{view_key}"
+                if _moht_layout_active
+                else f"worksheet_motion_v46_{worksheet_id}_{view_key}"
+            )
+        ),
         key=f"diagram_normal_surface_{worksheet_id}_{view_key}",
         default=None,
     )
@@ -14272,6 +14730,82 @@ def _remove_tracked_auto_components(
     return list(reversed(cleaned_reversed))
 
 
+def _displayed_worksheet_component_names(
+    component_names: list[str],
+    transport_settings: dict,
+    worksheet_id: int,
+) -> list[str]:
+    """Return every component name the worksheet will show for this selection.
+
+    The left-panel palette only keeps Sump, Bore Well, and OHT Tank. The worksheet
+    also shows trained requirements, wireless equipment, and requested sensors.
+    Dropdowns use this same expanded list.
+    """
+    base_components = list(component_names or [])
+    for state_key in (
+        f"_auto_wireless_components_{worksheet_id}",
+        f"_auto_requested_connection_components_{worksheet_id}",
+        f"_auto_trained_requirement_components_{worksheet_id}",
+    ):
+        base_components = _remove_tracked_auto_components(
+            base_components,
+            list(st.session_state.get(state_key, []) or []),
+        )
+
+    for component_name in _automatic_requirement_components_compat(base_components):
+        if component_name not in {"Master", "Transmitter", "Repeater"}:
+            base_components.append(component_name)
+
+    valid_ids = _allowed_connection_id_set(base_components)
+    base_transport = {
+        connection_id: _sanitize_connection_transport_setting(config)
+        for connection_id, config in dict(transport_settings or {}).items()
+        if connection_id in valid_ids
+    }
+    distance_without_interference = any(
+        float(config.get("distance_km", 0.0) or 0.0) > 0.0
+        and not bool(config.get("significant_interference", False))
+        for config in base_transport.values()
+    )
+    eligible_wireless = any(
+        normalize_connection_mode(config.get("mode", "automatic")) == "wireless"
+        and float(config.get("distance_km", 0.0) or 0.0) > 0.0
+        and bool(config.get("significant_interference", False))
+        for config in base_transport.values()
+    )
+    communication_generation_allowed = bool(
+        eligible_wireless and not distance_without_interference
+    )
+    expansion_settings = {
+        connection_id: dict(config) for connection_id, config in base_transport.items()
+    }
+    if not communication_generation_allowed:
+        for config in expansion_settings.values():
+            if normalize_connection_mode(config.get("mode", "automatic")) == "wireless":
+                config["mode"] = "automatic"
+
+    expanded_components, _auto_connection_ids, _expanded_settings, _wireless_active = (
+        auto_expand_wireless_components(
+            base_components,
+            connection_settings=expansion_settings,
+        )
+    )
+    if (
+        communication_generation_allowed
+        and {"Bore Well", "Sump", "OHT Tank"}.issubset(set(base_components))
+    ):
+        if "Smart Motor Controller (SMC)" not in expanded_components:
+            expanded_components.append("Smart Motor Controller (SMC)")
+        for _ in range(max(0, 2 - expanded_components.count("Linear Level Sensor (LLS)"))):
+            expanded_components.append("Linear Level Sensor (LLS)")
+
+    expanded_components, _adjustments = _apply_worksheet_component_count_adjustments(
+        int(worksheet_id),
+        expanded_components,
+    )
+    return expanded_components
+
+
 def _option_label_base(value: object) -> str:
     """Return a connection-option component label without its instance suffix."""
     label = " ".join(str(value or "").strip().split())
@@ -14421,6 +14955,22 @@ _LOCAL_AUTOMATIC_REQUIREMENT_PROFILES = {
             ("Motor (Pump)", "Auto Change Over Unit"),
             ("Motor (Pump)", "Non-Return Valve (NRV)"),
             ("Motor (Pump)", "Master"),
+        ],
+    },
+    # 1 Sump + 1 Bore Well + 4 OHT Tanks
+    (1, 1, 4): {
+        "components": [
+            "Smart Motor Controller (SMC)",
+            "Linear Level Sensor (LLS)",
+            "Linear Level Sensor (LLS)",
+            "Linear Level Sensor (LLS)",
+            "Linear Level Sensor (LLS)",
+        ],
+        "pairs": [
+            ("Bore Well", "Smart Motor Controller (SMC)"),
+            ("Smart Motor Controller (SMC)", "Bore Well"),
+            ("Bore Well", "Sump"),
+            ("Sump", "OHT Tank"),
         ],
     },
 }
@@ -14695,45 +15245,59 @@ def generate_selected_components(
         if connection_id in valid_base_connection_ids
     }
 
-    # Wireless communication components are driven ONLY by an explicit user
-    # Wireless selection. Automatic/Wired rows, distance values, interference,
-    # normal component selection and automatic routing must never create Master /
-    # Transmitter / Repeater components.
-    explicit_wireless_selected = any(
-        normalize_connection_mode(config.get("mode", "automatic")) == "wireless"
+    # Strict requested rule:
+    # - any positive Distance without Interference is invalid and must not create
+    #   Master / Transmitter / Repeater;
+    # - the existing Wireless auto-expansion is allowed only when a Wireless
+    #   setting has BOTH a positive Distance and Interference selected.
+    distance_without_interference = any(
+        float(config.get("distance_km", 0.0) or 0.0) > 0.0
+        and not bool(config.get("significant_interference", False))
         for config in base_transport_settings.values()
     )
-    communication_generation_allowed = bool(explicit_wireless_selected)
+    eligible_wireless = any(
+        normalize_connection_mode(config.get("mode", "automatic")) == "wireless"
+        and float(config.get("distance_km", 0.0) or 0.0) > 0.0
+        and bool(config.get("significant_interference", False))
+        for config in base_transport_settings.values()
+    )
 
-    # Defensive stale-state cleanup: communication devices are application-added
-    # infrastructure and must not survive after the last explicit Wireless option
-    # has been cleared. This also cleans worksheets saved by older builds where
-    # those auto-added names were not tracked in ``previous_auto_components``.
-    wireless_component_names = {"Master", "Transmitter", "Repeater"}
-    if not explicit_wireless_selected:
-        base_components = [
-            name for name in base_components
-            if name not in wireless_component_names
-        ]
-
-    if explicit_wireless_selected:
-        # Pass the user's settings through unchanged. ``auto_expand_wireless_components``
-        # already activates only from explicit Wireless mode; Automatic rows are
-        # intentionally not promoted from distance/interference heuristics.
-        (
-            expanded_components,
-            auto_connection_ids,
-            expanded_transport_settings,
-            wireless_active,
-        ) = auto_expand_wireless_components(
-            base_components,
-            connection_settings=base_transport_settings,
+    if distance_without_interference:
+        st.error(
+            "Interference must be selected when Distance is entered. "
+            "Transmitter, Repeater, and Master will not be generated."
         )
-    else:
-        expanded_components = list(base_components)
-        auto_connection_ids = []
-        expanded_transport_settings = dict(base_transport_settings)
-        wireless_active = False
+
+    communication_generation_allowed = bool(
+        eligible_wireless and not distance_without_interference
+    )
+
+    # Reuse the existing wireless-expansion function. Only its trigger input is
+    # constrained here; no component relationship, router or rendering logic is
+    # replaced. Ineligible Wireless rows are temporarily presented as Automatic
+    # to prevent auto-expansion, then the user's real settings are restored below.
+    expansion_settings = {
+        connection_id: dict(config)
+        for connection_id, config in base_transport_settings.items()
+    }
+    if not communication_generation_allowed:
+        for config in expansion_settings.values():
+            if normalize_connection_mode(config.get("mode", "automatic")) == "wireless":
+                config["mode"] = "automatic"
+
+    (
+        expanded_components,
+        auto_connection_ids,
+        expanded_transport_settings,
+        wireless_active,
+    ) = auto_expand_wireless_components(
+        base_components,
+        connection_settings=expansion_settings,
+    )
+
+    # Preserve the user's exact configured mode/distance/interference on all
+    # original connection candidates after using the constrained trigger above.
+    expanded_transport_settings.update(base_transport_settings)
 
     # Track only components newly added by automatic communication expansion so
     # they can be cleanly removed if Distance or Interference is later cleared.
@@ -15625,6 +16189,104 @@ components.html(
 # MAIN WORKSPACE
 # =============================================================================
 
+
+_CONNECTION_PAIR_PICKER = st.components.v2.component(
+    "connection_pair_picker",
+    html="""
+    <div class="pair-row">
+      <select id="from"></select>
+      <select id="to"></select>
+    </div>
+    """,
+    css="""
+    .pair-row { display: flex; gap: 8px; width: 100%; box-sizing: border-box; }
+    select {
+      flex: 1 1 0;
+      min-width: 0;
+      height: 32px;
+      margin: 0;
+      border: 1px solid #0b4f8a;
+      border-radius: 0;
+      background-color: #0b4f8a;
+      color: #ffffff;
+      font-family: Inter, "Segoe UI", Arial, sans-serif;
+      font-size: 14px;
+      font-weight: 400;
+      padding: 0 28px 0 8px;
+      box-sizing: border-box;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 8px center;
+      cursor: pointer;
+    }
+    select option {
+      background: #ffffff;
+      color: #31333f;
+    }
+    """,
+    js="""
+    export default function(component) {
+      const { data, setStateValue, parentElement } = component;
+      const from = parentElement.querySelector("#from");
+      const to = parentElement.querySelector("#to");
+      const options = (data && data.options) || [];
+      function fill(select) {
+        select.replaceChildren();
+        const blank = document.createElement("option");
+        blank.value = "";
+        blank.textContent = "Select Component";
+        blank.hidden = true;
+        blank.selected = true;
+        select.appendChild(blank);
+        for (const item of options) {
+          const option = document.createElement("option");
+          option.value = String(item.id || "");
+          option.textContent = String(item.label || item.id || "");
+          select.appendChild(option);
+        }
+        select.value = "";
+      }
+      fill(from);
+      fill(to);
+      let sent = "";
+      function commit() {
+        if (!from.value || !to.value || from.value === to.value) return;
+        const key = from.value + "|" + to.value;
+        if (key === sent) return;
+        sent = key;
+        setStateValue("pair", {from: from.value, to: to.value, key: key});
+      }
+      from.addEventListener("change", commit);
+      to.addEventListener("change", commit);
+      return () => {
+        from.removeEventListener("change", commit);
+        to.removeEventListener("change", commit);
+      };
+    }
+    """,
+)
+
+
+def _connection_choice_from_picker(result: object) -> tuple[str, str] | None:
+    """Read a pair only after both dropdowns have a real component selected."""
+    pair = getattr(result, "pair", None)
+    if not isinstance(pair, dict) and isinstance(result, dict):
+        pair = result.get("pair")
+    if not isinstance(pair, dict):
+        return None
+    source = str(pair.get("from") or "").strip()
+    target = str(pair.get("to") or "").strip()
+    key = str(pair.get("key") or "")
+    if not source or not target or source == target or not key:
+        return None
+    if st.session_state.get("_connection_pair_picker_key") == key:
+        return None
+    st.session_state["_connection_pair_picker_key"] = key
+    return source, target
+
+
 # Multi-worksheet state is initialized before any input widgets are rendered so
 # each worksheet keeps its own selections and generated outputs independently.
 ensure_worksheet_state()
@@ -16073,7 +16735,19 @@ with left_col:
         # twice on every rerun just to obtain the valid option ids first. The
         # existing cached catalog options are the same source of truth, so filter
         # state from them directly and build the UI table/model only once below.
-        connection_options = allowed_connection_options(selected_components)
+        connection_options = list(allowed_connection_options(selected_components))
+        displayed_component_names = _displayed_worksheet_component_names(
+            selected_components,
+            current_transport_settings,
+            int(active_worksheet_id),
+        )
+        if list(displayed_component_names) != list(selected_components):
+            seen_option_ids = {str(getattr(option, "id", "") or "") for option in connection_options}
+            for option in allowed_connection_options(displayed_component_names):
+                option_id = str(getattr(option, "id", "") or "")
+                if option_id and option_id not in seen_option_ids:
+                    connection_options.append(option)
+                    seen_option_ids.add(option_id)
         valid_connection_ids = {option.id for option in connection_options}
 
         filtered_connection_ids = [
@@ -16109,21 +16783,23 @@ with left_col:
             st.session_state["connection_transport_settings"] = filtered_transport_settings
             current_transport_settings = filtered_transport_settings
 
-        # Keep the "Search and select required connections" control visible
-        # at all times. Build its id/label model directly from the exact same
-        # catalog ConnectionOption objects instead of allocating/iterating a
-        # pandas DataFrame that is not displayed by this compact UI.
         connection_labels: dict[str, str] = {}
         connection_ids_in_order: list[str] = []
+        connection_by_pair: dict[tuple[str, str], str] = {}
         for option in connection_options:
             connection_id = str(getattr(option, "id", "") or "").strip()
             if not connection_id:
                 continue
             connection_ids_in_order.append(connection_id)
-            connection_labels[connection_id] = (
-                f"{str(getattr(option, 'source_label', '') or '').strip()}  →  "
-                f"{str(getattr(option, 'target_label', '') or '').strip()}"
-            )
+            source_id = str(getattr(option, "source_id", "") or "")
+            target_id = str(getattr(option, "target_id", "") or "")
+            source_label = str(getattr(option, "source_label", "") or "").strip()
+            target_label = str(getattr(option, "target_label", "") or "").strip()
+            connection_labels[connection_id] = f"{source_label}  →  {target_label}"
+            if source_id and target_id:
+                connection_by_pair[(source_id, target_id)] = connection_id
+                if bool(getattr(option, "bidirectional", False)):
+                    connection_by_pair.setdefault((target_id, source_id), connection_id)
 
         requirement_option_ids = list(DEFAULT_REQUIREMENT_OPTION_IDS)
         requirement_option_labels = DEFAULT_REQUIREMENT_OPTION_LABELS
@@ -16131,119 +16807,77 @@ with left_col:
         candidate_signature = hashlib.sha256(
             "|".join(connection_ids_in_order + requirement_option_ids).encode("utf-8")
         ).hexdigest()[:12]
-        connection_picker_generation = int(
-            st.session_state.get(
-                f"connection_picker_generation_{active_worksheet_id}", 0
-            )
-            or 0
-        )
-        selected_connection_ids = st.multiselect(
-            "Required connections",
-            options=connection_ids_in_order,
-            default=[
-                connection_id
-                for connection_id in current_connection_ids
-                if connection_id in connection_ids_in_order
-            ],
-            format_func=lambda connection_id: connection_labels.get(
-                connection_id, connection_id
-            ),
-            key=(
-                f"required_connection_compact_{active_worksheet_id}_"
-                f"{candidate_signature}_{connection_picker_generation}"
-            ),
-            placeholder="Search and select required connections...",
-            label_visibility="collapsed",
-        )
+        selected_connection_ids = [
+            connection_id
+            for connection_id in current_connection_ids
+            if connection_id in connection_ids_in_order
+        ]
 
-        # Visibility/layout only: when multiple selected connection pills occupy
-        # multiple lines, reserve that exact vertical space in Streamlit's owning
-        # layout element.  The visual selector, active rows and following dropdown
-        # then remain in normal document flow instead of overlapping one another.
-        # No connection state, selection behavior or control functionality changes.
-        if len(selected_connection_ids) >= 2:
-            required_connection_box_height = 40 + (len(selected_connection_ids) - 1) * 36
-            required_connection_key_prefix = (
-                f"st-key-required_connection_compact_{active_worksheet_id}_"
-            )
-            st.markdown(
-                f"""
-<style>
-/* Required Connections multi-line containment/alignment only. */
-[class*="st-key-reference_connection_section_"]
-[data-testid="stElementContainer"][class*="{required_connection_key_prefix}"],
-[class*="st-key-reference_connection_section_"]
-[data-testid="stElementContainer"]:has([class*="{required_connection_key_prefix}"]),
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"],
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] > div,
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] [data-testid="stMultiSelect"],
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] [data-testid="stMultiSelect"] > div,
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] [data-baseweb="select"],
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] [data-baseweb="select"] > div {{
-    height: {required_connection_box_height}px !important;
-    min-height: {required_connection_box_height}px !important;
-    max-height: none !important;
-    overflow: visible !important;
-    box-sizing: border-box !important;
-}}
+        # Every component on the worksheet is listed, including ones added
+        # automatically. Choosing a pair still uses the allowed-connection rules.
+        component_choice_ids: list[str] = []
+        component_choice_labels: dict[str, str] = {}
+        for instance in component_catalog_module._selected_instances(
+            displayed_component_names or selected_components
+        ):
+            component_choice_ids.append(instance.node_id)
+            component_choice_labels[instance.node_id] = instance.label
+        if not component_choice_ids:
+            _code_by_name = {item.name: item.code for item in COMPONENT_CATALOG}
+            _instance_counts: dict[str, int] = {}
+            for component_name in selected_components:
+                _instance_counts[component_name] = _instance_counts.get(component_name, 0) + 1
+                instance_index = _instance_counts[component_name]
+                raw_code = str(_code_by_name.get(component_name, component_name) or component_name)
+                slug = "".join(
+                    char.lower() if char.isalnum() else "_" for char in raw_code
+                ).strip("_") or "component"
+                node_id = f"{slug}_{instance_index}"
+                component_choice_ids.append(node_id)
+                component_choice_labels[node_id] = f"{component_name} {instance_index}"
 
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] {{
-    padding-bottom: 0 !important;
-    margin-bottom: 0 !important;
-}}
+        component_choice_signature = hashlib.sha256(
+            "|".join(component_choice_ids).encode("utf-8")
+        ).hexdigest()[:8]
+        if base_selected_components and component_choice_ids:
+            from_column, to_column = st.columns(2, gap="small")
+            with from_column:
+                from_component = st.selectbox(
+                    "Connect from",
+                    options=component_choice_ids,
+                    index=None,
+                    placeholder="Select Component",
+                    format_func=lambda node_id: component_choice_labels.get(node_id, node_id),
+                    key=f"connection_from_{active_worksheet_id}_{candidate_signature}_{component_choice_signature}",
+                    label_visibility="collapsed",
+                )
+            with to_column:
+                to_component = st.selectbox(
+                    "Connect to",
+                    options=component_choice_ids,
+                    index=None,
+                    placeholder="Select Component",
+                    format_func=lambda node_id: component_choice_labels.get(node_id, node_id),
+                    key=f"connection_to_{active_worksheet_id}_{candidate_signature}_{component_choice_signature}",
+                    label_visibility="collapsed",
+                )
+            if from_component and to_component and from_component != to_component:
+                chosen_connection_id = connection_by_pair.get(
+                    (str(from_component), str(to_component))
+                ) or connection_by_pair.get(
+                    (str(to_component), str(from_component))
+                )
+                if (
+                    chosen_connection_id
+                    and chosen_connection_id not in selected_connection_ids
+                ):
+                    selected_connection_ids.append(chosen_connection_id)
+                    st.session_state["selected_connections"] = list(
+                        selected_connection_ids
+                    )
 
-[class*="st-key-reference_connection_section_"]
-[class*="{required_connection_key_prefix}"] [data-baseweb="select"] > div {{
-    display: flex !important;
-    flex-wrap: wrap !important;
-    align-content: flex-start !important;
-    align-items: center !important;
-    padding-top: 2px !important;
-    padding-bottom: 2px !important;
-}}
-
-/* Keep each active green connection row and the following configuration
-   dropdown in their existing normal-flow positions beneath the full box. */
-[class*="st-key-reference_connection_section_"]
-[data-testid="stElementContainer"]:has([class*="st-key-reference_active_connection_row_"]),
-[class*="st-key-reference_connection_section_"]
-[class*="st-key-reference_active_connection_row_"] {{
-    position: relative !important;
-    z-index: 1 !important;
-    overflow: visible !important;
-}}
-
-[class*="st-key-reference_connection_section_"]
-[class*="st-key-connection_config_target_"] {{
-    position: relative !important;
-    z-index: 1 !important;
-    clear: both !important;
-    margin-top: 8px !important;
-}}
-</style>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        # The existing second 2A box now always contains both:
-        #   - the current valid instance-level connections, and
-        #   - the default auxiliary requirement/control choices from the catalog.
-        # Requirement choices are not new connection rules. Selecting one only
-        # adds the corresponding component requirement; its valid relationships
-        # are still derived from the existing allowed_connection_options() table.
-        actual_configuration_choices = (
-            selected_connection_ids
-            if selected_connection_ids
-            else connection_ids_in_order
-        )
-        configuration_choices = list(actual_configuration_choices) + requirement_option_ids
+        # The pair list is gone. This box only offers extra control components.
+        configuration_choices = list(requirement_option_ids)
 
         # Visibility-only rule: before any base component is selected, keep only
         # the first "Search and select required connections" box visible.

@@ -16,8 +16,10 @@ The important guarantees for every generated diagram are:
 * crossings/overlaps are rejected except at an explicit topology junction;
 * dense diagrams increase routing clearances and component/canvas space before
   routing is attempted;
-* automatic physical routes are restricted to straight or single-bend L paths;
-  Z-shaped, multi-lane zigzag and multi-bend A* paths are never returned.
+* each edge is routed from the current source and target boxes by trying a small
+  set of orthogonal candidates (straight, L, Z, and outer bypass);
+* component bodies are hard obstacles; existing lines are soft obstacles;
+* a short local A* search is used only when every candidate crosses a component.
 
 Rendering code only draws the returned polylines, so the same routing logic works
 for current and future components without adding component-specific ``if`` blocks.
@@ -26,8 +28,9 @@ for current and future components without adding component-specific ``if`` block
 from collections import defaultdict
 from dataclasses import dataclass
 import heapq
-import math
 from itertools import count
+import math
+import time
 from typing import Mapping, Sequence
 
 from .models import DiagramEdge, DiagramNode, DiagramSpec
@@ -4074,10 +4077,14 @@ def _strictly_separate_overlapping_routes(
     # geometry pressure; no component/relationship names are inspected.
     order_queue: list[list[int]] = [list(order) for order in seed_orders]
     seen_orders: set[tuple[int, ...]] = set()
-    max_attempts = 10 if len(diagram.edges) <= 24 else 4
+    max_attempts = 4 if len(diagram.edges) <= 12 else 1
     attempts = 0
+    start_time = time.monotonic()
+    max_time_seconds = 0.8
 
     while order_queue and attempts < max_attempts:
+        if time.monotonic() - start_time > max_time_seconds:
+            break
         order = order_queue.pop(0)
         order_key = tuple(order)
         if order_key in seen_orders:
@@ -4155,6 +4162,1547 @@ def _strictly_separate_overlapping_routes(
     return routes
 
 
+# =============================================================================
+# FAST ORTHOGONAL CANDIDATE ROUTER
+# =============================================================================
+#
+# Topology chooses the edges. This planner only chooses ports and polylines from
+# the boxes it is given. It does not know component names or counts.
+#
+# Candidate generation is cached per corridor. The finished diagram is cached
+# per routing geometry, so an unchanged Streamlit rerun does not route again.
+# A drag regenerates candidates only for corridors whose boxes changed.
+
+
+_FAST_CLEARANCE = 0.07
+_FAST_ESCAPE = 0.12
+_FAST_LANE = 0.14
+_EDGE_CANDIDATE_CACHE: dict[tuple, tuple] = {}
+_FINAL_ROUTE_CACHE: dict[tuple, tuple] = {}
+_EDGE_CACHE_LIMIT = 4096
+_FINAL_CACHE_LIMIT = 32
+
+
+def _q(value: float) -> float:
+    return round(float(value), 3)
+
+
+def _qbox(box: Box) -> tuple[float, float, float, float]:
+    return (_q(box[0]), _q(box[1]), _q(box[2]), _q(box[3]))
+
+
+def _cache_get(cache: dict, key: tuple):
+    if key not in cache:
+        return None
+    value = cache.pop(key)
+    cache[key] = value
+    return value
+
+
+def _cache_put(cache: dict, key: tuple, value, limit: int) -> None:
+    if key in cache:
+        cache.pop(key)
+    cache[key] = value
+    while len(cache) > limit:
+        cache.pop(next(iter(cache)))
+
+
+def _inflate_box(box: Box, margin: float) -> tuple[float, float, float, float]:
+    x, y, w, h = box
+    return (x - margin, y - margin, w + margin * 2.0, h + margin * 2.0)
+
+
+def _segment_hits_rect(
+    a: Point,
+    b: Point,
+    rect: tuple[float, float, float, float],
+) -> bool:
+    """True when segment AB touches axis-aligned rect (x, y, w, h)."""
+    x, y, w, h = rect
+    if w <= 0 or h <= 0:
+        return False
+    x1 = x + w
+    y1 = y + h
+    ax, ay = a
+    bx, by = b
+    dx = bx - ax
+    dy = by - ay
+    t0 = 0.0
+    t1 = 1.0
+    for p, q in (
+        (-dx, ax - x),
+        (dx, x1 - ax),
+        (-dy, ay - y),
+        (dy, y1 - ay),
+    ):
+        if abs(p) <= 1e-9:
+            if q < 0:
+                return False
+            continue
+        t = q / p
+        if p < 0:
+            if t > t1:
+                return False
+            if t > t0:
+                t0 = t
+        else:
+            if t < t0:
+                return False
+            if t < t1:
+                t1 = t
+    return True
+
+
+def _segments_separated(a: Point, b: Point, c: Point, d: Point) -> bool:
+    return (
+        max(a[0], b[0]) < min(c[0], d[0]) - 1e-6
+        or max(c[0], d[0]) < min(a[0], b[0]) - 1e-6
+        or max(a[1], b[1]) < min(c[1], d[1]) - 1e-6
+        or max(c[1], d[1]) < min(a[1], b[1]) - 1e-6
+    )
+
+
+def _proper_crossing(a: Point, b: Point, c: Point, d: Point) -> bool:
+    if a == c or a == d or b == c or b == d or _segments_separated(a, b, c, d):
+        return False
+
+    def orient(p: Point, q: Point, r: Point) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    o1 = orient(a, b, c)
+    o2 = orient(a, b, d)
+    o3 = orient(c, d, a)
+    o4 = orient(c, d, b)
+    return o1 * o2 < 0 and o3 * o4 < 0
+
+
+def _colinear_overlap(a: Point, b: Point, c: Point, d: Point) -> float:
+    if _segments_separated(a, b, c, d):
+        return 0.0
+    horizontal = abs(a[1] - b[1]) <= 1e-6 and abs(c[1] - d[1]) <= 1e-6
+    vertical = abs(a[0] - b[0]) <= 1e-6 and abs(c[0] - d[0]) <= 1e-6
+    if horizontal and abs(a[1] - c[1]) <= 1e-6:
+        lo = max(min(a[0], b[0]), min(c[0], d[0]))
+        hi = min(max(a[0], b[0]), max(c[0], d[0]))
+        return max(0.0, hi - lo)
+    if vertical and abs(a[0] - c[0]) <= 1e-6:
+        lo = max(min(a[1], b[1]), min(c[1], d[1]))
+        hi = min(max(a[1], b[1]), max(c[1], d[1]))
+        return max(0.0, hi - lo)
+    return 0.0
+
+
+def _side_pairs(source_box: Box, target_box: Box) -> tuple[tuple[str, str], tuple[str, str]]:
+    sx, sy = _box_center(source_box)
+    tx, ty = _box_center(target_box)
+    dx = tx - sx
+    dy = ty - sy
+    horizontal = ("right", "left") if dx >= 0 else ("left", "right")
+    vertical = ("bottom", "top") if dy >= 0 else ("top", "bottom")
+    if abs(dx) >= abs(dy):
+        return horizontal, vertical
+    return vertical, horizontal
+
+
+def _all_candidate_side_pairs(source_box: Box, target_box: Box) -> list[tuple[str, str]]:
+    sx, sy = _box_center(source_box)
+    tx, ty = _box_center(target_box)
+    dx = tx - sx
+    dy = ty - sy
+
+    pairs: list[tuple[str, str]] = []
+    if abs(dx) >= abs(dy):
+        pairs.append(("right", "left") if dx >= 0 else ("left", "right"))
+        pairs.append(("bottom", "top") if dy >= 0 else ("top", "bottom"))
+    else:
+        pairs.append(("bottom", "top") if dy >= 0 else ("top", "bottom"))
+        pairs.append(("right", "left") if dx >= 0 else ("left", "right"))
+
+    if dx >= 0 and dy <= 0:
+        pairs.append(("top", "left"))
+        pairs.append(("right", "bottom"))
+        pairs.append(("top", "top"))
+    elif dx >= 0 and dy > 0:
+        pairs.append(("bottom", "left"))
+        pairs.append(("right", "top"))
+        pairs.append(("bottom", "bottom"))
+    elif dx < 0 and dy <= 0:
+        pairs.append(("top", "right"))
+        pairs.append(("left", "bottom"))
+        pairs.append(("top", "top"))
+    else:
+        pairs.append(("bottom", "right"))
+        pairs.append(("left", "top"))
+        pairs.append(("bottom", "bottom"))
+
+    if dy <= 0:
+        pairs.append(("top", "top"))
+    else:
+        pairs.append(("bottom", "bottom"))
+
+    seen: set[tuple[str, str]] = set()
+    unique: list[tuple[str, str]] = []
+    for p in pairs:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def _port_on_side(box: Box, side: str, fraction: float) -> Point:
+    x, y, w, h = box
+    fraction = min(0.86, max(0.14, fraction))
+    if side == "left":
+        return (x, y + h * fraction)
+    if side == "right":
+        return (x + w, y + h * fraction)
+    if side == "top":
+        return (x + w * fraction, y)
+    return (x + w * fraction, y + h)
+
+
+def _working_bounds(
+    bounds: tuple[float, float, float, float],
+    boxes: Mapping[str, Box],
+) -> tuple[float, float, float, float]:
+    left, right, top, bottom = bounds
+    for box in boxes.values():
+        x, y, w, h = box
+        left = min(left, x - 0.4)
+        right = max(right, x + w + 0.4)
+        top = min(top, y - 0.4)
+        bottom = max(bottom, y + h + 0.4)
+    return left, right, top, bottom
+
+
+def _corridor_obstacles(
+    source_box: Box,
+    target_box: Box,
+    obstacles: Sequence[Box],
+) -> list[Box]:
+    pad = 1.25
+    x0 = min(source_box[0], target_box[0]) - pad
+    y0 = min(source_box[1], target_box[1]) - pad
+    x1 = max(source_box[0] + source_box[2], target_box[0] + target_box[2]) + pad
+    y1 = max(source_box[1] + source_box[3], target_box[1] + target_box[3]) + pad
+    chosen = []
+    for box in obstacles:
+        x, y, w, h = box
+        if x + w < x0 or x > x1 or y + h < y0 or y > y1:
+            continue
+        chosen.append(box)
+    return chosen
+
+
+def _hard_hits(
+    points: Sequence[Point],
+    obstacles: Sequence[tuple[float, float, float, float]],
+    source_box: Box,
+    target_box: Box,
+    *,
+    ignore_source: bool = False,
+    ignore_target: bool = False,
+) -> int:
+    if len(points) < 2:
+        return 1
+    source_interior = _inflate_box(source_box, -0.02)
+    target_interior = _inflate_box(target_box, -0.02)
+    hits = 0
+    for start, end in zip(points, points[1:]):
+        if abs(start[0] - end[0]) <= 1e-8 and abs(start[1] - end[1]) <= 1e-8:
+            continue
+        if abs(start[0] - end[0]) > 1e-6 and abs(start[1] - end[1]) > 1e-6:
+            hits += 5
+        for rect in obstacles:
+            if _segment_hits_rect(start, end, rect):
+                hits += 1
+        if (
+            not ignore_source
+            and source_interior[2] > 0
+            and source_interior[3] > 0
+            and _segment_hits_rect(start, end, source_interior)
+        ):
+            hits += 1
+        if (
+            not ignore_target
+            and target_interior[2] > 0
+            and target_interior[3] > 0
+            and _segment_hits_rect(start, end, target_interior)
+        ):
+            hits += 1
+    return hits
+
+
+def _orthogonal_candidates(
+    source_box: Box,
+    target_box: Box,
+    source_side: str,
+    source_fraction: float,
+    target_side: str,
+    target_fraction: float,
+    obstacles: Sequence[Box],
+    lane_offset: float,
+) -> list[list[Point]]:
+    start = _port_on_side(source_box, source_side, source_fraction)
+    end = _port_on_side(target_box, target_side, target_fraction)
+    approach = _FAST_ESCAPE + abs(lane_offset)
+    stub_start = _stub_point(start, source_side, approach)
+    stub_end = _stub_point(end, target_side, approach)
+    routes: list[list[Point]] = []
+
+    def add(points: list[Point]) -> None:
+        cleaned = _compress(points)
+        if len(cleaned) < 2:
+            return
+        for left, right in zip(cleaned, cleaned[1:]):
+            if abs(left[0] - right[0]) > 1e-6 and abs(left[1] - right[1]) > 1e-6:
+                return
+        routes.append(cleaned)
+
+    if abs(stub_start[0] - stub_end[0]) <= 1e-6 or abs(stub_start[1] - stub_end[1]) <= 1e-6:
+        add([start, stub_start, stub_end, end])
+    add([start, stub_start, (stub_end[0], stub_start[1]), stub_end, end])
+    add([start, stub_start, (stub_start[0], stub_end[1]), stub_end, end])
+
+    # Direct straight lines (0 bends) when endpoints align
+    if source_side == "right" and target_side == "left" and end[0] > start[0] and abs(start[1] - end[1]) <= 0.08:
+        add([start, (end[0], start[1])])
+    elif source_side == "left" and target_side == "right" and end[0] < start[0] and abs(start[1] - end[1]) <= 0.08:
+        add([start, (end[0], start[1])])
+    elif source_side == "bottom" and target_side == "top" and end[1] > start[1] and abs(start[0] - end[0]) <= 0.08:
+        add([start, (start[0], end[1])])
+    elif source_side == "top" and target_side == "bottom" and end[1] < start[1] and abs(start[0] - end[0]) <= 0.08:
+        add([start, (start[0], end[1])])
+
+    # Direct clean 1-bend L-routes (exit face normal, enter face normal)
+    if source_side == "top" and target_side == "left" and end[1] < start[1] and end[0] > start[0]:
+        add([start, (start[0], end[1]), end])
+    elif source_side == "top" and target_side == "right" and end[1] < start[1] and end[0] < start[0]:
+        add([start, (start[0], end[1]), end])
+    elif source_side == "bottom" and target_side == "left" and end[1] > start[1] and end[0] > start[0]:
+        add([start, (start[0], end[1]), end])
+    elif source_side == "bottom" and target_side == "right" and end[1] > start[1] and end[0] < start[0]:
+        add([start, (start[0], end[1]), end])
+    elif source_side == "right" and target_side == "top" and end[0] > start[0] and end[1] > start[1]:
+        add([start, (end[0], start[1]), end])
+    elif source_side == "right" and target_side == "bottom" and end[0] > start[0] and end[1] < start[1]:
+        add([start, (end[0], start[1]), end])
+    elif source_side == "left" and target_side == "top" and end[0] < start[0] and end[1] > start[1]:
+        add([start, (end[0], start[1]), end])
+    elif source_side == "left" and target_side == "bottom" and end[0] < start[0] and end[1] < start[1]:
+        add([start, (end[0], start[1]), end])
+
+    # Direct clean 2-bend U-routes (overhead header or bottom run)
+    if source_side == "top" and target_side == "top":
+        bus_y = min(source_box[1], target_box[1]) - (_FAST_ESCAPE + 0.18 + abs(lane_offset))
+        add([start, (start[0], bus_y), (end[0], bus_y), end])
+    elif source_side == "bottom" and target_side == "bottom":
+        bus_y = max(source_box[1] + source_box[3], target_box[1] + target_box[3]) + (_FAST_ESCAPE + 0.18 + abs(lane_offset))
+        add([start, (start[0], bus_y), (end[0], bus_y), end])
+
+    # Direct clean 2-bend Z-routes
+    if source_side == "right" and target_side == "left" and end[0] > start[0]:
+        mid_x = (start[0] + end[0]) / 2.0 + lane_offset
+        add([start, (mid_x, start[1]), (mid_x, end[1]), end])
+    elif source_side == "left" and target_side == "right" and end[0] < start[0]:
+        mid_x = (start[0] + end[0]) / 2.0 + lane_offset
+        add([start, (mid_x, start[1]), (mid_x, end[1]), end])
+    elif source_side == "bottom" and target_side == "top" and end[1] > start[1]:
+        mid_y = (start[1] + end[1]) / 2.0 + lane_offset
+        add([start, (start[0], mid_y), (end[0], mid_y), end])
+    elif source_side == "top" and target_side == "bottom" and end[1] < start[1]:
+        mid_y = (start[1] + end[1]) / 2.0 + lane_offset
+        add([start, (start[0], mid_y), (end[0], mid_y), end])
+
+    span_x0, span_x1 = sorted((stub_start[0], stub_end[0]))
+    span_y0, span_y1 = sorted((stub_start[1], stub_end[1]))
+    mid_x = (stub_start[0] + stub_end[0]) / 2.0 + lane_offset
+    mid_y = (stub_start[1] + stub_end[1]) / 2.0 + lane_offset
+    x_mids = [mid_x, mid_x - _FAST_LANE, mid_x + _FAST_LANE]
+    y_mids = [mid_y, mid_y - _FAST_LANE, mid_y + _FAST_LANE]
+    for box in obstacles:
+        x, y, w, h = box
+        if not (x + w < span_x0 or x > span_x1):
+            x_mids.append(x - _FAST_CLEARANCE - 0.05)
+            x_mids.append(x + w + _FAST_CLEARANCE + 0.05)
+        if not (y + h < span_y0 or y > span_y1):
+            y_mids.append(y - _FAST_CLEARANCE - 0.05)
+            y_mids.append(y + h + _FAST_CLEARANCE + 0.05)
+
+    def nearest(values: list[float], origin: float) -> list[float]:
+        unique = []
+        for value in sorted(values, key=lambda item: abs(item - origin)):
+            if all(abs(value - seen) > 0.04 for seen in unique):
+                unique.append(value)
+            if len(unique) >= 6:
+                break
+        return unique
+
+    for mid in nearest(x_mids, (stub_start[0] + stub_end[0]) / 2.0):
+        add([start, stub_start, (mid, stub_start[1]), (mid, stub_end[1]), stub_end, end])
+    for mid in nearest(y_mids, (stub_start[1] + stub_end[1]) / 2.0):
+        add([start, stub_start, (stub_start[0], mid), (stub_end[0], mid), stub_end, end])
+
+    tops = [source_box[1], target_box[1]]
+    bottoms = [source_box[1] + source_box[3], target_box[1] + target_box[3]]
+    lefts = [source_box[0], target_box[0]]
+    rights = [source_box[0] + source_box[2], target_box[0] + target_box[2]]
+    for box in obstacles:
+        x, y, w, h = box
+        tops.append(y)
+        bottoms.append(y + h)
+        lefts.append(x)
+        rights.append(x + w)
+    gap = _FAST_CLEARANCE + 0.1
+    bus_top = min(tops) - gap
+    bus_bottom = max(bottoms) + gap
+    bus_left = min(lefts) - gap
+    bus_right = max(rights) + gap
+    add([start, stub_start, (stub_start[0], bus_top), (stub_end[0], bus_top), stub_end, end])
+    add([
+        start,
+        stub_start,
+        (stub_start[0], bus_bottom),
+        (stub_end[0], bus_bottom),
+        stub_end,
+        end,
+    ])
+    add([start, stub_start, (bus_left, stub_start[1]), (bus_left, stub_end[1]), stub_end, end])
+    add([
+        start,
+        stub_start,
+        (bus_right, stub_start[1]),
+        (bus_right, stub_end[1]),
+        stub_end,
+        end,
+    ])
+    return routes
+
+
+def _candidate_key(
+    source_box: Box,
+    target_box: Box,
+    source_side: str,
+    source_fraction: float,
+    target_side: str,
+    target_fraction: float,
+    obstacles: Sequence[Box],
+    lane_offset: float,
+) -> tuple:
+    return (
+        _qbox(source_box),
+        _qbox(target_box),
+        source_side,
+        _q(source_fraction),
+        target_side,
+        _q(target_fraction),
+        _q(lane_offset),
+        tuple(sorted(_qbox(box) for box in obstacles)),
+    )
+
+
+def _edge_candidates(
+    source_box: Box,
+    target_box: Box,
+    source_side: str,
+    source_fraction: float,
+    target_side: str,
+    target_fraction: float,
+    obstacles: Sequence[Box],
+    lane_offset: float,
+) -> list[tuple[tuple[Point, ...], int]]:
+    key = _candidate_key(
+        source_box,
+        target_box,
+        source_side,
+        source_fraction,
+        target_side,
+        target_fraction,
+        obstacles,
+        lane_offset,
+    )
+    cached = _cache_get(_EDGE_CANDIDATE_CACHE, key)
+    if cached is not None:
+        return list(cached)
+
+    inflated = [_inflate_box(box, _FAST_CLEARANCE) for box in obstacles]
+    scored = []
+    for points in _orthogonal_candidates(
+        source_box,
+        target_box,
+        source_side,
+        source_fraction,
+        target_side,
+        target_fraction,
+        obstacles,
+        lane_offset,
+    ):
+        hits = _hard_hits(points, inflated, source_box, target_box)
+        scored.append((tuple(points), hits))
+    def _span(points: tuple[Point, ...]) -> float:
+        return sum(abs(b[0] - a[0]) + abs(b[1] - a[1]) for a, b in zip(points, points[1:]))
+
+    scored.sort(key=lambda item: (item[1], _span(item[0]), len(item[0]), item[0]))
+    # Short routes cover the normal L/Z choices. The longest clean routes are
+    # the outer bypasses, which matter when every short route crosses something.
+    clean = [item for item in scored if item[1] == 0]
+    if len(clean) > 10:
+        kept = clean[:6] + clean[-4:]
+    else:
+        kept = clean or scored[:6]
+    frozen = tuple(kept)
+    _cache_put(_EDGE_CANDIDATE_CACHE, key, frozen, _EDGE_CACHE_LIMIT)
+    return list(frozen)
+
+
+def _local_astar(
+    start: Point,
+    end: Point,
+    obstacles: Sequence[tuple[float, float, float, float]],
+) -> list[Point] | None:
+    margin = 0.6
+    x0 = min(start[0], end[0]) - margin
+    y0 = min(start[1], end[1]) - margin
+    x1 = max(start[0], end[0]) + margin
+    y1 = max(start[1], end[1]) + margin
+    step = 0.18
+    cells_x = int((x1 - x0) / step) + 1
+    cells_y = int((y1 - y0) / step) + 1
+    while cells_x * cells_y > 2500 and step < 0.5:
+        step *= 1.35
+        cells_x = int((x1 - x0) / step) + 1
+        cells_y = int((y1 - y0) / step) + 1
+    if cells_x * cells_y > 2500:
+        return None
+
+    def cell_of(point: Point) -> tuple[int, int]:
+        return (
+            max(0, min(cells_x, int(round((point[0] - x0) / step)))),
+            max(0, min(cells_y, int(round((point[1] - y0) / step)))),
+        )
+
+    def point_of(cell: tuple[int, int]) -> Point:
+        return (x0 + cell[0] * step, y0 + cell[1] * step)
+
+    start_cell = cell_of(start)
+    end_cell = cell_of(end)
+    blocked: set[tuple[int, int]] = set()
+    for gx in range(cells_x + 1):
+        for gy in range(cells_y + 1):
+            cell = (gx, gy)
+            if cell == start_cell or cell == end_cell:
+                continue
+            point = point_of(cell)
+            if any(_segment_hits_rect(point, point, rect) or (
+                rect[0] <= point[0] <= rect[0] + rect[2]
+                and rect[1] <= point[1] <= rect[1] + rect[3]
+            ) for rect in obstacles):
+                blocked.add(cell)
+
+    serial = count()
+    start_state = (start_cell[0], start_cell[1], -1)
+    queue = [(0.0, next(serial), start_state)]
+    best = {start_state: 0.0}
+    parent: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    goal = None
+    expansions = 0
+    while queue and expansions < 2500:
+        _estimate, _serial, state = heapq.heappop(queue)
+        expansions += 1
+        gx, gy, previous = state
+        if (gx, gy) == end_cell:
+            goal = state
+            break
+        current = best[state]
+        for direction, (dx, dy) in enumerate(((1, 0), (-1, 0), (0, 1), (0, -1))):
+            nx, ny = gx + dx, gy + dy
+            if nx < 0 or ny < 0 or nx > cells_x or ny > cells_y:
+                continue
+            if (nx, ny) in blocked and (nx, ny) != end_cell:
+                continue
+            turn = 0.0 if previous in (-1, direction) else 0.65
+            nxt = current + 1.0 + turn
+            nxt_state = (nx, ny, direction)
+            if nxt >= best.get(nxt_state, float("inf")):
+                continue
+            best[nxt_state] = nxt
+            parent[nxt_state] = state
+            heuristic = abs(end_cell[0] - nx) + abs(end_cell[1] - ny)
+            heapq.heappush(queue, (nxt + heuristic, next(serial), nxt_state))
+    if goal is None:
+        return None
+
+    cells: list[tuple[int, int]] = []
+    state = goal
+    while True:
+        cells.append((state[0], state[1]))
+        if state == start_state:
+            break
+        state = parent[state]
+    cells.reverse()
+    core = [point_of(cell) for cell in cells]
+    pinned = [start]
+    if core and abs(start[0] - core[0][0]) > 1e-6 and abs(start[1] - core[0][1]) > 1e-6:
+        pinned.append((core[0][0], start[1]))
+    pinned.extend(core)
+    if abs(pinned[-1][0] - end[0]) > 1e-6 and abs(pinned[-1][1] - end[1]) > 1e-6:
+        pinned.append((end[0], pinned[-1][1]))
+    pinned.append(end)
+    return _compress(pinned)
+
+
+def _segment_cells(start: Point, end: Point, size: float = 0.9) -> list[tuple[int, int]]:
+    x0, x1 = sorted((start[0], end[0]))
+    y0, y1 = sorted((start[1], end[1]))
+    ix0 = math.floor(x0 / size)
+    ix1 = math.floor(x1 / size)
+    iy0 = math.floor(y0 / size)
+    iy1 = math.floor(y1 / size)
+    return [
+        (ix, iy)
+        for ix in range(ix0, ix1 + 1)
+        for iy in range(iy0, iy1 + 1)
+    ]
+
+
+def _soft_obstacle_grid(routes: Sequence[Sequence[Point] | None]):
+    grid: dict[tuple[int, int], list[tuple[int, tuple[Point, Point]]]] = defaultdict(list)
+    for index, points in enumerate(routes):
+        if not points:
+            continue
+        for start, end in zip(points, points[1:]):
+            segment = (start, end)
+            for cell in _segment_cells(start, end):
+                grid[cell].append((index, segment))
+    return grid
+
+
+def _fast_route_cost(
+    points: Sequence[Point],
+    grid,
+    owner: int,
+    forward: Point,
+    alternate: bool,
+) -> tuple[float, int, float]:
+    length = 0.0
+    bends = 0
+    backward = 0.0
+    crossings = 0
+    overlap = 0.0
+    previous = ""
+    for start, end in zip(points, points[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length += abs(dx) + abs(dy)
+        kind = "h" if abs(dy) <= 1e-6 else "v" if abs(dx) <= 1e-6 else "d"
+        if previous and kind != previous:
+            bends += 1
+        previous = kind
+        if abs(forward[0]) >= abs(forward[1]):
+            if forward[0] >= 0 and dx < 0:
+                backward += -dx
+            elif forward[0] < 0 and dx > 0:
+                backward += dx
+        elif forward[1] >= 0 and dy < 0:
+            backward += -dy
+        elif forward[1] < 0 and dy > 0:
+            backward += dy
+        nearby = []
+        seen: set[tuple] = set()
+        for cell in _segment_cells(start, end):
+            for other_index, segment in grid.get(cell, ()):
+                if other_index == owner:
+                    continue
+                marker = (other_index, segment[0], segment[1])
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                nearby.append(segment)
+        for other_start, other_end in nearby:
+            if _proper_crossing(start, end, other_start, other_end):
+                crossings += 1
+            overlap += _colinear_overlap(start, end, other_start, other_end)
+    cost = (
+        length
+        + bends * 1.50
+        + backward * 1.80
+        + crossings * 4.0
+        + overlap * 8.0
+        + (0.85 if alternate else 0.0)
+    )
+    return cost, bends, length
+
+
+def _assign_port_fractions(
+    diagram: DiagramSpec,
+    boxes: Mapping[str, Box],
+) -> dict[tuple[int, str], tuple[str, float, float, int, int]]:
+    """Return (edge index, role) -> side, fraction, lane offset, rank, total."""
+    groups: dict[tuple[str, str], list[tuple[int, float]]] = defaultdict(list)
+    chosen_side: dict[tuple[int, str], str] = {}
+    for index, edge in enumerate(diagram.edges):
+        source_box = boxes.get(edge.source)
+        target_box = boxes.get(edge.target)
+        if source_box is None or target_box is None:
+            continue
+        primary, _alternate = _side_pairs(source_box, target_box)
+        source_side, target_side = primary
+        chosen_side[(index, "source")] = source_side
+        chosen_side[(index, "target")] = target_side
+        other_center = _box_center(target_box)
+        source_sort = other_center[1] if source_side in ("left", "right") else other_center[0]
+        groups[(edge.source, source_side)].append((index, source_sort))
+        target_center = _box_center(source_box)
+        target_sort = target_center[1] if target_side in ("left", "right") else target_center[0]
+        groups[(edge.target, target_side)].append((index, target_sort))
+
+    assigned: dict[tuple[int, str], tuple[str, float, float, int, int]] = {}
+    rank_lookup: dict[tuple[int, str], tuple[int, int]] = {}
+    for (node_id, side), members in groups.items():
+        ordered = sorted(members, key=lambda item: (item[1], item[0]))
+        total = len(ordered)
+        for rank, (index, _sort_value) in enumerate(ordered):
+            fraction = 0.5 if total == 1 else 0.22 + 0.56 * rank / (total - 1)
+            # A node can be source and target on the same side for different edges.
+            # Match the edge endpoint that actually uses this node/side.
+            if diagram.edges[index].source == node_id and chosen_side.get((index, "source")) == side:
+                rank_lookup[(index, "source")] = (rank, total)
+                assigned[(index, "source")] = (side, fraction, 0.0, rank, total)
+            if diagram.edges[index].target == node_id and chosen_side.get((index, "target")) == side:
+                rank_lookup[(index, "target")] = (rank, total)
+                assigned[(index, "target")] = (side, fraction, 0.0, rank, total)
+    for index, edge in enumerate(diagram.edges):
+        source_rank = rank_lookup.get((index, "source"), (0, 1))
+        if (index, "source") in assigned:
+            side, fraction, _offset, rank, total = assigned[(index, "source")]
+            lane = (rank - (total - 1) / 2.0) * _FAST_LANE
+            assigned[(index, "source")] = (side, fraction, lane, rank, total)
+        target_rank = rank_lookup.get((index, "target"), (0, 1))
+        if (index, "target") in assigned:
+            side, fraction, _offset, rank, total = assigned[(index, "target")]
+            lane = (rank - (target_rank[1] - 1) / 2.0) * _FAST_LANE
+            assigned[(index, "target")] = (side, fraction, lane, rank, total)
+        del source_rank
+    return assigned
+
+
+def _bus_offset(room: float) -> float:
+    """Short gap between a stack face and the shared trunk, staying in the open side."""
+    if room <= 0.16:
+        return max(0.08, room * 0.4)
+    return min(0.40, max(0.26, room * 0.18))
+
+
+def _open_bus_join(
+    preferred: float,
+    low: float,
+    high: float,
+    taps: Sequence[float],
+) -> float | None:
+    """Pick a trunk joint in the open gap, clear of the perpendicular taps."""
+    if high < low:
+        return None
+    ordered = sorted(taps)
+    candidates: list[float] = []
+    if low <= preferred <= high and all(abs(preferred - tap) >= 0.28 for tap in ordered):
+        candidates.append(preferred)
+    for left, right in zip(ordered, ordered[1:]):
+        mid = (left + right) / 2.0
+        if low <= mid <= high and all(abs(mid - tap) >= 0.28 for tap in ordered):
+            candidates.append(mid)
+    if not candidates:
+        clamped = min(high, max(low, preferred))
+        if low <= clamped <= high:
+            return clamped
+        return None
+    return min(candidates, key=lambda value: (abs(value - preferred), value))
+
+
+def _aligned_bus_members(
+    component_ids: Sequence[str],
+    boxes: Mapping[str, Box],
+) -> tuple[list[str], str] | None:
+    """Largest column or row of at least two components, plus its axis."""
+    best: list[str] = []
+    best_axis = ""
+    ordered_ids = [component_id for component_id in component_ids if component_id in boxes]
+    for axis in ("x", "y"):
+        coord = 0 if axis == "x" else 1
+        other = 1 - coord
+        ordered = sorted(ordered_ids, key=lambda component_id: _box_center(boxes[component_id])[coord])
+        for start in range(len(ordered)):
+            window = [ordered[start]]
+            origin = _box_center(boxes[ordered[start]])[coord]
+            for component_id in ordered[start + 1:]:
+                if _box_center(boxes[component_id])[coord] - origin <= 0.55:
+                    window.append(component_id)
+                else:
+                    break
+            if len(window) < 2:
+                continue
+            other_values = [_box_center(boxes[component_id])[other] for component_id in window]
+            if max(other_values) - min(other_values) < 0.35:
+                continue
+            if len(window) > len(best):
+                best = list(window)
+                best_axis = "column" if axis == "x" else "row"
+    if len(best) < 2:
+        return None
+    return best, best_axis
+
+
+def _largest_line(component_ids: Sequence[str], boxes: Mapping[str, Box], kind: str) -> list[str]:
+    """Largest column or row of at least two components."""
+    coord = 0 if kind == "column" else 1
+    other = 1 - coord
+    ordered = sorted(
+        (component_id for component_id in component_ids if component_id in boxes),
+        key=lambda component_id: _box_center(boxes[component_id])[coord],
+    )
+    best: list[str] = []
+    ids = list(ordered)
+    for start, origin_id in enumerate(ids):
+        window = [origin_id]
+        origin = _box_center(boxes[origin_id])[coord]
+        for component_id in ids[start + 1:]:
+            if _box_center(boxes[component_id])[coord] - origin <= 0.55:
+                window.append(component_id)
+            else:
+                break
+        if len(window) < 2:
+            continue
+        spread = [
+            _box_center(boxes[component_id])[other] for component_id in window
+        ]
+        if max(spread) - min(spread) < 0.35:
+            continue
+        better = len(window) > len(best)
+        if not better and len(window) == len(best) and best:
+            if kind == "column":
+                window_edge = min(_box_center(boxes[item])[0] for item in window)
+                best_edge = min(_box_center(boxes[item])[0] for item in best)
+            else:
+                window_edge = min(_box_center(boxes[item])[1] for item in window)
+                best_edge = min(_box_center(boxes[item])[1] for item in best)
+            better = window_edge < best_edge
+        if better:
+            best = list(window)
+    return best
+
+
+def _segment_blocked(points: Sequence[Point], obstacles: Sequence[Box]) -> bool:
+    if len(points) < 2:
+        return True
+    shrunk = []
+    for box in obstacles:
+        rect = _inflate_box(box, -0.05)
+        if rect[2] > 0.05 and rect[3] > 0.05:
+            shrunk.append(rect)
+    if not shrunk:
+        return False
+    dummy = shrunk[0]
+    return _hard_hits(points, shrunk, dummy, dummy, ignore_source=True, ignore_target=True) > 0
+
+
+def _structured_bus_routes(
+    edges: Sequence,
+    boxes: Mapping[str, Box],
+    junction_ids: set[str],
+) -> dict[int, list[Point]]:
+    """One backbone for a stack, a row, and an optional single component.
+
+    The stack gets a trunk and a short tap each. The row gets a header on its
+    outer side and a short drop each. One riser joins the trunk to the header.
+    The remaining component meets the trunk with one elbow. Names are not used.
+    """
+    components = [node_id for node_id in boxes if node_id not in junction_ids]
+    column = _largest_line(components, boxes, "column")
+    if len(column) < 2:
+        return {}
+    column_set = set(column)
+    row = _largest_line([node_id for node_id in components if node_id not in column_set], boxes, "row")
+    if len(row) < 2:
+        return {}
+    row_set = set(row)
+    singletons = [node_id for node_id in components if node_id not in column_set and node_id not in row_set]
+    singleton = singletons[0] if len(singletons) == 1 else None
+
+    adjacency: dict[str, set[str]] = defaultdict(set)
+    for edge in edges:
+        source, target = str(edge.source), str(edge.target)
+        adjacency[source].add(target)
+        adjacency[target].add(source)
+    seen: set[str] = set()
+    stack = list(column)
+    reaches_row = False
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        if node in row_set:
+            reaches_row = True
+            break
+        stack.extend(adjacency.get(node, ()))
+    if not reaches_row:
+        return {}
+
+    def attached_junctions(members: set[str]) -> set[str]:
+        found = set()
+        for edge in edges:
+            source, target = str(edge.source), str(edge.target)
+            if source in members and target in junction_ids:
+                found.add(target)
+            elif target in members and source in junction_ids:
+                found.add(source)
+        return found
+
+    def grow(seeds: set[str], blocked: set[str]) -> set[str]:
+        zone = set(seeds)
+        pending = list(seeds)
+        while pending:
+            node = pending.pop()
+            for nxt in adjacency.get(node, ()):
+                if nxt in zone or nxt in blocked or nxt not in junction_ids:
+                    continue
+                zone.add(nxt)
+                pending.append(nxt)
+        return zone
+
+    column_direct = attached_junctions(column_set)
+    row_direct = attached_junctions(row_set)
+    column_zone = grow(column_direct, row_direct)
+    row_zone = grow(row_direct, column_zone)
+    if not column_zone or not row_zone:
+        return {}
+
+    column_boxes = [boxes[node_id] for node_id in column]
+    row_boxes = [boxes[node_id] for node_id in row]
+    column_left = min(box[0] for box in column_boxes)
+    column_right = max(box[0] + box[2] for box in column_boxes)
+    column_center = (column_left + column_right) / 2.0
+    row_left = min(box[0] for box in row_boxes)
+    row_right = max(box[0] + box[2] for box in row_boxes)
+    row_top = min(box[1] for box in row_boxes)
+    row_bottom = max(box[1] + box[3] for box in row_boxes)
+    row_center_x = (row_left + row_right) / 2.0
+    row_center_y = (row_top + row_bottom) / 2.0
+    column_center_y = sum(_box_center(box)[1] for box in column_boxes) / len(column_boxes)
+
+    if row_center_x >= column_center:
+        trunk = column_right + 0.24
+        column_side = "right"
+        channel = row_left - 0.16
+        riser = min(trunk + 0.46, channel)
+        if riser - trunk < 0.14:
+            riser = trunk
+    else:
+        trunk = column_left - 0.24
+        column_side = "left"
+        channel = row_right + 0.16
+        riser = max(trunk - 0.46, channel)
+        if trunk - riser < 0.14:
+            riser = trunk
+    if abs(riser - trunk) > 1e-6 and _segment_blocked([(trunk, column_center_y), (riser, column_center_y)], row_boxes):
+        riser = trunk
+
+    if row_center_y < column_center_y:
+        header = row_top - 0.36
+        row_side = "top"
+    else:
+        header = row_bottom + 0.36
+        row_side = "bottom"
+
+    proposals: dict[int, list[Point]] = {}
+    tap_ys: list[float] = []
+    tap_xs: list[float] = []
+    for index, edge in enumerate(edges):
+        source, target = str(edge.source), str(edge.target)
+        member = source if source in column_set else target if target in column_set else None
+        if member is None or (source in row_set or target in row_set):
+            continue
+        other = target if source == member else source
+        if other not in junction_ids and other not in column_set:
+            continue
+        port = _port_on_side(boxes[member], column_side, 0.5)
+        tap = (trunk, port[1])
+        points = [port, tap] if source == member else [tap, port]
+        proposals[index] = _compress(points)
+        tap_ys.append(port[1])
+    for index, edge in enumerate(edges):
+        source, target = str(edge.source), str(edge.target)
+        if source in column_set or target in column_set:
+            continue
+        member = source if source in row_set else target if target in row_set else None
+        if member is None:
+            continue
+        other = target if source == member else source
+        if other not in junction_ids and other not in row_set:
+            continue
+        port = _port_on_side(boxes[member], row_side, 0.5)
+        drop = (port[0], header)
+        points = [port, drop] if source == member else [drop, port]
+        proposals[index] = _compress(points)
+        tap_xs.append(port[0])
+    if len(tap_ys) < 2 or len(tap_xs) < 2:
+        return {}
+
+    ordered_y = sorted(set(round(value, 3) for value in tap_ys))
+    gap_points: list[float] = []
+    for left, right in zip(ordered_y, ordered_y[1:]):
+        if right - left < 0.45:
+            continue
+        gap_points.append((left + right) / 2.0)
+        if right - left >= 1.0:
+            gap_points.append(left + (right - left) * 0.35)
+            gap_points.append(left + (right - left) * 0.65)
+    if not gap_points:
+        gap_points = [ordered_y[0], ordered_y[-1]]
+    facing = row_bottom if row_center_y < column_center_y else row_top
+    gap_mids = [
+        (left + right) / 2.0
+        for left, right in zip(ordered_y, ordered_y[1:])
+        if right - left >= 0.45
+    ] or list(gap_points)
+
+    def riser_points(join: float) -> list[Point]:
+        points = [(trunk, join)]
+        if abs(riser - trunk) > 0.08:
+            points.append((riser, join))
+        points.append((riser, header))
+        span_left = min(list(tap_xs) + [riser])
+        span_right = max(list(tap_xs) + [riser])
+        if span_left < riser - 0.01:
+            points.append((span_left, header))
+        if span_right > riser + 0.01:
+            points.append((span_right, header))
+        return points
+
+    riser_join = min(gap_mids, key=lambda value: abs(value - facing))
+    for candidate in sorted(gap_mids, key=lambda value: abs(value - facing)):
+        if not _segment_blocked(riser_points(candidate), column_boxes + row_boxes):
+            riser_join = candidate
+            break
+    riser_poly = _compress(riser_points(riser_join))
+
+    singleton_poly: list[Point] | None = None
+    if singleton is not None:
+        singleton_box = boxes[singleton]
+        obstacles = [boxes[node_id] for node_id in components if node_id != singleton]
+        top = singleton_box[1]
+        bottom = top + singleton_box[3]
+        just_above = top - 0.28
+        just_below = bottom + 0.28
+        feeder_gaps = list(gap_points)
+        for extra in (just_above, just_below):
+            for left, right in zip(ordered_y, ordered_y[1:]):
+                if left + 0.22 <= extra <= right - 0.22:
+                    feeder_gaps.append(extra)
+                    break
+        preferred = just_above
+        ordered_gaps = sorted(
+            feeder_gaps,
+            key=lambda value: (abs(value - riser_join) < 0.34, 0 if value <= top - 0.12 else 1, abs(value - preferred)),
+        )
+        for candidate in ordered_gaps:
+            top = singleton_box[1]
+            bottom = top + singleton_box[3]
+            if candidate <= top - 0.12:
+                port = _port_on_side(singleton_box, "top", 0.5)
+                poly = [(trunk, candidate), (port[0], candidate), port]
+            elif candidate >= bottom + 0.12:
+                port = _port_on_side(singleton_box, "bottom", 0.5)
+                poly = [(trunk, candidate), (port[0], candidate), port]
+            else:
+                center_x = _box_center(singleton_box)[0]
+                side = "left" if center_x > trunk else "right"
+                port = _port_on_side(singleton_box, side, 0.5)
+                if abs(port[1] - candidate) > 0.12:
+                    continue
+                poly = [(trunk, port[1]), port]
+            if not _segment_blocked(poly, obstacles):
+                singleton_poly = _compress(poly)
+                break
+        if singleton_poly is None:
+            return {}
+
+    span_lo = min([min(tap_ys), riser_join] + ([singleton_poly[0][1]] if singleton_poly else []))
+    span_hi = max([max(tap_ys), riser_join] + ([singleton_poly[0][1]] if singleton_poly else []))
+    # The singleton polyline may start at the component. Use the trunk joint, which shares trunk x.
+    trunk_joints = [point[1] for point in (singleton_poly or []) if abs(point[0] - trunk) <= 0.08]
+    if trunk_joints:
+        span_lo = min(span_lo, min(trunk_joints))
+        span_hi = max(span_hi, max(trunk_joints))
+    trunk_poly = [(trunk, span_lo), (trunk, span_hi)]
+    header_xs = list(tap_xs) + [riser]
+    header_poly = [(min(header_xs), header), (max(header_xs), header)]
+
+    backbone = [trunk_poly, header_poly, riser_poly]
+    if singleton_poly:
+        backbone.append(singleton_poly)
+    if any(_segment_blocked(poly, column_boxes + row_boxes + ([boxes[singleton]] if singleton and poly is not singleton_poly else [])) for poly in (trunk_poly, header_poly, riser_poly)):
+        return {}
+
+    for index, edge in enumerate(edges):
+        source, target = str(edge.source), str(edge.target)
+        if index in proposals:
+            continue
+        if singleton and (source == singleton or target == singleton):
+            points = list(singleton_poly or [])
+            if source != singleton:
+                points.reverse()
+            # singleton_poly runs from the trunk to the component
+            if singleton_poly and abs(singleton_poly[0][0] - trunk) <= 0.08:
+                points = list(singleton_poly if target == singleton else list(reversed(singleton_poly)))
+            proposals[index] = _compress(points)
+            continue
+        source_column = source in column_zone
+        target_column = target in column_zone
+        source_row = source in row_zone
+        target_row = target in row_zone
+        if source_column and target_column:
+            proposals[index] = list(trunk_poly)
+        elif source_row and target_row:
+            proposals[index] = list(header_poly)
+        elif (source_column and target_row) or (source_row and target_column):
+            points = list(riser_poly)
+            if source_row and target_column:
+                points.reverse()
+            proposals[index] = _compress(points)
+    return {index: points for index, points in proposals.items() if len(points) >= 2}
+
+
+def _manifold_routes(
+    edges: Sequence,
+    boxes: Mapping[str, Box],
+    junction_ids: set[str],
+) -> dict[int, list[Point]]:
+    """Shared trunk with one tap per aligned component and one elbow from the singleton.
+
+    This is the reference fan: a line of components, a trunk on the open side facing
+    the remaining component, short perpendicular taps, and a single elbow from that
+    singleton onto the trunk. Component names are not used.
+    """
+    if len(junction_ids) < 1:
+        return {}
+
+    parent = {junction_id: junction_id for junction_id in junction_ids}
+
+    def find(junction_id: str) -> str:
+        while parent[junction_id] != junction_id:
+            parent[junction_id] = parent[parent[junction_id]]
+            junction_id = parent[junction_id]
+        return junction_id
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    junction_edges: list[tuple[int, str, str]] = []
+    attachments: list[tuple[int, str, str]] = []
+    for index, edge in enumerate(edges):
+        source, target = str(edge.source), str(edge.target)
+        source_is_junction = source in junction_ids
+        target_is_junction = target in junction_ids
+        if source_is_junction and target_is_junction:
+            union(source, target)
+            junction_edges.append((index, source, target))
+        elif source_is_junction and target in boxes:
+            attachments.append((index, source, target))
+        elif target_is_junction and source in boxes:
+            attachments.append((index, target, source))
+
+    groups: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    for item in attachments:
+        groups[find(item[1])].append(item)
+    trunk_groups: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    for item in junction_edges:
+        trunk_groups[find(item[1])].append(item)
+
+    routed: dict[int, list[Point]] = {}
+    for root, attached in groups.items():
+        by_component: dict[str, list[tuple[int, str]]] = defaultdict(list)
+        for edge_index, junction_id, component_id in attached:
+            by_component[component_id].append((edge_index, junction_id))
+        if any(len(items) != 1 for items in by_component.values()):
+            continue
+        aligned = _aligned_bus_members(list(by_component), boxes)
+        if aligned is None:
+            continue
+        members, axis = aligned
+        outsiders = [component_id for component_id in by_component if component_id not in set(members)]
+        if len(outsiders) != 1:
+            continue
+        feeder_id = outsiders[0]
+        feeder_box = boxes[feeder_id]
+        member_boxes = [boxes[component_id] for component_id in members]
+        feeder_center = _box_center(feeder_box)
+
+        if axis == "column":
+            stack_left = min(box[0] for box in member_boxes)
+            stack_right = max(box[0] + box[2] for box in member_boxes)
+            if feeder_center[0] >= (stack_left + stack_right) / 2.0:
+                room = feeder_box[0] - stack_right
+                trunk = stack_right + _bus_offset(room)
+                member_side = "right"
+            else:
+                room = stack_left - (feeder_box[0] + feeder_box[2])
+                trunk = stack_left - _bus_offset(room)
+                member_side = "left"
+        else:
+            stack_top = min(box[1] for box in member_boxes)
+            stack_bottom = max(box[1] + box[3] for box in member_boxes)
+            if feeder_center[1] >= (stack_top + stack_bottom) / 2.0:
+                room = feeder_box[1] - stack_bottom
+                trunk = stack_bottom + _bus_offset(room)
+                member_side = "bottom"
+            else:
+                room = stack_top - (feeder_box[1] + feeder_box[3])
+                trunk = stack_top - _bus_offset(room)
+                member_side = "top"
+
+        proposals: dict[int, list[Point]] = {}
+        stations: dict[str, float] = {}
+        tap_values: list[float] = []
+        for component_id in members:
+            edge_index, junction_id = by_component[component_id][0]
+            port = _port_on_side(boxes[component_id], member_side, 0.5)
+            if axis == "column":
+                tap = (trunk, port[1])
+                stations[junction_id] = port[1]
+                tap_values.append(port[1])
+            else:
+                tap = (port[0], trunk)
+                stations[junction_id] = port[0]
+                tap_values.append(port[0])
+            points = [port, tap]
+            if str(edges[edge_index].source) != component_id:
+                points.reverse()
+            proposals[edge_index] = _compress(points)
+
+        span_lo, span_hi = min(tap_values), max(tap_values)
+        feeder_edge_index, feeder_junction = by_component[feeder_id][0]
+        if axis == "column":
+            top = feeder_box[1]
+            bottom = feeder_box[1] + feeder_box[3]
+            room_above = top - span_lo
+            room_below = span_hi - bottom
+            if room_above >= 0.18:
+                preferred = top - min(0.55, room_above)
+                join = _open_bus_join(preferred, span_lo, min(span_hi, top - 0.18), tap_values)
+                if join is None:
+                    continue
+                port = _port_on_side(feeder_box, "top", 0.5)
+                feeder_points = [(trunk, join), (port[0], join), port]
+            elif room_below >= 0.18:
+                preferred = bottom + min(0.55, room_below)
+                join = _open_bus_join(preferred, max(span_lo, bottom + 0.18), span_hi, tap_values)
+                if join is None:
+                    continue
+                port = _port_on_side(feeder_box, "bottom", 0.5)
+                feeder_points = [(trunk, join), (port[0], join), port]
+            else:
+                side = "left" if feeder_center[0] > trunk else "right"
+                port = _port_on_side(feeder_box, side, 0.5)
+                join = port[1]
+                feeder_points = [(trunk, join), port]
+            if feeder_junction not in stations:
+                stations[feeder_junction] = join
+        else:
+            left = feeder_box[0]
+            right = feeder_box[0] + feeder_box[2]
+            room_left = left - span_lo
+            room_right = span_hi - right
+            if span_lo - 0.05 <= feeder_center[0] <= span_hi + 0.05:
+                side = "top" if feeder_center[1] > trunk else "bottom"
+                port = _port_on_side(feeder_box, side, 0.5)
+                join = port[0]
+                feeder_points = [(join, trunk), port]
+            elif room_left >= 0.18 or feeder_center[0] < span_lo:
+                join = span_lo
+                port = _port_on_side(feeder_box, "top" if feeder_center[1] > trunk else "bottom", 0.5)
+                feeder_points = [(join, trunk), (port[0], trunk), port]
+            elif room_right >= 0.18 or feeder_center[0] > span_hi:
+                join = span_hi
+                port = _port_on_side(feeder_box, "top" if feeder_center[1] > trunk else "bottom", 0.5)
+                feeder_points = [(join, trunk), (port[0], trunk), port]
+            else:
+                continue
+            if feeder_junction not in stations:
+                stations[feeder_junction] = join
+        if str(edges[feeder_edge_index].source) == feeder_id:
+            feeder_points = list(reversed(feeder_points))
+        proposals[feeder_edge_index] = _compress(feeder_points)
+
+        trunk_proposals: list[tuple[int, list[Point] | None]] = []
+        for edge_index, source_id, target_id in trunk_groups.get(root, []):
+            source_station = stations.get(source_id, join)
+            target_station = stations.get(target_id, join)
+            if abs(source_station - target_station) <= 1e-6:
+                trunk_proposals.append((edge_index, None))
+                continue
+            if axis == "column":
+                poly = [(trunk, source_station), (trunk, target_station)]
+            else:
+                poly = [(source_station, trunk), (target_station, trunk)]
+            trunk_proposals.append((edge_index, poly))
+        real_trunk = next((poly for _index, poly in trunk_proposals if poly), None)
+        if real_trunk is None and len(members) >= 2:
+            ordered_taps = sorted(tap_values)
+            if axis == "column":
+                real_trunk = [(trunk, ordered_taps[0]), (trunk, ordered_taps[-1])]
+            else:
+                real_trunk = [(ordered_taps[0], trunk), (ordered_taps[-1], trunk)]
+        for edge_index, poly in trunk_proposals:
+            proposals[edge_index] = list(poly or real_trunk or [])
+
+        foreign = [
+            box
+            for node_id, box in boxes.items()
+            if node_id not in junction_ids and node_id not in set(members) and node_id != feeder_id
+        ]
+        blocked = False
+        for poly in proposals.values():
+            if len(poly) < 2:
+                continue
+            if _hard_hits(poly, [_inflate_box(box, 0.02) for box in foreign], poly and boxes.get(feeder_id, feeder_box), feeder_box, ignore_source=True, ignore_target=True):
+                blocked = True
+                break
+        if blocked:
+            continue
+        routed.update(proposals)
+    return routed
+
+
+def _spine_route(
+    source_box: Box,
+    target_box: Box,
+    source_is_junction: bool,
+    target_is_junction: bool,
+) -> list[Point] | None:
+    """Orthogonal bus route for a topology spine.
+
+    Junction-to-junction edges stay on the trunk. A component beside the trunk
+    gets a straight branch. A component off to the side meets the trunk with one
+    elbow, which is the shared fan shown in the reference sketch.
+    """
+    if not source_is_junction and not target_is_junction:
+        return None
+
+    source_center = _box_center(source_box)
+    target_center = _box_center(target_box)
+    if source_is_junction and target_is_junction:
+        if abs(source_center[0] - target_center[0]) <= 0.08:
+            return _compress([source_center, (source_center[0], target_center[1])])
+        if abs(source_center[1] - target_center[1]) <= 0.08:
+            return _compress([source_center, (target_center[0], source_center[1])])
+        return _compress([source_center, (target_center[0], source_center[1]), target_center])
+
+    if source_is_junction:
+        junction_box, component_box = source_box, target_box
+        junction_point, component_point = source_center, target_center
+        junction_first = True
+    else:
+        junction_box, component_box = target_box, source_box
+        junction_point, component_point = target_center, source_center
+        junction_first = False
+
+    jx, jy = junction_point
+    cx, cy = component_point
+    same_row = abs(jy - cy) <= max(component_box[3] * 0.55, 0.12)
+    same_column = abs(jx - cx) <= max(component_box[2] * 0.55, 0.12)
+    if same_row and not same_column:
+        port = _port_on_side(component_box, "right" if jx >= cx else "left", 0.5)
+        component_to_junction = _compress([port, junction_point])
+    elif same_column and not same_row:
+        port = _port_on_side(component_box, "bottom" if jy >= cy else "top", 0.5)
+        component_to_junction = _compress([port, junction_point])
+    elif abs(jx - cx) >= abs(jy - cy):
+        port = _port_on_side(component_box, "right" if jx >= cx else "left", 0.5)
+        component_to_junction = _compress([port, (jx, port[1]), junction_point])
+    else:
+        port = _port_on_side(component_box, "bottom" if jy >= cy else "top", 0.5)
+        component_to_junction = _compress([port, (port[0], jy), junction_point])
+
+    if junction_first:
+        return list(reversed(component_to_junction))
+    return component_to_junction
+
+
+def _plan_fast_orthogonal_routes(
+    diagram: DiagramSpec,
+    boxes: Mapping[str, Box],
+    bounds: tuple[float, float, float, float],
+) -> list[tuple[list[Point], str] | None]:
+    edges = list(diagram.edges)
+    if not edges:
+        return []
+
+    normalized_boxes = {
+        str(node_id): (float(box[0]), float(box[1]), float(box[2]), float(box[3]))
+        for node_id, box in boxes.items()
+        if box is not None and len(box) == 4
+    }
+    final_key = (
+        tuple((str(edge.id), str(edge.source), str(edge.target)) for edge in edges),
+        tuple(sorted((node_id, _qbox(box)) for node_id, box in normalized_boxes.items())),
+        tuple(_q(value) for value in bounds),
+        (_q(_FAST_CLEARANCE), _q(_FAST_ESCAPE), _q(_FAST_LANE)),
+    )
+    cached_final = _cache_get(_FINAL_ROUTE_CACHE, final_key)
+    if cached_final is not None:
+        return [
+            ([(x, y) for x, y in points], direction) if points is not None else None
+            for points, direction in cached_final
+        ]
+
+    junction_ids = {
+        str(node.id)
+        for node in diagram.nodes
+        if str(getattr(node, "node_type", "") or "") == "junction"
+    }
+    manifold = _manifold_routes(edges, normalized_boxes, junction_ids)
+    manifold.update(_structured_bus_routes(edges, normalized_boxes, junction_ids))
+    ports = _assign_port_fractions(diagram, normalized_boxes)
+    prepared: list[list[tuple[tuple[Point, ...], int, bool]]] = []
+    pass_one: list[tuple[Point, ...] | None] = []
+
+    for index, edge in enumerate(edges):
+        source_box = normalized_boxes.get(str(edge.source))
+        target_box = normalized_boxes.get(str(edge.target))
+        if source_box is None or target_box is None:
+            prepared.append([])
+            pass_one.append(None)
+            continue
+
+        forced = manifold.get(index)
+        if forced and len(forced) >= 2:
+            prepared.append([(tuple(forced), 0, False)])
+            pass_one.append(tuple(forced))
+            continue
+
+        source_is_junction = str(edge.source) in junction_ids
+        target_is_junction = str(edge.target) in junction_ids
+        obstacle_boxes = [
+            box
+            for node_id, box in normalized_boxes.items()
+            if node_id not in {str(edge.source), str(edge.target)} and node_id not in junction_ids
+        ]
+        corridor = _corridor_obstacles(source_box, target_box, obstacle_boxes)
+        if source_is_junction or target_is_junction:
+            spine = _spine_route(
+                source_box,
+                target_box,
+                source_is_junction,
+                target_is_junction,
+            )
+            if spine:
+                spine_hits = _hard_hits(
+                    spine,
+                    [_inflate_box(box, _FAST_CLEARANCE) for box in corridor],
+                    source_box,
+                    target_box,
+                    ignore_source=source_is_junction,
+                    ignore_target=target_is_junction,
+                )
+                if spine_hits == 0:
+                    prepared.append([(tuple(spine), 0, False)])
+                    pass_one.append(tuple(spine))
+                    continue
+
+        source_port = ports.get((index, "source"))
+        target_port = ports.get((index, "target"))
+        if source_port is None or target_port is None:
+            source_port = ("right", 0.5, 0.0, 0, 1)
+            target_port = ("left", 0.5, 0.0, 0, 1)
+
+        source_side, source_fraction, lane_offset, _rank, _total = source_port
+        target_side, target_fraction, _target_lane, _target_rank, _target_total = target_port
+        primary, alternate = _side_pairs(source_box, target_box)
+        candidate_pairs = _all_candidate_side_pairs(source_box, target_box)
+        bundles = [(primary, False)]
+        for pair in candidate_pairs:
+            if pair != primary:
+                bundles.append((pair, True))
+
+        bundle_candidates: list[tuple[tuple[Point, ...], int, bool]] = []
+        for (side_a, side_b), is_alternate in bundles:
+            use_source_fraction = source_fraction if not is_alternate else 0.5
+            use_target_fraction = target_fraction if not is_alternate else 0.5
+            for points, hits in _edge_candidates(
+                source_box,
+                target_box,
+                side_a,
+                use_source_fraction,
+                side_b,
+                use_target_fraction,
+                corridor,
+                0.0 if is_alternate else lane_offset,
+            ):
+                bundle_candidates.append((points, hits, is_alternate))
+
+        if not any(hits == 0 for _points, hits, _alternate in bundle_candidates):
+            start = _port_on_side(source_box, source_side, source_fraction)
+            end = _port_on_side(target_box, target_side, target_fraction)
+            astar_points = _local_astar(
+                _stub_point(start, source_side, _FAST_ESCAPE),
+                _stub_point(end, target_side, _FAST_ESCAPE),
+                [_inflate_box(box, _FAST_CLEARANCE) for box in corridor],
+            )
+            if astar_points:
+                astar_points = _compress([start] + astar_points + [end])
+                hits = _hard_hits(
+                    astar_points,
+                    [_inflate_box(box, _FAST_CLEARANCE) for box in corridor],
+                    source_box,
+                    target_box,
+                )
+                if hits == 0:
+                    bundle_candidates.append((tuple(astar_points), 0, False))
+
+        prepared.append(bundle_candidates)
+        clean = [item for item in bundle_candidates if item[1] == 0 and not item[2]]
+        pool = clean or [item for item in bundle_candidates if item[1] == 0] or bundle_candidates
+        if pool:
+            best = min(pool, key=lambda item: (item[1], len(item[0]), item[0]))
+            pass_one.append(best[0])
+        else:
+            pass_one.append(None)
+
+    grid = _soft_obstacle_grid(pass_one)
+
+    result: list[tuple[tuple[Point, ...], str] | None] = []
+    for index, edge in enumerate(edges):
+        bundle = prepared[index]
+        if not bundle:
+            result.append(None)
+            continue
+        source_box = normalized_boxes[str(edge.source)]
+        target_box = normalized_boxes[str(edge.target)]
+        forward = (
+            _box_center(target_box)[0] - _box_center(source_box)[0],
+            _box_center(target_box)[1] - _box_center(source_box)[1],
+        )
+        clean = [item for item in bundle if item[1] == 0]
+        pool = clean or bundle
+
+        def sort_key(item, grid=grid, owner=index, forward=forward):
+            points, hits, alternate = item
+            cost, bend_count, length = _fast_route_cost(points, grid, owner, forward, alternate)
+            return (hits, cost, bend_count, length, points)
+
+        chosen_points, _hits, _alternate = min(pool, key=sort_key)
+        result.append((chosen_points, _route_direction(chosen_points)))
+
+    frozen_result = tuple(result)
+    _cache_put(_FINAL_ROUTE_CACHE, final_key, frozen_result, _FINAL_CACHE_LIMIT)
+    return [
+        ([(x, y) for x, y in points], direction) if points is not None else None
+        for points, direction in result
+    ]
+
+
 class ConnectionRouter:
     """Reusable renderer-independent orthogonal connection router.
 
@@ -4174,7 +5722,7 @@ class ConnectionRouter:
         self.bounds = bounds
 
     def route(self) -> list[tuple[list[Point], str] | None]:
-        return _plan_connection_routes_impl(self.diagram, self.boxes, self.bounds)
+        return plan_connection_routes(self.diagram, self.boxes, self.bounds)
 
 
 def plan_connection_routes(
@@ -4182,5 +5730,5 @@ def plan_connection_routes(
     boxes: Mapping[str, Box],
     bounds: tuple[float, float, float, float],
 ) -> list[tuple[list[Point], str] | None]:
-    """Compatibility function used by the existing renderer."""
-    return ConnectionRouter(diagram, boxes, bounds).route()
+    """Route existing edges from current boxes. Topology is not modified."""
+    return _plan_fast_orthogonal_routes(diagram, boxes, bounds)

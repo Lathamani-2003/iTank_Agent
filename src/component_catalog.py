@@ -1786,6 +1786,81 @@ def _graph_positions(
             )
             positions[instance.node_id] = (x, y_fixed)
 
+    sumps = [
+        instance for instance in instances
+        if instance.definition.node_type == "sump"
+    ]
+    tanks = [
+        instance for instance in instances
+        if instance.definition.node_type == "oht"
+    ]
+    bores = [
+        instance for instance in instances
+        if instance.definition.node_type == "bore"
+    ]
+    if sumps:
+        sumps.sort(key=lambda instance: (instance.instance_index, instance.node_id))
+        y_top, y_bottom = 0.28, 0.78
+        for index, instance in enumerate(sumps):
+            y = (
+                0.50
+                if len(sumps) == 1
+                else y_top + (y_bottom - y_top) * index / (len(sumps) - 1)
+            )
+            positions[instance.node_id] = (0.18, y)
+    if bores:
+        # Borewells keep one fixed slot. Adding sumps or tanks does not move them.
+        bores.sort(key=lambda instance: (instance.instance_index, instance.node_id))
+        anchor_y = 0.53
+        for index, instance in enumerate(bores):
+            y = anchor_y + (index - (len(bores) - 1) / 2.0) * 0.22
+            positions[instance.node_id] = (0.78, max(0.18, min(0.84, y)))
+    if tanks:
+        tanks.sort(key=lambda instance: (instance.instance_index, instance.node_id))
+        x_left, x_right = 0.42, 0.90
+        for index, instance in enumerate(tanks):
+            x = (
+                (x_left + x_right) / 2.0
+                if len(tanks) == 1
+                else x_left + (x_right - x_left) * index / (len(tanks) - 1)
+            )
+            positions[instance.node_id] = (x, 0.12)
+    placed = {instance.node_id for instance in sumps}
+    placed.update(instance.node_id for instance in tanks)
+    placed.update(instance.node_id for instance in bores)
+    others = [
+        instance for instance in instances
+        if instance.node_id not in placed
+    ]
+    if others:
+        others.sort(key=lambda instance: (
+            instance.definition.order,
+            instance.definition.node_type,
+            instance.instance_index,
+            instance.node_id,
+        ))
+        groups: list[list] = []
+        for instance in others:
+            if groups and groups[-1][0].definition.node_type == instance.definition.node_type:
+                groups[-1].append(instance)
+            else:
+                groups.append([instance])
+        x_left, x_right = 0.48, 0.90
+        y_top, y_bottom = 0.46, 0.84
+        for group_index, group in enumerate(groups):
+            x = (
+                (x_left + x_right) / 2.0
+                if len(groups) == 1
+                else x_left + (x_right - x_left) * group_index / (len(groups) - 1)
+            )
+            for index, instance in enumerate(group):
+                y = (
+                    (y_top + y_bottom) / 2.0
+                    if len(group) == 1
+                    else y_top + (y_bottom - y_top) * index / (len(group) - 1)
+                )
+                positions[instance.node_id] = (x, y)
+
     return positions
 
 
