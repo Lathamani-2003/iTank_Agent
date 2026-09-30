@@ -450,6 +450,47 @@ def _wifi_badge_png_bytes(size: int = 160) -> bytes:
     return output.getvalue()
 
 
+# Valves and flow meters stay smaller than the worksheet cards so the pipe
+# can pass through the symbol instead of stopping on a large outer frame.
+_INLINE_PIPE_CODES = {"MV", "PRV", "NRV", "UFM", "FFM", "EMFM", "PFM"}
+_INLINE_PIPE_SIZE = (0.68, 0.50)
+
+
+def _node_is_inline_pipe_symbol(node) -> bool:
+    """True for PRV, NRV, motorized valves and flow meters only."""
+    if str(getattr(node, "node_type", "") or "") == "valve":
+        return True
+    for detail in list(getattr(node, "details", []) or []):
+        text = str(detail or "").strip()
+        if text.lower().startswith("code:"):
+            code = text.split(":", 1)[1].strip().upper()
+            if code in _INLINE_PIPE_CODES:
+                return True
+    label = str(getattr(node, "label", "") or "").lower()
+    return "flow meter" in label or "flowmeter" in label
+
+
+def _compact_inline_pipe_boxes(diagram: DiagramSpec, boxes: dict) -> dict:
+    """Keep a dragged symbol where it is, and draw it at the compact pipe size."""
+    result = dict(boxes or {})
+    width, height = _INLINE_PIPE_SIZE
+    for node in list(getattr(diagram, "nodes", []) or []):
+        node_id = str(getattr(node, "id", "") or "")
+        box = result.get(node_id)
+        if box is None or len(box) != 4 or not _node_is_inline_pipe_symbol(node):
+            continue
+        left, top, box_w, box_h = [float(value) for value in box]
+        center_x = left + box_w / 2.0
+        center_y = top + box_h / 2.0
+        result[node_id] = (
+            center_x - width / 2.0,
+            center_y - height / 2.0,
+            width,
+            height,
+        )
+    return result
+
+
 # Professional card sizes. Dense diagrams scale these down automatically.
 NODE_SIZES = {
     "bore": (1.55, 1.24),
@@ -510,6 +551,7 @@ _MANUAL_COMPONENT_IMAGE_FILES: dict[str, str] = {
     "Valve Control Unit (VCU)": "VCU.png",
     "Display (D)": "Display.png",
     "Data Logger": "Data Logger.png",
+    "ACN 10": "ACN 10.png",
 }
 
 # Generic assets are retained ONLY for unknown/custom AI nodes.  Recognized
@@ -709,6 +751,7 @@ def _manual_component_name(node: DiagramNode) -> str | None:
         "WELL": "Well",
         "MOTOR": "Motor (Pump)",
         "ACOU": "Auto Change Over Unit",
+        "ACN10": "ACN 10",
     }
     return code_map.get(code)
 
@@ -1429,7 +1472,9 @@ def compute_layout_boxes(diagram: DiagramSpec):
         items = []
 
         for node in visible_nodes:
-            if selection_mode:
+            if _node_is_inline_pipe_symbol(node):
+                width, height = _INLINE_PIPE_SIZE
+            elif selection_mode:
                 # Keep the same professional card proportions on expanded canvases.
                 bulk_card_factor = 1.00 if visible_count <= 100 else 0.92
                 base_w, base_h = (1.42 * bulk_card_factor, 1.08 * bulk_card_factor)
@@ -6858,6 +6903,269 @@ def _effective_edge_direction(edge, manual_route_overrides=None) -> str:
     return str(getattr(edge, "direction", "source_to_target") or "source_to_target")
 
 
+def _shift_junctions_with_moved_components(diagram, boxes, base_boxes):
+    """Keep junction anchors with the components the user has already moved."""
+    result = dict(boxes)
+    component_delta = {}
+    moved = False
+    for node in getattr(diagram, "nodes", []) or []:
+        if str(getattr(node, "node_type", "") or "") == "junction":
+            continue
+        node_id = str(getattr(node, "id", "") or "")
+        old_box = base_boxes.get(node_id)
+        new_box = result.get(node_id)
+        if old_box is None or new_box is None:
+            continue
+        dx = (float(new_box[0]) + float(new_box[2]) / 2.0) - (
+            float(old_box[0]) + float(old_box[2]) / 2.0
+        )
+        dy = (float(new_box[1]) + float(new_box[3]) / 2.0) - (
+            float(old_box[1]) + float(old_box[3]) / 2.0
+        )
+        if abs(dx) > 0.01 or abs(dy) > 0.01:
+            moved = True
+        component_delta[node_id] = (dx, dy)
+    if not moved:
+        return result, False
+
+    neighbors = {}
+    for edge in getattr(diagram, "edges", []) or []:
+        neighbors.setdefault(str(edge.source), []).append(str(edge.target))
+        neighbors.setdefault(str(edge.target), []).append(str(edge.source))
+    junction_ids = [
+        str(getattr(node, "id", "") or "")
+        for node in getattr(diagram, "nodes", []) or []
+        if str(getattr(node, "node_type", "") or "") == "junction"
+    ]
+    junction_delta = {}
+    pending = set(junction_ids)
+    for _ in range(8):
+        if not pending:
+            break
+        progressed = False
+        for junction_id in list(pending):
+            deltas = []
+            for neighbor_id in neighbors.get(junction_id, []):
+                if neighbor_id in component_delta:
+                    deltas.append(component_delta[neighbor_id])
+                elif neighbor_id in junction_delta:
+                    deltas.append(junction_delta[neighbor_id])
+            if not deltas:
+                continue
+            junction_delta[junction_id] = (
+                sum(item[0] for item in deltas) / len(deltas),
+                sum(item[1] for item in deltas) / len(deltas),
+            )
+            pending.discard(junction_id)
+            progressed = True
+        if not progressed:
+            break
+    for junction_id, (dx, dy) in junction_delta.items():
+        box = result.get(junction_id)
+        if box is None:
+            continue
+        x, y, width, height = [float(value) for value in box]
+        result[junction_id] = (x + dx, y + dy, width, height)
+    return result, True
+
+
+def _distance_to_component_box(point, box) -> float:
+    x, y = float(point[0]), float(point[1])
+    left, top, width, height = [float(value) for value in box]
+    dx = max(left - x, 0.0, x - (left + width))
+    dy = max(top - y, 0.0, y - (top + height))
+    return math.hypot(dx, dy)
+
+
+def _nearest_box_boundary_point(box, point):
+    left, top, width, height = [float(value) for value in box]
+    right = left + width
+    bottom = top + height
+    x = float(point[0])
+    y = float(point[1])
+    if left <= x <= right and top <= y <= bottom:
+        distances = (
+            (x - left, (left, y)),
+            (right - x, (right, y)),
+            (y - top, (x, top)),
+            (bottom - y, (x, bottom)),
+        )
+        return min(distances, key=lambda item: item[0])[1]
+    return (
+        min(max(x, left), right),
+        min(max(y, top), bottom),
+    )
+
+
+def _segment_is_horizontal(start, end) -> bool:
+    return abs(float(end[0]) - float(start[0])) >= abs(float(end[1]) - float(start[1]))
+
+
+def _attach_orthogonal_endpoint(points, is_source: bool, port):
+    result = [[float(point[0]), float(point[1])] for point in points]
+    locked = [float(port[0]), float(port[1])]
+    if len(result) < 2:
+        return result
+    if len(result) == 2:
+        source = result[0]
+        target = result[1]
+        horizontal = _segment_is_horizontal(source, target)
+        if is_source:
+            source = locked
+        else:
+            target = locked
+        if horizontal:
+            mid_x = (source[0] + target[0]) / 2.0
+            return [source, [mid_x, source[1]], [mid_x, target[1]], target]
+        mid_y = (source[1] + target[1]) / 2.0
+        return [source, [source[0], mid_y], [target[0], mid_y], target]
+    if is_source:
+        horizontal = _segment_is_horizontal(result[0], result[1])
+        result[0] = locked
+        if horizontal:
+            result[1][1] = locked[1]
+        else:
+            result[1][0] = locked[0]
+    else:
+        horizontal = _segment_is_horizontal(result[-2], result[-1])
+        result[-1] = locked
+        if horizontal:
+            result[-2][1] = locked[1]
+        else:
+            result[-2][0] = locked[0]
+    return result
+
+
+def _compress_orthogonal_points(points):
+    deduped = []
+    for point in points:
+        current = [float(point[0]), float(point[1])]
+        if (
+            not deduped
+            or abs(deduped[-1][0] - current[0]) > 1e-6
+            or abs(deduped[-1][1] - current[1]) > 1e-6
+        ):
+            deduped.append(current)
+    if len(deduped) <= 2:
+        return deduped
+    result = [deduped[0]]
+    for index in range(1, len(deduped) - 1):
+        previous = result[-1]
+        current = deduped[index]
+        nxt = deduped[index + 1]
+        same_x = abs(previous[0] - current[0]) < 1e-6 and abs(current[0] - nxt[0]) < 1e-6
+        same_y = abs(previous[1] - current[1]) < 1e-6 and abs(current[1] - nxt[1]) < 1e-6
+        if same_x or same_y:
+            continue
+        result.append(current)
+    result.append(deduped[-1])
+    return result
+
+
+def _pull_endpoint_through_symbol(points, is_source: bool, box):
+    """Continue one pipe end through the center port of a valve or flow meter."""
+    if not isinstance(points, (list, tuple)) or len(points) < 2:
+        return points
+    if box is None or len(box) != 4:
+        return points
+    result = [[float(point[0]), float(point[1])] for point in points]
+    left, top, width, height = [float(value) for value in box]
+    if width <= 0 or height <= 0:
+        return result
+    center_x = left + width / 2.0
+    center_y = top + height / 2.0
+    end_index = 0 if is_source else len(result) - 1
+    prev_index = 1 if is_source else len(result) - 2
+    end = result[end_index]
+    previous = result[prev_index]
+    inside = (
+        left + 0.02 < end[0] < left + width - 0.02
+        and top + 0.02 < end[1] < top + height - 0.02
+    )
+    horizontal = abs(previous[0] - end[0]) >= abs(previous[1] - end[1])
+    if inside:
+        if horizontal:
+            previous[1] = center_y
+        else:
+            previous[0] = center_x
+        result[prev_index] = previous
+        result[end_index] = [center_x, center_y]
+        return _compress_orthogonal_points(result)
+
+    side = min(
+        (
+            ("left", abs(end[0] - left)),
+            ("right", abs(end[0] - (left + width))),
+            ("top", abs(end[1] - top)),
+            ("bottom", abs(end[1] - (top + height))),
+        ),
+        key=lambda item: item[1],
+    )[0]
+    if side in {"left", "right"}:
+        face = [left if side == "left" else left + width, center_y]
+        previous[1] = center_y
+    else:
+        face = [center_x, top if side == "top" else top + height]
+        previous[0] = center_x
+    result[prev_index] = previous
+    if is_source:
+        result[0] = [center_x, center_y]
+        result.insert(1, face)
+    else:
+        result[-1] = [center_x, center_y]
+        result.insert(len(result) - 1, face)
+    return _compress_orthogonal_points(result)
+
+
+def _snap_polyline_to_live_boxes(points, source_box, target_box):
+    """Move a connection's ends onto the components' current boxes."""
+    if not isinstance(points, (list, tuple)) or len(points) < 2:
+        return points
+    result = points
+    if source_box is not None and len(source_box) == 4:
+        if _distance_to_component_box(result[0], source_box) > 0.02:
+            result = _attach_orthogonal_endpoint(
+                result,
+                True,
+                _nearest_box_boundary_point(source_box, result[0]),
+            )
+    if target_box is not None and len(target_box) == 4:
+        if _distance_to_component_box(result[-1], target_box) > 0.02:
+            result = _attach_orthogonal_endpoint(
+                result,
+                False,
+                _nearest_box_boundary_point(target_box, result[-1]),
+            )
+    return result
+
+
+def _direct_orthogonal_route(source_box, target_box):
+    """Return a visible elbow when the planner has no points for a selected pair."""
+    sx, sy, sw, sh = (float(value) for value in source_box)
+    tx, ty, tw, th = (float(value) for value in target_box)
+    source_center = (sx + sw / 2.0, sy + sh / 2.0)
+    target_center = (tx + tw / 2.0, ty + th / 2.0)
+    if abs(target_center[0] - source_center[0]) >= abs(target_center[1] - source_center[1]):
+        if target_center[0] >= source_center[0]:
+            start = (sx + sw, source_center[1])
+            end = (tx, target_center[1])
+        else:
+            start = (sx, source_center[1])
+            end = (tx + tw, target_center[1])
+        bend = (start[0] + end[0]) / 2.0
+        points = [start, (bend, start[1]), (bend, end[1]), end]
+    else:
+        if target_center[1] >= source_center[1]:
+            start = (source_center[0], sy + sh)
+            end = (target_center[0], ty)
+        else:
+            start = (source_center[0], sy)
+            end = (target_center[0], ty + th)
+        bend = (start[1] + end[1]) / 2.0
+        points = [start, (start[0], bend), (end[0], bend), end]
+    return points, "source_to_target"
+
+
 def get_preview_route_geometry(
     diagram: DiagramSpec,
     manual_route_overrides: dict | None = None,
@@ -6866,18 +7174,41 @@ def get_preview_route_geometry(
     """Return exact final route geometry plus immutable router originals for editing."""
     with _canvas_scope(diagram):
         boxes, original_routes, labels = _final_auto_geometry(diagram)
+        base_boxes = dict(boxes)
         boxes, hidden_component_ids = _apply_manual_component_overrides(
             boxes, manual_component_overrides
         )
+        boxes = _compact_inline_pipe_boxes(diagram, boxes)
+        boxes, components_were_moved = _shift_junctions_with_moved_components(
+            diagram, boxes, base_boxes
+        )
+        if components_were_moved:
+            original_routes = _visually_separate_shared_connection_segments(
+                build_edge_routes(diagram, boxes)
+            )
         edited_routes = _apply_manual_route_overrides(
             diagram, original_routes, manual_route_overrides
         )
 
         route_map = {}
+        inline_pipe_ids = {
+            str(getattr(node, "id", "") or "")
+            for node in (getattr(diagram, "nodes", []) or [])
+            if _node_is_inline_pipe_symbol(node)
+        }
         for index, edge in enumerate(diagram.edges):
             original = original_routes[index] if index < len(original_routes) else None
-            if original is None:
-                continue
+            if original is None or not original[0] or len(original[0]) < 2:
+                source_box = boxes.get(str(edge.source))
+                target_box = boxes.get(str(edge.target))
+                if (
+                    source_box is None
+                    or target_box is None
+                    or len(source_box) != 4
+                    or len(target_box) != 4
+                ):
+                    continue
+                original = _direct_orthogonal_route(source_box, target_box)
             original_points, original_router_direction = original
             edited = edited_routes[index] if index < len(edited_routes) else None
             config = _manual_route_config(manual_route_overrides, str(edge.id))
@@ -6892,6 +7223,26 @@ def get_preview_route_geometry(
             line_color, dotted = _edge_line_style(edge)
             source_id = str(config.get("source", edge.source) or edge.source)
             target_id = str(config.get("target", edge.target) or edge.target)
+            # A dropped line is stored exactly. Adding another connection must
+            # not pull those coordinates back onto a freshly generated route.
+            manual_drag = str(config.get("mode") or "") == "manual_drag"
+            if not manual_drag:
+                points = _snap_polyline_to_live_boxes(
+                    points,
+                    boxes.get(source_id),
+                    boxes.get(target_id),
+                )
+            # A dropped line stays where it was released. Undragged water lines
+            # continue through the center port of a valve or flow meter.
+            if not manual_drag and not dotted and _edge_is_water_flow(edge):
+                if source_id in inline_pipe_ids:
+                    points = _pull_endpoint_through_symbol(
+                        points, True, boxes.get(source_id)
+                    )
+                if target_id in inline_pipe_ids:
+                    points = _pull_endpoint_through_symbol(
+                        points, False, boxes.get(target_id)
+                    )
             route_map[str(edge.id)] = {
                 "points": [[float(x), float(y)] for x, y in points],
                 "original_points": [[float(x), float(y)] for x, y in original_points],
@@ -6922,12 +7273,20 @@ def get_preview_route_geometry(
                     continue
             if len(pts) < 2:
                 continue
+            source_id = str(raw.get("source", "") or "")
+            target_id = str(raw.get("target", "") or "")
+            pts = _snap_polyline_to_live_boxes(
+                pts,
+                boxes.get(source_id),
+                boxes.get(target_id),
+            )
+            pts = [[float(point[0]), float(point[1])] for point in pts]
             route_map[str(custom_id)] = {
                 "points": pts,
                 "original_points": pts,
                 "direction": "manual",
-                "source": str(raw.get("source", "") or ""),
-                "target": str(raw.get("target", "") or ""),
+                "source": source_id,
+                "target": target_id,
                 "color": str(raw.get("color", "#1473E6") or "#1473E6"),
                 "dotted": bool(raw.get("dotted", False)),
                 "hidden": bool(raw.get("hidden", False)),

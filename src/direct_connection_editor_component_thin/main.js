@@ -9,6 +9,8 @@
   const eid=()=>`${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
   let dragOnlyWindowListeners=[];
   let dragOnlyRouteAction=null;
+  let appliedAutoRouteToken="";
+  const worksheetTools={setManualDraw(){}};
 
   // Pointer interaction helpers only. Keep all geometry/routing/rendering logic
   // unchanged while coalescing high-frequency pointermove events to one update
@@ -63,6 +65,18 @@
   }
   function post(type,extra={}){if(window.parent===window)return;window.parent.postMessage(Object.assign({isStreamlitMessage:true,type},extra),"*");}
   function ready(){post(READY,{apiVersion:1});} function emit(type,extra={}){post(SET_VALUE,{value:Object.assign({type,event_id:eid()},extra)});}
+  let componentAddGuard="";
+  function requestWorksheetComponentAdd(component,instanceId,sourceComponent){
+    const token=`${String(component||"")}|${String(instanceId||"")}`;
+    const now=Date.now();
+    const marker=componentAddGuard.split("|");
+    const previousToken=marker.slice(0,-1).join("|");
+    const previousAt=Number(marker[marker.length-1]||0);
+    if(previousToken===token&&now-previousAt<700)return;
+    componentAddGuard=`${token}|${now}`;
+    if(sourceComponent)optimisticWorksheetAdd(sourceComponent);
+    emit("component_add",{component:String(component||""),instance_id:String(instanceId||"")});
+  }
 
   // Movement-only state for the normal Worksheet.
   // Streamlit setComponentValue triggers a Python rerun, so component/line/arrow
@@ -142,14 +156,31 @@
     }
     return result;
   }
+
+  function dottedTransmitterUsesInternalTank(route,endIsSource){
+    if(!route||!route.dotted)return false;
+    const embeds=Array.isArray(argsState.oht_sensor_embeds)?argsState.oht_sensor_embeds:[];
+    const sourceId=String(route.source||"");
+    const targetId=String(route.target||"");
+    const sourceName=String(components[sourceId]?.component||"");
+    const targetName=String(components[targetId]?.component||"");
+    const tankId=endIsSource?sourceId:targetId;
+    const tankName=endIsSource?sourceName:targetName;
+    const otherName=endIsSource?targetName:sourceName;
+    if(tankName!=="OHT Tank"||otherName!=="Transmitter")return false;
+    return embeds.some(item=>String(item&&item.tank_id||"")===tankId);
+  }
   function saveMovementDraft(){
     const key=movementDraftStorageKey();
     if(!key)return;
     try{
       sessionStorage.setItem(key,JSON.stringify({
-        route_draft_version:"orthogonal-candidate-v82",
+        route_draft_version:"orthogonal-candidate-v83",
         routes:Object.values(routes).map(r=>({
           edge_id:String(r.edge_id||""),
+          source:String(r.source||""),
+          target:String(r.target||""),
+          manual_drag:!!r.manual_drag,
           points:clonePoints(r.points)
         })),
         components:Object.values(components).map(c=>({
@@ -169,12 +200,19 @@
     // Keep the current draft version and every existing movement behavior.
     // This fix only prevents a newly regenerated automatic route from being
     // combined with an older browser-local component position.
-    const restoreRoutes=saved.route_draft_version==="orthogonal-candidate-v82";
-    const savedRoutes=new Map((saved.routes||[]).map(r=>[String(r.edge_id||""),r]));
+    const restoreRoutes=saved.route_draft_version==="orthogonal-candidate-v83";
+    const savedRouteList=Array.isArray(saved.routes)?saved.routes:[];
+    const savedRoutes=new Map(savedRouteList.map(r=>[String(r.edge_id||""),r]));
     const savedComponents=new Map((saved.components||[]).map(c=>[String(c.instance_id||""),c]));
-    const currentComponentIds=Object.keys(components).map(id=>String(id)).sort().join("|");
-    const savedComponentIds=[...savedComponents.keys()].sort().join("|");
-    const sameComponentSet=currentComponentIds===savedComponentIds;
+
+    function savedRouteFor(route){
+      const byId=savedRoutes.get(String(route.edge_id||""));
+      if(byId)return byId;
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      if(!source||!target)return null;
+      return savedRouteList.find(item=>String(item.source||"")===source&&String(item.target||"")===target)||null;
+    }
 
     // Capture the server-generated component boxes and the exact port reference
     // used by each fresh route BEFORE restoring any browser-local movement.
@@ -196,57 +234,620 @@
       });
     });
 
-    Object.values(routes).forEach(r=>{
-      delete r.arrow_control;
-      if(!restoreRoutes || !sameComponentSet)return;
-      const s=savedRoutes.get(String(r.edge_id||""));
-      if(!s)return;
-      if(Array.isArray(s.points)&&s.points.length>=2)r.points=clonePoints(s.points);
-    });
-
-    if(restoreRoutes && !sameComponentSet){
-      try{sessionStorage.removeItem(key);}catch(_){}
-    }else if(restoreRoutes){
-      Object.values(components).forEach(c=>{
-        const s=savedComponents.get(String(c.instance_id||""));
-        if(s&&Array.isArray(s.box)&&s.box.length===4)c.box=cloneBox(s.box);
-      });
-
-      // Re-anchor only terminal coordinates. Interior routing, manual bends,
-      // arrow behavior, line style and all current drag logic remain untouched.
-      Object.values(routes).forEach(r=>{
-        if(!Array.isArray(r.points)||r.points.length<2)return;
-        const edgeId=String(r.edge_id||"");
-        const sourceId=String(r.source||"");
-        const targetId=String(r.target||"");
-        const sourceBox=components[sourceId]?.box;
-        const targetBox=components[targetId]?.box;
-        const wasSaved=savedRoutes.has(edgeId);
-        const generatedRefs=generatedPortRefs.get(edgeId)||{};
-
-        if(Array.isArray(sourceBox)&&sourceBox.length===4){
-          const sourceRef=wasSaved
-            ?draftPortReference(sourceBox,r.points[0])
-            :generatedRefs.source;
-          const sourcePort=draftResolvePortReference(sourceBox,sourceRef);
-          if(sourcePort)r.points=draftAttachEndpoint(r.points,true,sourcePort);
-        }
-
-        if(Array.isArray(targetBox)&&targetBox.length===4){
-          const last=r.points.length-1;
-          const targetRef=wasSaved
-            ?draftPortReference(targetBox,r.points[last])
-            :generatedRefs.target;
-          const targetPort=draftResolvePortReference(targetBox,targetRef);
-          if(targetPort)r.points=draftAttachEndpoint(r.points,false,targetPort);
-        }
-      });
-    }else{
+    if(!restoreRoutes){
       // Remove the incompatible snapshot so the next drag starts from the
       // current generated diagram as one consistent component+route state.
       try{sessionStorage.removeItem(key);}catch(_){}
+      return;
     }
+
+    // A new connection adds a route. Keep every component and line the user
+    // already placed, and leave only the new route on its generated path.
+    Object.values(components).forEach(c=>{
+      const s=savedComponents.get(String(c.instance_id||""));
+      if(s&&Array.isArray(s.box)&&s.box.length===4)c.box=cloneBox(s.box);
+    });
+    Object.values(routes).forEach(r=>{
+      const s=savedRouteFor(r);
+      if(!s)return;
+      if(s.manual_drag)r.manual_drag=true;
+      if(Array.isArray(s.points)&&s.points.length>=2)r.points=clonePoints(s.points);
+    });
+
+    // Re-anchor only automatic terminals. A dropped line keeps its saved points.
+    Object.values(routes).forEach(r=>{
+      if(!Array.isArray(r.points)||r.points.length<2)return;
+      if(r.manual_drag)return;
+      const edgeId=String(r.edge_id||"");
+      const sourceId=String(r.source||"");
+      const targetId=String(r.target||"");
+      const sourceBox=components[sourceId]?.box;
+      const targetBox=components[targetId]?.box;
+      const wasSaved=!!savedRouteFor(r);
+      const generatedRefs=generatedPortRefs.get(edgeId)||{};
+
+      if(Array.isArray(sourceBox)&&sourceBox.length===4&&!dottedTransmitterUsesInternalTank(r,true)){
+        const sourceRef=wasSaved
+          ?draftPortReference(sourceBox,r.points[0])
+          :generatedRefs.source;
+        const sourcePort=draftResolvePortReference(sourceBox,sourceRef);
+        if(sourcePort)r.points=draftAttachEndpoint(r.points,true,sourcePort);
+      }
+
+      if(Array.isArray(targetBox)&&targetBox.length===4&&!dottedTransmitterUsesInternalTank(r,false)){
+        const last=r.points.length-1;
+        const targetRef=wasSaved
+          ?draftPortReference(targetBox,r.points[last])
+          :generatedRefs.target;
+        const targetPort=draftResolvePortReference(targetBox,targetRef);
+        if(targetPort)r.points=draftAttachEndpoint(r.points,false,targetPort);
+      }
+    });
   }
+
+  function isInlinePipeSymbol(component){
+    const name=String(component&&(component.component||component.title)||"").toLowerCase();
+    if(name.includes("flow meter")||name.includes("flowmeter"))return true;
+    return name.includes("motorized valve")||name.includes("pressure relief")||name.includes("non-return")||name.includes("non return");
+  }
+
+  function compressOrthogonalPoints(points){
+    const deduped=[];
+    for(const point of points){
+      const current=[Number(point[0]),Number(point[1])];
+      const last=deduped[deduped.length-1];
+      if(!last||Math.abs(last[0]-current[0])>1e-6||Math.abs(last[1]-current[1])>1e-6)deduped.push(current);
+    }
+    if(deduped.length<=2)return deduped;
+    const result=[deduped[0]];
+    for(let index=1;index<deduped.length-1;index++){
+      const previous=result[result.length-1];
+      const current=deduped[index];
+      const next=deduped[index+1];
+      const sameX=Math.abs(previous[0]-current[0])<1e-6&&Math.abs(current[0]-next[0])<1e-6;
+      const sameY=Math.abs(previous[1]-current[1])<1e-6&&Math.abs(current[1]-next[1])<1e-6;
+      if(!sameX&&!sameY)result.push(current);
+    }
+    result.push(deduped[deduped.length-1]);
+    return result;
+  }
+
+  function pullEndpointThroughSymbol(points,isSource,box){
+    if(!Array.isArray(points)||points.length<2||!Array.isArray(box)||box.length!==4)return points;
+    const result=clonePoints(points);
+    const [x,y,w,h]=box.map(Number);
+    if(!(w>0)||!(h>0))return result;
+    const cx=x+w/2,cy=y+h/2;
+    const endIndex=isSource?0:result.length-1;
+    const prevIndex=isSource?1:result.length-2;
+    const end=result[endIndex];
+    const previous=result[prevIndex];
+    const inside=end[0]>x+0.02&&end[0]<x+w-0.02&&end[1]>y+0.02&&end[1]<y+h-0.02;
+    const dx=Math.abs(previous[0]-end[0]);
+    const dy=Math.abs(previous[1]-end[1]);
+    const aligned=inside||((dx>=dy?dy:dx)<0.04);
+    if(aligned){
+      if(dx>=dy)previous[1]=cy;
+      else previous[0]=cx;
+      result[prevIndex]=previous;
+      result[endIndex]=[cx,cy];
+      return compressOrthogonalPoints(result);
+    }
+    const sides=[
+      ["left",Math.abs(end[0]-x)],
+      ["right",Math.abs(end[0]-(x+w))],
+      ["top",Math.abs(end[1]-y)],
+      ["bottom",Math.abs(end[1]-(y+h))]
+    ].sort((a,b)=>a[1]-b[1]);
+    const side=sides[0][0];
+    let face;
+    if(side==="left"||side==="right"){
+      face=[side==="left"?x:x+w,cy];
+      previous[1]=cy;
+    }else{
+      face=[cx,side==="top"?y:y+h];
+      previous[0]=cx;
+    }
+    result[prevIndex]=previous;
+    if(isSource){
+      result[0]=[cx,cy];
+      result.splice(1,0,face);
+    }else{
+      result[result.length-1]=[cx,cy];
+      result.splice(result.length-1,0,face);
+    }
+    return compressOrthogonalPoints(result);
+  }
+
+  function seatInlinePipeSymbols(){
+    const targetW=0.68,targetH=0.50;
+    Object.values(components).forEach(component=>{
+      if(!component||component.hidden||!isInlinePipeSymbol(component)||!Array.isArray(component.box))return;
+      const [x,y,w,h]=component.box.map(Number);
+      const cx=x+w/2,cy=y+h/2;
+      component.box=[cx-targetW/2,cy-targetH/2,targetW,targetH];
+    });
+    Object.values(routes).forEach(route=>{
+      if(!route||route.hidden||route.manual_drag||route.dotted)return;
+      const source=components[String(route.source||"")];
+      const target=components[String(route.target||"")];
+      if(source&&isInlinePipeSymbol(source))route.points=pullEndpointThroughSymbol(route.points,true,source.box);
+      if(target&&isInlinePipeSymbol(target))route.points=pullEndpointThroughSymbol(route.points,false,target.box);
+    });
+  }
+
+  const ANNOTATION_COLORS={
+    Black:"#1c1c1c",
+    White:"#ffffff",
+    Yellow:"#ffe56a",
+    Red:"#f05b5b",
+    Blue:"#7eb0ff"
+  };
+
+  let refreshWorksheetAnnotations=null;
+  let applyAnnotationFormatColor=null;
+  let appliedAnnotationFormatToken="";
+  function mountWorksheetAnnotations(stage,cw,ch,canvasPoint,addWindowListener){
+    stage.querySelectorAll("[data-annotation-layer]").forEach(node=>node.remove());
+    let annotationFieldStyle=document.getElementById("annotation-field-style");
+    if(!annotationFieldStyle){
+      annotationFieldStyle=document.createElement("style");
+      annotationFieldStyle.id="annotation-field-style";
+      document.head.appendChild(annotationFieldStyle);
+    }
+    annotationFieldStyle.textContent="[data-annotation-title][data-placeholder]:empty:before,[data-annotation-field][data-placeholder]:empty:before{content:attr(data-placeholder);color:inherit;-webkit-text-fill-color:inherit}";
+    const layer=document.createElement("div");
+    layer.setAttribute("data-annotation-layer","1");
+    layer.style.cssText="position:absolute;inset:0;z-index:70;pointer-events:none;overflow:hidden;";
+    stage.appendChild(layer);
+    const annotationColorValue=value=>{
+      const raw=String(value||"").trim().toLowerCase();
+      const named={black:"#1c1c1c",white:"#ffffff",yellow:"#ffe56a",red:"#f05b5b",blue:"#7eb0ff","#fff":"#ffffff","#1c1c1c":"#1c1c1c","#ffffff":"#ffffff","#ffe56a":"#ffe56a","#f05b5b":"#f05b5b","#7eb0ff":"#7eb0ff"};
+      if(named[raw])return named[raw];
+      const hex=raw.match(/^#([0-9a-f]{6})$/);
+      if(hex)return "#"+hex[1];
+      const short=raw.match(/^#([0-9a-f]{3})$/);
+      if(short){const h=short[1];return "#"+h[0]+h[0]+h[1]+h[1]+h[2]+h[2];}
+      const rgb=raw.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+      if(!rgb)return "";
+      const channel=part=>Math.max(0,Math.min(255,parseInt(part,10))).toString(16).padStart(2,"0");
+      return "#"+channel(rgb[1])+channel(rgb[2])+channel(rgb[3]);
+    };
+    const sanitizeAnnotationHtml=html=>{
+      const template=document.createElement("template");
+      template.innerHTML=String(html||"");
+      const escapeText=value=>String(value||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+      const walk=node=>{
+        let out="";
+        node.childNodes.forEach(child=>{
+          if(child.nodeType===3){out+=escapeText(child.textContent);return;}
+          if(child.nodeType!==1)return;
+          const tag=child.tagName.toLowerCase();
+          if(tag==="br"){out+="<br>";return;}
+          if(tag==="div"||tag==="p"){
+            if(out&&!out.endsWith("<br>"))out+="<br>";
+            out+=walk(child);
+            return;
+          }
+          if(tag==="span"||tag==="font"){
+            const declared=(child.style&&child.style.color)||child.getAttribute("color")||"";
+            const color=annotationColorValue(declared);
+            const inner=walk(child);
+            out+=color?`<span style="color:${color}">${inner}</span>`:inner;
+            return;
+          }
+          out+=walk(child);
+        });
+        return out;
+      };
+      return walk(template.content).slice(0,8000);
+    };
+    const notes=Array.isArray(argsState.annotations)?argsState.annotations:[];
+    const toPercent=(value,total)=>`${(Number(value||0)/Math.max(1,total))*100}%`;
+
+    const place=(card,note)=>{
+      const x=Number(note.x)||0;
+      const y=Number(note.y)||0;
+      const w=Number(note.w)||2.15;
+      const h=Number(note.h)||1.35;
+      const rect=stage.getBoundingClientRect();
+      if(x>cw*2||y>ch*2){
+        const stageW=Math.max(rect.width||0,stage.offsetWidth||0,800);
+        const stageH=Math.max(rect.height||0,stage.offsetHeight||0,450);
+        card.style.left=`${Math.min(78,(x/stageW)*100)}%`;
+        card.style.top=`${Math.min(70,(y/stageH)*100)}%`;
+      }else{
+        card.style.left=toPercent(x,cw);
+        card.style.top=toPercent(y,ch);
+      }
+      card.style.width=toPercent(w,cw);
+      card.style.height=toPercent(h,ch);
+    };
+
+    const payload=(note,text)=>{
+      if(note&&note._swatch&&note._swatch.dataset&&note._swatch.dataset.annotationColor){
+        note.color=String(note._swatch.dataset.annotationColor);
+      }
+      return {
+        id:String(note.id||""),
+        x:Number(note.x)||0,
+        y:Number(note.y)||0,
+        w:Number(note.w)||2.15,
+        h:Number(note.h)||1.35,
+        color:String(note.color||"Yellow"),
+        title:String(note.title||"").slice(0,800),
+        text:String(text==null?note.text||"":text)
+      };
+    };
+
+    notes.forEach(raw=>{
+      try{
+      if(!raw||typeof raw!=="object")return;
+      const noteId=raw.id==null||String(raw.id).trim()===""?"":String(raw.id).trim();
+      if(!noteId)return;
+      let x=Number(raw.x);
+      let y=Number(raw.y);
+      if(!Number.isFinite(x))x=250;
+      if(!Number.isFinite(y))y=200;
+      const w=Number(raw.w)>0?Number(raw.w):2.15;
+      const h=Number(raw.h)>0?Number(raw.h):1.35;
+      const rect=stage.getBoundingClientRect();
+      const stageW=Math.max(rect.width||0,stage.offsetWidth||0,stage.clientWidth||0,640);
+      const stageH=Math.max(rect.height||0,stage.offsetHeight||0,stage.clientHeight||0,420);
+      if(x>Math.max(20,cw*2)||y>Math.max(20,ch*2)){
+        x=Math.min(Math.max(16,x),Math.max(16,stageW-230));
+        y=Math.min(Math.max(16,y),Math.max(16,stageH-148));
+      }else{
+        x=Math.min(Math.max(0,x),Math.max(0,cw-w));
+        y=Math.min(Math.max(0,y),Math.max(0,ch-h));
+      }
+      const note={
+        id:noteId,
+        x,
+        y,
+        w,
+        h,
+        color:ANNOTATION_COLORS[raw.color]?String(raw.color):"Black",
+        title:raw.title==null?"":String(raw.title),
+        text:raw.text==null?"":String(raw.text)
+      };
+      const ink=ANNOTATION_COLORS[note.color]||"#1c1c1c";
+      const card=document.createElement("div");
+      card.setAttribute("data-annotation-id",note.id);
+      card.dataset.annotationColor=note.color;
+      note._swatch=card;
+      card.style.cssText=[
+        "position:absolute",
+        "pointer-events:auto",
+        "box-sizing:border-box",
+        "display:flex",
+        "flex-direction:column",
+        "border:2px solid #000",
+        "border-radius:8px",
+        "box-shadow:none",
+        "overflow:auto",
+        "resize:none",
+        "background:transparent",
+        "cursor:grab",
+        "touch-action:none",
+        `color:${ink}`
+      ].join(";");
+      place(card,note);
+
+      const header=document.createElement("div");
+      header.style.cssText="flex:0 0 28px;display:flex;align-items:center;padding:0 8px;background:transparent;cursor:inherit;";
+      const title=document.createElement("div");
+      title.setAttribute("data-annotation-title","1");
+      title.setAttribute("data-placeholder","Title");
+      title.setAttribute("contenteditable","true");
+      title.setAttribute("role","textbox");
+      title.setAttribute("aria-label","Annotation title");
+      const titleHtml=sanitizeAnnotationHtml(note.title||"");
+      if(titleHtml && String(titleHtml).replace(/<[^>]+>/g,"").trim())title.innerHTML=titleHtml;
+      title.style.cssText=`flex:1 1 auto;min-width:0;outline:none;background:transparent;color:${ink};font:600 13px/1.2 sans-serif;white-space:nowrap;overflow:hidden;user-select:text;cursor:text;`;
+      header.appendChild(title);
+      const readTitle=()=>{
+        if(!String(title.textContent||"").trim())return "";
+        return sanitizeAnnotationHtml(title.innerHTML).slice(0,800);
+      };
+      title.addEventListener("keydown",event=>{
+        event.stopPropagation();
+        if(event.key==="Enter")event.preventDefault();
+      });
+      title.addEventListener("blur",()=>{
+        note.title=readTitle();
+        if(!note.title)title.innerHTML="";
+        emit("annotation_update",{action:"text",id:note.id,annotation:payload(note,readField())});
+      });
+
+      const field=document.createElement("div");
+      field.setAttribute("data-annotation-field","1");
+      field.setAttribute("data-placeholder","Enter note here...");
+      field.setAttribute("contenteditable","true");
+      field.setAttribute("role","textbox");
+      field.setAttribute("aria-label","Annotation note");
+      field.style.cssText=`flex:1 1 auto;width:100%;min-height:48px;margin:0;border:0;outline:none;resize:none;background:transparent;color:${ink};font:13px/1.35 sans-serif;padding:6px 8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;overflow:auto;user-select:text;cursor:text;touch-action:none;`;
+      const initialHtml=sanitizeAnnotationHtml(note.text||"");
+      if(initialHtml && String(initialHtml).replace(/<[^>]+>/g,"").trim())field.innerHTML=initialHtml;
+      const readField=()=>sanitizeAnnotationHtml(field.innerHTML);
+      field.addEventListener("focus",()=>{
+        if((field.textContent||"")==="Enter note here..."||(field.textContent||"")==="Add annotation..."){
+          const range=document.createRange();
+          range.selectNodeContents(field);
+          const selection=window.getSelection();
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+      });
+
+      field.addEventListener("keydown",event=>event.stopPropagation());
+      field.addEventListener("blur",()=>{
+        note.text=readField();
+        emit("annotation_update",{action:"text",id:note.id,annotation:payload(note,note.text)});
+      });
+      const caretOffset=(root,node,offset)=>{
+        try{
+          const range=document.createRange();
+          range.selectNodeContents(root);
+          range.setEnd(node,offset);
+          return range.toString().length;
+        }catch(_){return 0;}
+      };
+      const rememberFormatTarget=(element,part)=>{
+        const selection=window.getSelection();
+        if(!selection||!selection.rangeCount)return;
+        const range=selection.getRangeAt(0);
+        if(!element.contains(range.startContainer))return;
+        const start=caretOffset(element,range.startContainer,range.startOffset);
+        const end=caretOffset(element,range.endContainer,range.endOffset);
+        try{
+          sessionStorage.setItem("rts:annotation-format-target",JSON.stringify({
+            id:String(note.id),
+            part,
+            start:Math.min(start,end),
+            end:Math.max(start,end)
+          }));
+        }catch(_){}
+      };
+      const bindTypingColor=element=>{
+        element.addEventListener("beforeinput",event=>{
+          if((event.inputType!=="insertText"&&event.inputType!=="insertCompositionText")||!event.data)return;
+          const colorName=String(argsState.annotation_format_color||note.color||"Black");
+          const hex=ANNOTATION_COLORS[colorName]||ink;
+          if(ANNOTATION_COLORS[colorName]){
+            note.color=colorName;
+            card.dataset.annotationColor=colorName;
+          }
+          event.preventDefault();
+          const safe=String(event.data).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+          document.execCommand("insertHTML",false,`<span style="color:${hex}">${safe}</span>`);
+        });
+      };
+      bindTypingColor(title);
+      bindTypingColor(field);
+      title.addEventListener("mouseup",()=>rememberFormatTarget(title,"title"));
+      title.addEventListener("keyup",()=>rememberFormatTarget(title,"title"));
+      field.addEventListener("mouseup",()=>rememberFormatTarget(field,"text"));
+      field.addEventListener("keyup",()=>rememberFormatTarget(field,"text"));
+      title.addEventListener("blur",()=>rememberFormatTarget(title,"title"));
+      field.addEventListener("blur",()=>rememberFormatTarget(field,"text"));
+      card._annotationNote=note;
+      card._readTitle=readTitle;
+      card._readField=readField;
+
+      const readRenderedBox=()=>{
+        const stageRect=stage.getBoundingClientRect();
+        const cardRect=card.getBoundingClientRect();
+        const width=Math.max(1,stageRect.width||stage.offsetWidth||1);
+        const height=Math.max(1,stageRect.height||stage.offsetHeight||1);
+        if(!cardRect.width||!cardRect.height)return;
+        note.x=clamp(((cardRect.left-stageRect.left)/width)*cw,0,Math.max(0,cw-(Number(note.w)||2.15)));
+        note.y=clamp(((cardRect.top-stageRect.top)/height)*ch,0,Math.max(0,ch-(Number(note.h)||1.35)));
+        note.w=clamp((cardRect.width/width)*cw,1.15,Math.max(1.15,cw*0.72));
+        note.h=clamp((cardRect.height/height)*ch,0.85,Math.max(0.85,ch*0.72));
+      };
+      const frameEdge=event=>{
+        const rect=card.getBoundingClientRect();
+        const localX=event.clientX-rect.left;
+        const localY=event.clientY-rect.top;
+        const margin=8;
+        const horizontal=localX<=margin||localX>=rect.width-margin;
+        const vertical=localY<=margin||localY>=rect.height-margin;
+        return {
+          left:localX<=margin,
+          right:localX>=rect.width-margin,
+          top:localY<=margin,
+          bottom:localY>=rect.height-margin,
+          corner:horizontal&&vertical,
+          edge:(horizontal||vertical)&&!(horizontal&&vertical)
+        };
+      };
+      const cursorForEdge=edge=>edge.corner?"nwse-resize":edge.edge?"grab":"text";
+      card.addEventListener("pointermove",event=>{
+        if(event.buttons)return;
+        const cursor=cursorForEdge(frameEdge(event));
+        card.style.cursor=cursor;
+        title.style.cursor=cursor;
+        field.style.cursor=cursor;
+      });
+      const startMove=event=>{
+        if(event.button!==0)return;
+        const edge=frameEdge(event);
+        const onText=event.target&&event.target.closest&&event.target.closest("[data-annotation-title],[data-annotation-field]");
+        if(onText&&!edge.corner&&!edge.edge)return;
+        const sizing=!!edge.corner;
+        if(sizing||edge.edge){
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        readRenderedBox();
+        const start=canvasPoint(event);
+        const originX=note.x;
+        const originY=note.y;
+        const originW=Number(note.w)||2.15;
+        const originH=Number(note.h)||1.35;
+        let action="";
+        const move=ev=>{
+          const point=canvasPoint(ev);
+          const dx=point[0]-start[0];
+          const dy=point[1]-start[1];
+          if(!sizing&&Math.hypot(dx,dy)<=0.03)return;
+          if(!action){
+            action=sizing?"resize":"move";
+            card.style.cursor=sizing?cursorForEdge(edge):"grabbing";
+            window.getSelection()?.removeAllRanges();
+          }
+          if(action==="move"){
+            note.x=clamp(originX+dx,0,Math.max(0,cw-originW));
+            note.y=clamp(originY+dy,0,Math.max(0,ch-originH));
+          }else{
+            let nextX=originX;
+            let nextY=originY;
+            let nextW=originW;
+            let nextH=originH;
+            if(edge.right)nextW=clamp(originW+dx,1.15,Math.max(1.15,cw*0.72));
+            if(edge.left){
+              nextW=clamp(originW-dx,1.15,Math.max(1.15,cw*0.72));
+              nextX=originX+(originW-nextW);
+            }
+            if(edge.bottom)nextH=clamp(originH+dy,0.85,Math.max(0.85,ch*0.72));
+            if(edge.top){
+              nextH=clamp(originH-dy,0.85,Math.max(0.85,ch*0.72));
+              nextY=originY+(originH-nextH);
+            }
+            note.x=clamp(nextX,0,Math.max(0,cw-nextW));
+            note.y=clamp(nextY,0,Math.max(0,ch-nextH));
+            note.w=nextW;
+            note.h=nextH;
+          }
+          place(card,note);
+        };
+        const up=()=>{
+          window.removeEventListener("pointermove",move);
+          window.removeEventListener("pointerup",up);
+          card.style.cursor="grab";
+          if(!action)return;
+          readRenderedBox();
+          note.title=readTitle();
+          note.text=readField();
+          emit("annotation_update",{
+            action,
+            id:note.id,
+            annotation:payload(note,note.text)
+          });
+        };
+        addWindowListener("pointermove",move);
+        addWindowListener("pointerup",up);
+      };
+      card.addEventListener("pointerdown",startMove);
+
+      card.addEventListener("contextmenu",event=>{
+        event.preventDefault();
+        event.stopPropagation();
+        closeContext();
+        const menu=document.createElement("div");
+        menu.className="context";
+        menu.style.cssText=`position:fixed;left:${Math.min(event.clientX,window.innerWidth-140)}px;top:${Math.min(event.clientY,window.innerHeight-48)}px;z-index:10000;min-width:112px;background:#fff;border:1px solid #cbd5e1;border-radius:7px;box-shadow:0 8px 24px rgba(15,23,42,.16);padding:4px;pointer-events:auto;`;
+        const remove=document.createElement("button");
+        remove.type="button";
+        remove.className="danger";
+        remove.textContent="Delete";
+        remove.style.cssText="display:block;width:100%;text-align:left;border:0;background:transparent;padding:7px 9px;border-radius:5px;font-size:12px;cursor:pointer;color:#b42318;";
+        remove.addEventListener("pointerdown",pointerEvent=>pointerEvent.stopPropagation());
+        remove.addEventListener("click",clickEvent=>{
+          clickEvent.preventDefault();
+          clickEvent.stopPropagation();
+          card.remove();
+          emit("annotation_update",{action:"delete",id:String(note.id)});
+          closeContext();
+        });
+        menu.appendChild(remove);
+        document.body.appendChild(menu);
+        contextMenu=menu;
+      });
+
+      card.appendChild(header);
+      card.appendChild(field);
+      layer.appendChild(card);
+      }catch(_){}
+    });
+    const paintFormatRange=(element,start,end,hex)=>{
+      element.dataset.pendingInk=hex;
+      if(!(end>start))return;
+      const nodes=[];
+      const walker=document.createTreeWalker(element,NodeFilter.SHOW_TEXT);
+      while(walker.nextNode())nodes.push(walker.currentNode);
+      let pos=0;
+      let startNode=null;
+      let startOffset=0;
+      let endNode=null;
+      let endOffset=0;
+      for(const node of nodes){
+        const len=node.textContent.length;
+        if(!startNode&&start<=pos+len){
+          startNode=node;
+          startOffset=Math.max(0,start-pos);
+        }
+        if(!endNode&&end<=pos+len){
+          endNode=node;
+          endOffset=Math.max(0,end-pos);
+          break;
+        }
+        pos+=len;
+      }
+      if(!startNode||!endNode)return;
+      const range=document.createRange();
+      try{
+        range.setStart(startNode,Math.min(startOffset,startNode.textContent.length));
+        range.setEnd(endNode,Math.min(endOffset,endNode.textContent.length));
+      }catch(_){return;}
+      if(range.collapsed)return;
+      const span=document.createElement("span");
+      span.style.color=hex;
+      span.appendChild(range.extractContents());
+      range.insertNode(span);
+      element.innerHTML=sanitizeAnnotationHtml(element.innerHTML);
+    };
+    applyAnnotationFormatColor=()=>{
+      const token=String(argsState.annotation_format_token??"");
+      const hex=ANNOTATION_COLORS[String(argsState.annotation_format_color||"")];
+      if(!appliedAnnotationFormatToken){
+        try{appliedAnnotationFormatToken=sessionStorage.getItem("rts:annotation-format-applied")||"";}catch(_){}
+      }
+      if(!token||token==="0"||token===appliedAnnotationFormatToken||!hex)return;
+      appliedAnnotationFormatToken=token;
+      try{sessionStorage.setItem("rts:annotation-format-applied",token);}catch(_){}
+      let saved=null;
+      try{saved=JSON.parse(sessionStorage.getItem("rts:annotation-format-target")||"null");}catch(_){saved=null;}
+      const colorName=String(argsState.annotation_format_color||"Black");
+      let card=null;
+      if(saved&&saved.id!=null){
+        card=layer.querySelector(`[data-annotation-id="${String(saved.id).replace(/"/g,"")}"]`);
+      }
+      if(!card){
+        const cards=layer.querySelectorAll("[data-annotation-id]");
+        card=cards.length?cards[cards.length-1]:null;
+      }
+      if(!card||!card._annotationNote)return;
+      const note=card._annotationNote;
+      note.color=colorName;
+      card.dataset.annotationColor=colorName;
+      card.style.color=hex;
+      card.querySelectorAll("[data-annotation-title],[data-annotation-field]").forEach(element=>{
+        element.style.color=hex;
+        element.dataset.pendingInk=hex;
+      });
+      if(saved&&Number(saved.end)>Number(saved.start)){
+        const element=card.querySelector(saved.part==="title"?"[data-annotation-title]":"[data-annotation-field]");
+        if(element)paintFormatRange(element,Number(saved.start)||0,Number(saved.end)||0,hex);
+      }
+      note.title=card._readTitle();
+      note.text=card._readField();
+      emit("annotation_update",{action:"text",id:note.id,annotation:payload(note,note.text)});
+    };
+    applyAnnotationFormatColor();
+  }
+
   function snapshot(){return {routes:Object.values(routes).map(r=>({...r,points:clonePoints(r.points),original_points:clonePoints(r.original_points||r.points)})),components:Object.values(components).map(c=>({...c,box:cloneBox(c.box)}))};}
   function applySnapshot(state){routes={};components={};for(const r of (state?.routes||[])){const id=String(r.edge_id||"");if(id)routes[id]={...r,edge_id:id,points:clonePoints(r.points),original_points:clonePoints(r.original_points||r.points),hidden:!!r.hidden};}for(const c of (state?.components||[])){const id=String(c.instance_id||"");if(id)components[id]={...c,instance_id:id,box:cloneBox(c.box),hidden:!!c.hidden};}rebuildRouteConnectionIndex();selectedEdge=null;selectedComponents.clear();renderOverlay();}
   function checkpoint(){const s=snapshot();history=history.slice(0,historyIndex+1);history.push(JSON.parse(JSON.stringify(s)));if(history.length>100)history=history.slice(-100);historyIndex=history.length-1;dirty=true;}
@@ -286,7 +887,22 @@
   function canvasSize(){return [Number(argsState.canvas_width||1),Number(argsState.canvas_height||1)];}
   function clientToCanvas(svg,ev){const pt=svg.createSVGPoint();pt.x=ev.clientX;pt.y=ev.clientY;const m=svg.getScreenCTM();if(!m)return[0,0];const q=pt.matrixTransform(m.inverse());return[q.x,q.y];}
   function pointInBox(p,b){return b&&p[0]>=b[0]&&p[0]<=b[0]+b[2]&&p[1]>=b[1]&&p[1]<=b[1]+b[3];}
-  function componentAt(p,exclude=null){const vals=Object.values(components).reverse();for(const c of vals){if(!c.hidden&&c.instance_id!==exclude&&pointInBox(p,c.box))return c;}return null;}
+  function isPrimaryCanvasComponent(component){
+    const name=String(component&&component.component||"");
+    return name==="OHT Tank"||name==="Sump"||name==="Bore Well";
+  }
+  function componentStackLayer(component){
+    if(component&&component.__oht_attached_sensor)return 1;
+    if(isPrimaryCanvasComponent(component))return 0;
+    return 2;
+  }
+  function componentAt(p,exclude=null){
+    const vals=Object.values(components).filter(c=>
+      c&&!c.hidden&&c.instance_id!==exclude&&pointInBox(p,c.box)
+    );
+    vals.sort((a,b)=>componentStackLayer(a)-componentStackLayer(b));
+    return vals.length?vals[vals.length-1]:null;
+  }
   function boundaryPoint(box,p){const [x,y,w,h]=box,rx=x+w,by=y+h,px=p[0],py=p[1],cx=clamp(px,x,rx),cy=clamp(py,y,by);const cand=[[Math.abs(px-x),[x,cy]],[Math.abs(px-rx),[rx,cy]],[Math.abs(py-y),[cx,y]],[Math.abs(py-by),[cx,by]]];cand.sort((a,b)=>a[0]-b[0]);return cand[0][1];}
   function sidePort(box,side){const [x,y,w,h]=box;if(side==="left")return[x,y+h/2];if(side==="right")return[x+w,y+h/2];if(side==="top")return[x+w/2,y];return[x+w/2,y+h];}
 
@@ -345,9 +961,13 @@
     // changes only the live box position; dimensions and route data stay intact.
     let alignedBox=best?best.box:box;
     let alignedScore=best?best.score:Infinity;
+    const dragged=components[String(activeDrag?.id||"")];
+    const draggingPrimary=isPrimaryCanvasComponent(dragged);
     for(const candidate of Object.values(components)){
       if(!candidate||candidate.hidden||String(candidate.instance_id||"")===String(activeDrag?.id||""))continue;
       if(candidate.__oht_attached_sensor)continue;
+      // A secondary card must not lock onto the OHT, Sump, or Bore Well center.
+      if(!draggingPrimary&&isPrimaryCanvasComponent(candidate))continue;
       const [cx,cy,cwBox,chBox]=cloneBox(candidate.box);
       const candidateCenter=[cx+(cwBox/2),cy+(chBox/2)];
       const xDistance=Math.abs(center[0]-candidateCenter[0]);
@@ -369,6 +989,16 @@
         w,
         h
       ];
+    }
+    if(!draggingPrimary){
+      const cx=alignedBox[0]+alignedBox[2]/2;
+      const cy=alignedBox[1]+alignedBox[3]/2;
+      const covered=Object.values(components).some(candidate=>
+        isPrimaryCanvasComponent(candidate)&&
+        !candidate.hidden&&
+        pointInBox([cx,cy],candidate.box)
+      );
+      if(covered)return box;
     }
     return alignedBox;
   }
@@ -467,6 +1097,38 @@
     return [x+(w*0.38),y+(h*0.16),w*0.42,h*0.42];
   }
 
+  function revealInternalSensorGlyph(img){
+    const paint=()=>{
+      try{
+        const width=img.naturalWidth||0;
+        const height=img.naturalHeight||0;
+        if(!width||!height)return;
+        const canvas=document.createElement("canvas");
+        canvas.width=width;
+        canvas.height=height;
+        const context=canvas.getContext("2d",{willReadFrequently:true});
+        if(!context)return;
+        context.drawImage(img,0,0,width,height);
+        const frame=context.getImageData(0,0,width,height);
+        const pixels=frame.data;
+        for(let index=0;index<pixels.length;index+=4){
+          if(pixels[index]<36&&pixels[index+1]<36&&pixels[index+2]<36){
+            pixels[index+3]=0;
+          }
+        }
+        context.putImageData(frame,0,0);
+        img.src=canvas.toDataURL("image/png");
+      }catch(_){}
+    };
+    if(img.complete&&img.naturalWidth)paint();
+    else img.addEventListener("load",paint,{once:true});
+  }
+
+  function sensorAnchorPoint(box){
+    const [x,y,w,h]=cloneBox(box);
+    return [x+(w/2),y+(h/2)];
+  }
+
   function reanchorComponentRoutes(instanceId,fromBox,toBox){
     const componentId=String(instanceId||"");
     if(!componentId)return;
@@ -474,68 +1136,143 @@
       if(!Array.isArray(route.points)||route.points.length<2)continue;
       const isSource=String(route.source||"")===componentId;
       const endpoint=isSource?route.points[0]:route.points[route.points.length-1];
+      const symbol=components[componentId];
+      if(symbol&&isInlinePipeSymbol(symbol)&&!route.dotted&&!route.manual_drag&&Array.isArray(toBox)&&toBox.length===4){
+        route.points=pullEndpointThroughSymbol(route.points,isSource,toBox);
+        continue;
+      }
       const portRef=draftPortReference(fromBox,endpoint);
       const portPoint=draftResolvePortReference(toBox,portRef);
       if(portPoint)route.points=draftAttachEndpoint(route.points,isSource,portPoint);
     }
   }
 
-  function prepareOhtTankSensorAttachments(){
-    const componentName=id=>String(components[String(id||"")]?.component||"");
-    const allRoutes=Object.values(routes).filter(Boolean);
+  function attachEndpointToPoint(route,isSource,point){
+    if(!route||!Array.isArray(route.points)||route.points.length<2||!point)return;
+    const endpoint=isSource?route.points[0]:route.points[route.points.length-1];
+    const gap=Math.hypot(Number(endpoint[0])-point[0],Number(endpoint[1])-point[1]);
+    if(gap<=0.02)return;
+    route.points=draftAttachEndpoint(route.points,isSource,point);
+  }
 
+  function attachSensorLinksToLivePoint(sensorId,sensorBox){
+    const id=String(sensorId||"");
+    const point=sensorAnchorPoint(sensorBox);
+    if(!id||!point)return;
+    for(const route of connectedRoutes(id)){
+      if(route&&route.manual_drag)continue;
+      const isSource=String(route.source||"")===id;
+      const isTarget=String(route.target||"")===id;
+      if(!isSource&&!isTarget)continue;
+      attachEndpointToPoint(route,isSource,point);
+    }
+  }
+
+  function attachOhtTransmitterToInternalSensor(tankId,sensorBox){
+    const point=sensorAnchorPoint(sensorBox);
+    const tank=String(tankId||"");
+    if(!tank||!point)return;
+    for(const route of connectedRoutes(tank)){
+      if(!route||!route.dotted||route.manual_drag)continue;
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      const other=source===tank?target:source;
+      if(String(components[other]?.component||"")!=="Transmitter")continue;
+      attachEndpointToPoint(route,source===tank,point);
+    }
+  }
+
+  function internalSensorForTank(tankId){
+    const tank=String(tankId||"");
+    return Object.values(components).find(component=>
+      component &&
+      !component.hidden &&
+      component.__oht_attached_sensor &&
+      String(component.__oht_parent_id||"")===tank &&
+      Array.isArray(component.box)
+    )||null;
+  }
+
+  function forceDottedOhtTransmitterOntoSensor(){
+    for(const route of Object.values(routes)){
+      if(!route||route.hidden||!route.dotted||route.manual_drag)continue;
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      const sourceName=String(components[source]?.component||"");
+      const targetName=String(components[target]?.component||"");
+      let tankId="";
+      if(sourceName==="OHT Tank"&&targetName==="Transmitter")tankId=source;
+      else if(targetName==="OHT Tank"&&sourceName==="Transmitter")tankId=target;
+      else continue;
+      const sensor=internalSensorForTank(tankId);
+      if(!sensor)continue;
+      attachEndpointToPoint(route,source===tankId,sensorAnchorPoint(sensor.box));
+    }
+  }
+
+  function prepareOhtTankSensorAttachments(){
     Object.values(components).forEach(component=>{
       if(!component)return;
       delete component.__oht_attached_sensor;
       delete component.__oht_parent_id;
     });
+  }
 
-    const ohtToTransmitters=allRoutes.filter(route=>
-      componentName(route.source)==="OHT Tank" &&
-      componentName(route.target)==="Transmitter"
-    );
-    const transmitterToSensors=allRoutes.filter(route=>
-      componentName(route.source)==="Transmitter" &&
-      componentName(route.target)==="Linear Level Sensor (LLS)"
-    );
-
-    const usedSensorIds=new Set();
-    for(const tankRoute of ohtToTransmitters){
-      const tankId=String(tankRoute.source||"");
-      const transmitterId=String(tankRoute.target||"");
-      const sensorRoute=transmitterToSensors.find(route=>
-        String(route.source||"")===transmitterId &&
-        !usedSensorIds.has(String(route.target||""))
-      );
-      if(!sensorRoute)continue;
-
-      const sensorId=String(sensorRoute.target||"");
+  function applyClickedOhtSensorEmbeds(){
+    const embeds=Array.isArray(argsState.oht_sensor_embeds)?argsState.oht_sensor_embeds:[];
+    embeds.forEach(item=>{
+      const tankId=String(item&&item.tank_id||"");
+      const sensorId=String(item&&item.sensor_id||"");
       const tank=components[tankId];
-      const transmitter=components[transmitterId];
       const sensor=components[sensorId];
-      if(!tank||!sensor)continue;
-
-      usedSensorIds.add(sensorId);
+      if(!tank||!sensor||tank.hidden||!Array.isArray(tank.box))return;
+      sensor.hidden=false;
       sensor.__oht_attached_sensor=true;
       sensor.__oht_parent_id=tankId;
+      sensor.box=ohtAttachedSensorBox(tank.box);
+      attachSensorLinksToLivePoint(sensorId,sensor.box);
+    });
+  }
 
-      // When either existing OHT sensor link is deleted, hide only this attached
-      // visual sensor. The saved component/project data remains untouched.
-      const attachmentActive=
-        !tank.hidden &&
-        !transmitter?.hidden &&
-        !tankRoute.hidden &&
-        !sensorRoute.hidden;
-      if(!attachmentActive){
-        sensor.hidden=true;
-        continue;
+  function separateComponentsFromTanks(){
+    const tanks=Object.values(components).filter(component=>
+      component&&!component.hidden&&String(component.component||"")==="OHT Tank"&&Array.isArray(component.box)
+    );
+    if(!tanks.length)return;
+    const [canvasWidth,canvasHeight]=canvasSize();
+    const occupied=[];
+    let moved=false;
+    Object.values(components).forEach(component=>{
+      if(!component||component.hidden||isPrimaryCanvasComponent(component))return;
+      if(component.__oht_attached_sensor)return;
+      if(!Array.isArray(component.box)||component.box.length!==4)return;
+      const [x,y,w,h]=component.box.map(Number);
+      if(!(w>0)||!(h>0))return;
+      const center=[x+w/2,y+h/2];
+      const insideTank=tanks.some(tank=>pointInBox(center,tank.box));
+      const atOrigin=Math.abs(x)<0.05&&Math.abs(y)<0.05;
+      if(!insideTank&&!atOrigin){
+        occupied.push(component.box);
+        return;
       }
-
-      const previousBox=cloneBox(sensor.box);
-      const attachedBox=ohtAttachedSensorBox(tank.box);
-      sensor.box=attachedBox;
-      reanchorComponentRoutes(sensorId,previousBox,attachedBox);
-    }
+      let next=component.box;
+      for(let slot=0;slot<24;slot++){
+        const nx=Math.min(Math.max(0.4,canvasWidth-w-0.3),4.4+(slot%3)*1.45);
+        const ny=Math.min(Math.max(0.4,canvasHeight-h-0.3),3.15+Math.floor(slot/3)*1.2);
+        const candidate=[nx,ny,w,h];
+        const candidateCenter=[nx+w/2,ny+h/2];
+        const hitsTank=tanks.some(tank=>pointInBox(candidateCenter,tank.box));
+        const hitsOther=occupied.some(box=>pointInBox(candidateCenter,box));
+        if(!hitsTank&&!hitsOther){
+          next=candidate;
+          break;
+        }
+      }
+      component.box=next;
+      occupied.push(component.box);
+      moved=true;
+    });
+    if(moved)saveMovementDraft();
   }
   function collectRoutePayload(ids){const set=new Set(ids||[]),out=[];Object.values(routes).forEach(r=>{if(set.has(r.source)||set.has(r.target))out.push({edge_id:r.edge_id,points:clonePoints(r.points),source:r.source,target:r.target,hidden:!!r.hidden});});return out;}
   function selectEdge(id){if(!routes[id]||routes[id].hidden)return;selectedEdge=id;selectedComponents.clear();closeContext();renderOverlay();root.focus({preventScroll:true});}
@@ -1316,6 +2053,14 @@
     routeSvg.setAttribute("preserveAspectRatio","none");
     routeSvg.style.cssText="position:absolute;inset:0;width:100%;height:100%;z-index:5;pointer-events:auto;overflow:visible;";
     stage.appendChild(routeSvg);
+    // The dotted OHT sensor line must paint above the tank icon and still
+    // sit under the internal LLS icon, so it is visible from the sensor to
+    // the transmitter. Solid lines, including Sump-to-Tank, stay below.
+    const sensorRouteSvg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+    sensorRouteSvg.setAttribute("viewBox",`0 0 ${cw} ${ch}`);
+    sensorRouteSvg.setAttribute("preserveAspectRatio","none");
+    sensorRouteSvg.style.cssText="position:absolute;inset:0;width:100%;height:100%;z-index:16;pointer-events:none;overflow:visible;";
+    stage.appendChild(sensorRouteSvg);
 
     const routeEl=(name,attrs={})=>{
       const el=document.createElementNS("http://www.w3.org/2000/svg",name);
@@ -2263,6 +3008,15 @@
         }
       };
 
+      const openRenderedRouteMenu=(clientX,clientY,edgeId)=>{
+        const id=String(edgeId||"");
+        const route=routes[id];
+        if(!route||route.hidden)return;
+        if(dragOnlyRouteAction)dragOnlyRouteAction.select(id);
+        openContext(clientX,clientY,"edge",id);
+        if(contextMenu)contextMenu.style.zIndex="400";
+      };
+
       // Direction arrows keep the existing orange appearance.
       const defs=routeEl("defs",{});
       routeSvg.appendChild(defs);
@@ -2274,6 +3028,7 @@
         return pose?pose.angle:0;
       };
 
+      forceDottedOhtTransmitterOntoSensor();
       for(const route of Object.values(routes)){
         if(route.hidden)continue;
         const pts=Array.isArray(route.points)?route.points:[];
@@ -2284,12 +3039,37 @@
           .map(p=>`${Number(p[0]||0)},${Number(p[1]||0)}`)
           .join(" ");
 
+        const sourceName=String(components[String(route.source||"")]?.component||"");
+        const targetName=String(components[String(route.target||"")]?.component||"");
+        const attachedLevelSensor=(componentId)=>{
+          const component=components[String(componentId||"")];
+          return !!(
+            component &&
+            component.__oht_attached_sensor &&
+            String(component.component||"")==="Linear Level Sensor (LLS)"
+          );
+        };
+        const drawsOverTank=!!(
+          route.dotted &&
+          (
+            (
+              (
+                (sourceName==="OHT Tank"&&targetName==="Transmitter") ||
+                (targetName==="OHT Tank"&&sourceName==="Transmitter")
+              ) &&
+              internalSensorForTank(sourceName==="OHT Tank"?route.source:route.target)
+            ) ||
+            (sourceName==="OHT Tank"&&attachedLevelSensor(route.target)) ||
+            (targetName==="OHT Tank"&&attachedLevelSensor(route.source))
+          )
+        );
+        const routeHost=drawsOverTank?sensorRouteSvg:routeSvg;
         const under=routeEl("polyline",{
           points,fill:"none",stroke:"#ffffff","stroke-width":"0.030",
           "stroke-linejoin":"round","stroke-linecap":"round",
           "pointer-events":"none"
         });
-        routeSvg.appendChild(under);
+        routeHost.appendChild(under);
 
         const line=routeEl("polyline",{
           points,fill:"none",
@@ -2300,7 +3080,7 @@
         });
         if(route.dotted)line.setAttribute("stroke-dasharray","0.026 0.052");
         const direction=String(route.direction||"source_to_target");
-        routeSvg.appendChild(line);
+        routeHost.appendChild(line);
 
         // Draw the existing orange arrow as its own SVG shape instead of an SVG
         // marker. Its tip stays on the terminal route point and its angle is
@@ -2313,7 +3093,7 @@
           "stroke-width":"0.004",
           "pointer-events":"none"
         });
-        routeSvg.appendChild(arrowVisual);
+        routeHost.appendChild(arrowVisual);
 
         const placeLockedArrow=()=>{
           const pose=originalArrowPose(route);
@@ -2330,7 +3110,7 @@
         const hit=routeEl("polyline",{
           points:routePointsText(route),
           fill:"none",
-          stroke:"transparent",
+          stroke:"rgba(0,0,0,0.002)",
           "stroke-width":"14",
           "vector-effect":"non-scaling-stroke",
           "stroke-linejoin":"round",
@@ -2338,7 +3118,8 @@
           style:"pointer-events:stroke;cursor:grab;touch-action:none;"
         });
         hit.dataset.edgeId=edgeId;
-        routeSvg.appendChild(hit);
+        routeHost.appendChild(hit);
+        if(drawsOverTank)hit.style.pointerEvents="stroke";
 
         // Keep the existing visible orange arrow exactly unchanged.
         // Use a transparent HTML drag target above the component hit layer.
@@ -2837,14 +3618,16 @@
           try{arrowHandle.setPointerCapture(e.pointerId);}catch(_){}
         });
 
-        hit.addEventListener("contextmenu",e=>{
+        const openThisRouteMenu=e=>{
           e.preventDefault();
           e.stopPropagation();
-          if(!route.hidden){
-            if(dragOnlyRouteAction)dragOnlyRouteAction.select(edgeId);
-            openContext(e.clientX,e.clientY,"edge",edgeId);
-          }
-        });
+          openRenderedRouteMenu(e.clientX,e.clientY,edgeId);
+        };
+        hit.addEventListener("contextmenu",openThisRouteMenu);
+        arrowHandle.addEventListener("contextmenu",openThisRouteMenu);
+        sourceTerminalHandle.addEventListener("contextmenu",openThisRouteMenu);
+        targetTerminalHandle.addEventListener("contextmenu",openThisRouteMenu);
+        sourceEndpointHandle.addEventListener("contextmenu",openThisRouteMenu);
 
         hit.addEventListener("click",e=>{
           e.preventDefault();
@@ -2961,6 +3744,7 @@
           try{targetTerminalHandle.releasePointerCapture(e.pointerId);}catch(_){}
           try{sourceEndpointHandle.releasePointerCapture(e.pointerId);}catch(_){}
           if(moved){
+            route.manual_drag=true;
             // Persist the adjusted connection back to Streamlit on pointer-up.
             // The existing Python handler stores the exact route points as a
             // manual override, so the line no longer snaps back after any rerun,
@@ -2991,6 +3775,52 @@
         addDragOnlyWindowListener("pointerup",finishRouteDrag);
         addDragOnlyWindowListener("pointercancel",finishRouteDrag);
       }
+
+      // Right-click uses the geometry drawn on this pass. The first and last
+      // segments sit under drag handles, so the menu is also opened from the
+      // pointer position against those original points.
+      const routeIdAtClient=(clientX,clientY)=>{
+        const rect=stage.getBoundingClientRect();
+        if(!rect.width||!rect.height)return "";
+        const px=(clientX-rect.left)/rect.width*cw;
+        const py=(clientY-rect.top)/rect.height*ch;
+        let bestId="";
+        let bestPx=17;
+        for(const route of Object.values(routes)){
+          if(!route||route.hidden)continue;
+          const pts=Array.isArray(route.points)?route.points:[];
+          for(let i=0;i<pts.length-1;i++){
+            const a=pts[i],b=pts[i+1];
+            if(!a||!b)continue;
+            const ax=Number(a[0]),ay=Number(a[1]),bx=Number(b[0]),by=Number(b[1]);
+            const vx=bx-ax,vy=by-ay;
+            const len2=vx*vx+vy*vy;
+            if(len2<1e-12)continue;
+            let t=((px-ax)*vx+(py-ay)*vy)/len2;
+            if(t<0)t=0;
+            else if(t>1)t=1;
+            const qx=ax+t*vx,qy=ay+t*vy;
+            const dist=Math.hypot((qx-px)/cw*rect.width,(qy-py)/ch*rect.height);
+            if(dist<bestPx){
+              bestPx=dist;
+              bestId=String(route.edge_id||"");
+            }
+          }
+        }
+        return bestPx<=16?bestId:"";
+      };
+      stage.addEventListener("contextmenu",event=>{
+        const target=event.target;
+        if(!target)return;
+        const tag=String(target.tagName||"").toUpperCase();
+        if(tag==="BUTTON"||tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT")return;
+        if(typeof target.closest==="function"&&target.closest("[data-component-id],[data-annotation-id]"))return;
+        const edgeId=routeIdAtClient(event.clientX,event.clientY);
+        if(!edgeId)return;
+        event.preventDefault();
+        event.stopPropagation();
+        openRenderedRouteMenu(event.clientX,event.clientY,edgeId);
+      },true);
     };
     drawDragOnlyRoutes();
 
@@ -3143,6 +3973,191 @@
       ];
     };
 
+    // Manual Draw stays in the browser until a line is finished. Toggling the
+    // mode does not notify Streamlit, so opening it does not reroute the sheet.
+    const manualDraw={enabled:false,source:"",points:[]};
+    const manualPreview=document.createElementNS("http://www.w3.org/2000/svg","svg");
+    manualPreview.setAttribute("viewBox",`0 0 ${cw} ${ch}`);
+    manualPreview.setAttribute("preserveAspectRatio","none");
+    manualPreview.style.cssText="position:absolute;inset:0;width:100%;height:100%;z-index:6;pointer-events:none;overflow:visible;";
+    stage.appendChild(manualPreview);
+    const manualPreviewLine=document.createElementNS("http://www.w3.org/2000/svg","polyline");
+    manualPreviewLine.setAttribute("fill","none");
+    manualPreviewLine.setAttribute("stroke","#0a66e3");
+    manualPreviewLine.setAttribute("stroke-width","0.018");
+    manualPreviewLine.setAttribute("stroke-dasharray","0.05 0.04");
+    manualPreviewLine.setAttribute("stroke-linejoin","round");
+    manualPreviewLine.setAttribute("stroke-linecap","round");
+    manualPreview.appendChild(manualPreviewLine);
+
+    const portFacingPoint=(box,point)=>{
+      const x=Number(box[0]),y=Number(box[1]),w=Number(box[2]),h=Number(box[3]);
+      const cx=x+w/2,cy=y+h/2;
+      const dx=Number(point[0])-cx,dy=Number(point[1])-cy;
+      if(Math.abs(dx)>=Math.abs(dy))return dx>=0?[x+w,cy]:[x,cy];
+      return dy>=0?[cx,y+h]:[cx,y];
+    };
+    const elbowBetween=(fromBox,toBox)=>{
+      const start=portFacingPoint(fromBox,[toBox[0]+toBox[2]/2,toBox[1]+toBox[3]/2]);
+      const end=portFacingPoint(toBox,[fromBox[0]+fromBox[2]/2,fromBox[1]+fromBox[3]/2]);
+      if(Math.abs(start[0]-end[0])<0.02||Math.abs(start[1]-end[1])<0.02)return [start,end];
+      const horizontalExit=Math.abs(start[0]-(fromBox[0]+fromBox[2]/2))>=Math.abs(start[1]-(fromBox[1]+fromBox[3]/2));
+      return horizontalExit?[start,[end[0],start[1]],end]:[start,[start[0],end[1]],end];
+    };
+    const pushOrtho=(points,point)=>{
+      if(!points.length){points.push([Number(point[0]),Number(point[1])]);return;}
+      const prev=points[points.length-1];
+      const dx=Math.abs(point[0]-prev[0]),dy=Math.abs(point[1]-prev[1]);
+      if(dx<0.02&&dy<0.02)return;
+      let next;
+      if(points.length>=2){
+        const before=points[points.length-2];
+        const lastHorizontal=Math.abs(prev[0]-before[0])>=Math.abs(prev[1]-before[1]);
+        next=lastHorizontal?[prev[0],point[1]]:[point[0],prev[1]];
+      }else{
+        next=dx>=dy?[point[0],prev[1]]:[prev[0],point[1]];
+      }
+      if(Math.hypot(next[0]-prev[0],next[1]-prev[1])<0.02)return;
+      points.push(next);
+    };
+    const showManualPreview=(extra)=>{
+      const pts=manualDraw.points.map(p=>[p[0],p[1]]);
+      if(extra)pushOrtho(pts,extra);
+      manualPreviewLine.setAttribute("points",pts.map(p=>`${p[0]},${p[1]}`).join(" "));
+    };
+    const highlightManualSource=(id)=>{
+      for(const [cid,item] of overlays){
+        if(!item||!item.hit)continue;
+        item.hit.style.outline=cid===id?"3px solid #0a66e3":"none";
+        item.hit.style.outlineOffset=cid===id?"2px":"0";
+      }
+    };
+    manualDraw.cancel=()=>{
+      manualDraw.source="";
+      manualDraw.points=[];
+      manualPreviewLine.setAttribute("points","");
+      highlightManualSource("");
+    };
+    worksheetTools.setManualDraw=(enabled)=>{
+      const next=!!enabled;
+      const changed=manualDraw.enabled!==next;
+      manualDraw.enabled=next;
+      stage.style.cursor=next?"crosshair":"";
+      if(changed&&!next)manualDraw.cancel();
+    };
+    worksheetTools.setManualDraw(!!argsState.manual_draw);
+    manualDraw.commit=(sourceId,targetId,points)=>{
+      const clean=clonePoints(points).filter(p=>Array.isArray(p)&&p.length>=2);
+      if(clean.length<2){manualDraw.cancel();return;}
+      const fromId=String(sourceId||"");
+      const toId=String(targetId||"");
+      const existing=Object.values(routes).find(route=>!route.hidden&&fromId&&toId&&(
+        (String(route.source||"")===fromId&&String(route.target||"")===toId)||
+        (String(route.source||"")===toId&&String(route.target||"")===fromId)
+      ));
+      const edgeId=existing
+        ?String(existing.edge_id||"")
+        :`manual__${fromId||"canvas"}__${toId||"canvas"}__${Date.now().toString(36)}`;
+      if(existing){
+        existing.points=clean;
+        existing.original_points=clonePoints(clean);
+        updateRouteVisual(edgeId);
+      }else{
+        routes[edgeId]={
+          edge_id:edgeId,
+          points:clean,
+          original_points:clonePoints(clean),
+          source:fromId,
+          target:toId,
+          color:"#123DBD",
+          dotted:false,
+          direction:"source_to_target",
+          original_direction:"source_to_target",
+          hidden:false,
+          custom:true
+        };
+        const drawn=clean.map(p=>`${p[0]},${p[1]}`).join(" ");
+        const strokeUnder=routeEl("polyline",{
+          points:drawn,fill:"none",stroke:"#ffffff","stroke-width":"0.030",
+          "stroke-linejoin":"round","stroke-linecap":"round","pointer-events":"none"
+        });
+        const strokeLine=routeEl("polyline",{
+          points:drawn,fill:"none",stroke:"#123DBD","stroke-width":"0.015",
+          "stroke-linejoin":"round","stroke-linecap":"round","pointer-events":"none"
+        });
+        strokeUnder.setAttribute("data-manual-stroke","1");
+        strokeLine.setAttribute("data-manual-stroke","1");
+        routeSvg.appendChild(strokeUnder);
+        routeSvg.appendChild(strokeLine);
+      }
+      manualDraw.cancel();
+      saveMovementDraft();
+      emit("manual_draw_commit",{
+        edge_id:edgeId,
+        source:String(sourceId||""),
+        target:String(targetId||""),
+        points:clonePoints(clean)
+      });
+    };
+    manualDraw.handleComponent=(id)=>{
+      if(!manualDraw.enabled)return false;
+      const target=components[id];
+      if(!target||target.hidden)return true;
+      if(manualDraw.points.length){
+        const port=portFacingPoint(target.box,manualDraw.points[manualDraw.points.length-1]);
+        pushOrtho(manualDraw.points,port);
+        const last=manualDraw.points[manualDraw.points.length-1];
+        if(Math.hypot(last[0]-port[0],last[1]-port[1])>0.02)manualDraw.points.push(port);
+        manualDraw.commit(manualDraw.source,id,manualDraw.points);
+        return true;
+      }
+      if(!manualDraw.source){
+        manualDraw.source=id;
+        highlightManualSource(id);
+        return true;
+      }
+      if(manualDraw.source===id){
+        manualDraw.cancel();
+        return true;
+      }
+      const source=components[manualDraw.source];
+      if(!source){manualDraw.cancel();return true;}
+      manualDraw.commit(manualDraw.source,id,elbowBetween(source.box,target.box));
+      return true;
+    };
+    stage.addEventListener("pointerdown",event=>{
+      if(!manualDraw.enabled)return;
+      if(event.button!==0&&event.pointerType!=="touch"&&event.pointerType!=="pen")return;
+      if(event.target&&event.target.closest&&event.target.closest("[data-manual-draw-ui],[data-component-id],[data-annotation-id]"))return;
+      const tag=String(event.target&&event.target.tagName||"").toLowerCase();
+      if(tag==="polyline"||tag==="path")return;
+      const point=canvasPoint(event);
+      if(manualDraw.source&&!manualDraw.points.length){
+        const source=components[manualDraw.source];
+        if(source)manualDraw.points.push(portFacingPoint(source.box,point));
+      }
+      pushOrtho(manualDraw.points,point);
+      showManualPreview();
+    });
+    stage.addEventListener("pointermove",event=>{
+      if(!manualDraw.enabled||!manualDraw.points.length)return;
+      showManualPreview(canvasPoint(event));
+    });
+    stage.addEventListener("dblclick",event=>{
+      if(!manualDraw.enabled)return;
+      if(event.target&&event.target.closest&&event.target.closest("[data-manual-draw-ui],[data-component-id],[data-annotation-id]"))return;
+      event.preventDefault();
+      event.stopPropagation();
+      if(manualDraw.points.length>=2){
+        manualDraw.commit(manualDraw.source,"",manualDraw.points);
+      }
+    });
+    addDragOnlyWindowListener("keydown",event=>{
+      if(!manualDraw.enabled||event.key!=="Escape")return;
+      event.preventDefault();
+      manualDraw.cancel();
+    });
+
     const makeGhostFromPreview=(component)=>{
       const ghost=document.createElement("img");
       ghost.draggable=false;
@@ -3232,18 +4247,26 @@
       if(changed)writeHoverReveals(reveals);
     };
 
-    for(const c of Object.values(components)){
+    const paintOrder=Object.values(components).slice().sort(
+      (a,b)=>componentStackLayer(a)-componentStackLayer(b)
+    );
+    for(const c of paintOrder){
       if(c.hidden)continue;
       const id=String(c.instance_id||"");
       if(!id)continue;
+      const visualZ=c.__oht_attached_sensor?19:(isPrimaryCanvasComponent(c)?15:28);
+      const hitZ=isPrimaryCanvasComponent(c)?46:58;
 
       // Actual visible component layer. This is deliberately separate from the
       // transparent pointer target so the component itself moves immediately.
+      // Secondary cards sit above Sump, Bore Well, and OHT Tank so a tank image
+      // cannot cover them or steal their drag target.
       const visual=document.createElement("img");
       visual.draggable=false;
       visual.alt=String(c.title||c.component||id);
       visual.src=`data:image/png;base64,${String(c.image_b64||"").trim()}`;
-      visual.style.cssText=`position:absolute;z-index:${c.__oht_attached_sensor?18:15};pointer-events:none;user-select:none;object-fit:${String(c.image_fit||"contain")};`;
+      visual.style.cssText=`position:absolute;z-index:${visualZ};pointer-events:none;user-select:none;object-fit:${String(c.image_fit||"contain")};`;
+      if(c.__oht_attached_sensor)revealInternalSensorGlyph(visual);
       applyVisibleComponentImageBox(visual,c.box);
       stage.appendChild(visual);
       componentVisuals.set(id,visual);
@@ -3349,7 +4372,7 @@
       const hit=document.createElement("div");
       hit.dataset.componentId=id;
       hit.title=String(c.title||c.component||id);
-      hit.style.cssText="position:absolute;z-index:50;box-sizing:border-box;cursor:grab;background:rgba(0,0,0,0.001);touch-action:none;pointer-events:auto;-webkit-user-select:none;user-select:none;";
+      hit.style.cssText=`position:absolute;z-index:${hitZ};box-sizing:border-box;cursor:grab;background:rgba(0,0,0,0.001);touch-action:none;pointer-events:auto;-webkit-user-select:none;user-select:none;`;
       applyBox(hit,c.box);
 
       if(id===pendingId){
@@ -3374,8 +4397,7 @@
       del.addEventListener("pointerdown",e=>{e.preventDefault();e.stopPropagation();});
       add.addEventListener("click",e=>{
         e.preventDefault();e.stopPropagation();
-        optimisticWorksheetAdd(c);
-        emit("component_add",{component:String(c.component||""),instance_id:id});
+        requestWorksheetComponentAdd(String(c.component||""),id,c);
       });
       del.addEventListener("click",e=>{
         e.preventDefault();e.stopPropagation();
@@ -3540,22 +4562,16 @@
             if(!Array.isArray(basePoints)||basePoints.length<2)continue;
 
             route.points=clonePoints(basePoints);
-            const portRefs=childState.routePortRefs?.[edgeId]||{};
+            const sensorPoint=sensorAnchorPoint(child.box);
             if(String(route.source||"")===childState.id){
-              const sourcePort=resolvePortReference(child.box,portRefs.source);
-              if(sourcePort){
-                route.points=moveConnectedRouteEndpointToPort(
-                  route.points,true,sourcePort
-                );
-              }
+              route.points=moveConnectedRouteEndpointToPort(
+                route.points,true,sensorPoint
+              );
             }
             if(String(route.target||"")===childState.id){
-              const targetPort=resolvePortReference(child.box,portRefs.target);
-              if(targetPort){
-                route.points=moveConnectedRouteEndpointToPort(
-                  route.points,false,targetPort
-                );
-              }
+              route.points=moveConnectedRouteEndpointToPort(
+                route.points,false,sensorPoint
+              );
             }
 
             route.points=cleanDraggedRoutePoints(route.points);
@@ -3574,9 +4590,19 @@
 
           route.points=clonePoints(basePoints);
           const portRefs=activeDrag.routePortRefs?.[edgeId]||{};
+          const otherId=String(route.source||"")===id
+            ?String(route.target||"")
+            :String(route.source||"");
+          const internalSensor=(activeDrag.attachedComponents||[]).find(childState=>childState&&childState.component);
+          const transmitterSensorAnchor=(
+            !c.__oht_attached_sensor &&
+            String(components[otherId]?.component||"")==="Transmitter" &&
+            internalSensor
+          )?sensorAnchorPoint(internalSensor.component.box):null;
+          const sensorPoint=c.__oht_attached_sensor?sensorAnchorPoint(c.box):transmitterSensorAnchor;
 
           if(String(route.source||"")===id){
-            const sourcePort=resolvePortReference(c.box,portRefs.source);
+            const sourcePort=sensorPoint||resolvePortReference(c.box,portRefs.source);
             if(sourcePort){
               route.points=moveConnectedRouteEndpointToPort(
                 route.points,true,sourcePort
@@ -3585,12 +4611,23 @@
           }
 
           if(String(route.target||"")===id){
-            const targetPort=resolvePortReference(c.box,portRefs.target);
+            const targetPort=sensorPoint||resolvePortReference(c.box,portRefs.target);
             if(targetPort){
               route.points=moveConnectedRouteEndpointToPort(
                 route.points,false,targetPort
               );
             }
+          }
+
+          const linkedSensor=(activeDrag.attachedComponents||[]).find(
+            childState=>String(childState.id||"")===otherId
+          );
+          if(linkedSensor&&linkedSensor.component){
+            route.points=moveConnectedRouteEndpointToPort(
+              route.points,
+              String(route.source||"")===otherId,
+              sensorAnchorPoint(linkedSensor.component.box)
+            );
           }
 
           // Maintain a clean right-angle route while the component moves.
@@ -3646,10 +4683,29 @@
         hit.style.outlineOffset=id===pendingId?"2px":"0";
 
         if(d.moved){
-          // Do not notify Streamlit for movement. The component stays exactly at
-          // its dropped position and the current page does not rerun/reload.
           saveMovementDraft();
           suppressComponentClick=true;
+          const movedComponents=[{
+            instance_id:id,
+            component:String(c.component||""),
+            box:cloneBox(c.box)
+          }];
+          for(const childState of (d.attachedComponents||[])){
+            const child=childState.component;
+            const childId=String(child&&child.instance_id||"");
+            if(!childId||!child.box)continue;
+            movedComponents.push({
+              instance_id:childId,
+              component:String(child.component||""),
+              box:cloneBox(child.box)
+            });
+          }
+          emit("component_move",{
+            instance_id:id,
+            component:String(c.component||""),
+            box:cloneBox(c.box),
+            moved_components:movedComponents
+          });
         }else{
           // Selection is emitted by the normal click event below.
         }
@@ -3661,6 +4717,7 @@
         if(suppressComponentClick){suppressComponentClick=false;return;}
         e.preventDefault();
         e.stopPropagation();
+        if(manualDraw.handleComponent(id))return;
         emit("component_select",{
           instance_id:id,
           component:String(c.component||"")
@@ -3718,6 +4775,12 @@
       hit.appendChild(del);
       stage.appendChild(hit);
       overlays.set(id,{hit,add,del,visual});
+    }
+
+    for(const c of Object.values(components)){
+      if(!c||c.hidden||!c.__oht_attached_sensor)continue;
+      const sensorVisual=componentVisuals.get(String(c.instance_id||""));
+      if(sensorVisual)stage.appendChild(sensorVisual);
     }
 
     const componentIdAtPointer=(ev)=>{
@@ -3783,6 +4846,8 @@
     }else{
       requestAnimationFrame(()=>setHeight(true));
     }
+    refreshWorksheetAnnotations=()=>mountWorksheetAnnotations(stage,cw,ch,canvasPoint,addDragOnlyWindowListener);
+    refreshWorksheetAnnotations();
   }
 
   function renderNormal(){
@@ -3922,8 +4987,7 @@
       b.addEventListener("click",e=>{
         e.preventDefault();
         e.stopPropagation();
-        optimisticWorksheetAdd(item);
-        emit("component_add",{component:String(item.component||""),instance_id:itemId});
+        requestWorksheetComponentAdd(String(item.component||""),itemId,item);
       });
       d.addEventListener("click",e=>{
         e.preventDefault();
@@ -3939,8 +5003,24 @@
     setHeight(true);
   }
 
+  function consumeAutoRouteToken(incoming){
+    const token=String((incoming&&incoming.auto_route_token)||"");
+    if(!token||token===appliedAutoRouteToken)return;
+    appliedAutoRouteToken=token;
+    const draftKey=String((incoming&&incoming.local_draft_key)||argsState.local_draft_key||"").trim();
+    if(!draftKey)return;
+    try{
+      const saved=JSON.parse(sessionStorage.getItem(`rts:${draftKey}`)||"null");
+      if(!saved||typeof saved!=="object")return;
+      saved.routes=[];
+      sessionStorage.setItem(`rts:${draftKey}`,JSON.stringify(saved));
+    }catch(_){}
+  }
+
   function render(args){
     const incoming=args||{};
+    consumeAutoRouteToken(incoming);
+    worksheetTools.setManualDraw(!!incoming.manual_draw);
     const revision=String(incoming.render_revision||"");
     const compact=!!incoming.compact_payload;
 
@@ -3950,12 +5030,15 @@
     // route arrays. Preserve the already-mounted heavy payload instead of
     // replacing it with the compact placeholders.
     if(revision&&revision===lastRenderRevision&&compact){
+      const notesChanged=JSON.stringify(argsState.annotations||[])!==JSON.stringify(incoming.annotations||[]);
       argsState={...argsState,...incoming,
         image_b64:argsState.image_b64||"",
         routes:argsState.routes||[],
         hotspots:argsState.hotspots||[],
         components:argsState.components||[]
       };
+      if(notesChanged&&refreshWorksheetAnnotations)refreshWorksheetAnnotations();
+      if(applyAnnotationFormatColor)applyAnnotationFormatColor();
       return;
     }
 
@@ -3968,7 +5051,10 @@
     }
 
     if(revision&&revision===lastRenderRevision){
+      const notesChanged=JSON.stringify(argsState.annotations||[])!==JSON.stringify(incoming.annotations||[]);
       argsState=incoming;
+      if(notesChanged&&refreshWorksheetAnnotations)refreshWorksheetAnnotations();
+      if(applyAnnotationFormatColor)applyAnnotationFormatColor();
       return;
     }
     argsState=incoming;
@@ -3981,12 +5067,15 @@
     rebuildRouteConnectionIndex();
     if(argsState.drag_only){
       restoreMovementDraft();
+      seatInlinePipeSymbols();
       prepareOhtTankSensorAttachments();
+      applyClickedOhtSensorEmbeds();
+      separateComponentsFromTanks();
     }
     if(argsState.edit_mode){initialSnapshot=snapshot();history=[JSON.parse(JSON.stringify(initialSnapshot))];historyIndex=0;dirty=false;renderEditor();}
     else if(argsState.drag_only){renderDragOnly();}
     else renderNormal();
   }
-  function keydown(e){if(["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName))return;const cmd=e.ctrlKey||e.metaKey,k=String(e.key||"").toLowerCase();if(cmd&&k==="z"){e.preventDefault();e.shiftKey?redoLocal():undoLocal();return;}if(cmd&&k==="y"){e.preventDefault();redoLocal();return;}if(cmd&&k==="c"){e.preventDefault();copySelection();return;}if(cmd&&k==="v"){e.preventDefault();pasteSelection();return;}if(cmd&&k==="d"){e.preventDefault();duplicateIds([...selectedComponents]);return;}if(cmd&&k==="s"){e.preventDefault();saveEditor();return;}if(e.key==="Escape"){deselect();return;}if(e.key==="Delete"||e.key==="Backspace"){e.preventDefault();deleteSelection();return;}if(!cmd&&k==="d"&&selectedEdge){const r=routes[selectedEdge];r.direction=r.direction==="target_to_source"?"source_to_target":"target_to_source";checkpoint();renderOverlay();}}
+  function keydown(e){const active=document.activeElement;if(["INPUT","TEXTAREA","SELECT"].includes(active?.tagName))return;if(e.target?.closest?.("[data-annotation-field],[data-annotation-title]")||active?.closest?.("[data-annotation-field],[data-annotation-title]"))return;const cmd=e.ctrlKey||e.metaKey,k=String(e.key||"").toLowerCase();if(cmd&&k==="z"){e.preventDefault();e.shiftKey?redoLocal():undoLocal();return;}if(cmd&&k==="y"){e.preventDefault();redoLocal();return;}if(cmd&&k==="c"){e.preventDefault();copySelection();return;}if(cmd&&k==="v"){e.preventDefault();pasteSelection();return;}if(cmd&&k==="d"){e.preventDefault();duplicateIds([...selectedComponents]);return;}if(cmd&&k==="s"){e.preventDefault();saveEditor();return;}if(e.key==="Escape"){deselect();return;}if(e.key==="Delete"||e.key==="Backspace"){e.preventDefault();deleteSelection();return;}if(!cmd&&k==="d"&&selectedEdge){const r=routes[selectedEdge];r.direction=r.direction==="target_to_source"?"source_to_target":"target_to_source";checkpoint();renderOverlay();}}
   window.addEventListener("message",e=>{const d=e.data;if(d&&d.type===RENDER)render(d.args||{});});window.addEventListener("resize",()=>{if(!argsState.fit_screen)requestAnimationFrame(()=>setHeight(true));});window.addEventListener("pointerdown",e=>{if(contextMenu&&!contextMenu.contains(e.target))closeContext();});root.addEventListener("keydown",keydown);ready();setTimeout(ready,120);setHeight(true);setTimeout(()=>setHeight(true),250);
 })();

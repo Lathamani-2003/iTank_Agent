@@ -5530,6 +5530,118 @@ def _spine_route(
     return component_to_junction
 
 
+def _visible_component_boxes(
+    boxes: Mapping[str, Box],
+    skip_ids: set[str],
+) -> list[Box]:
+    """Real component bodies. Tiny junction markers are not obstacles."""
+    visible: list[Box] = []
+    for node_id, box in boxes.items():
+        if node_id in skip_ids:
+            continue
+        if box[2] < 0.20 or box[3] < 0.20:
+            continue
+        visible.append(box)
+    return visible
+
+
+def _body_overlap_length(points: Sequence[Point], bodies: Sequence[Box]) -> float:
+    total = 0.0
+    for start, end in zip(points, points[1:]):
+        span = abs(start[0] - end[0]) + abs(start[1] - end[1])
+        if span <= 1e-6:
+            continue
+        for box in bodies:
+            rect = _inflate_box(box, -0.012)
+            if rect[2] <= 0.02 or rect[3] <= 0.02:
+                continue
+            if _segment_hits_rect(start, end, rect):
+                total += span
+                break
+    return total
+
+
+def _jog_clear_of_box(
+    start: Point,
+    end: Point,
+    box: Box,
+    clearance: float,
+) -> list[Point] | None:
+    """Shift one orthogonal segment just outside a component it crosses."""
+    vertical = abs(start[0] - end[0]) <= 1e-6
+    horizontal = abs(start[1] - end[1]) <= 1e-6
+    if vertical == horizontal:
+        return None
+    x, y, w, h = box
+    if vertical:
+        lanes = (x + w + clearance, x - clearance)
+        options = [
+            [start, (lane, start[1]), (lane, end[1]), end]
+            for lane in lanes
+        ]
+    else:
+        lanes = (y - clearance, y + h + clearance)
+        options = [
+            [start, (start[0], lane), (end[0], lane), end]
+            for lane in lanes
+        ]
+    return [_compress(option) for option in options]
+
+
+def _separate_route_from_components(
+    points: Sequence[Point],
+    boxes: Mapping[str, Box],
+    source_id: str,
+    target_id: str,
+) -> list[Point]:
+    """Keep an orthogonal route, but move any run that crosses another component."""
+    bodies = _visible_component_boxes(boxes, {source_id, target_id})
+    if len(points) < 2 or not bodies:
+        return list(points)
+    current = _compress(list(points))
+    overlap = _body_overlap_length(current, bodies)
+    if overlap <= 1e-6:
+        return current
+
+    for _attempt in range(6):
+        improved = False
+        rebuilt: list[Point] = [current[0]]
+        for index, (start, end) in enumerate(zip(current, current[1:])):
+            tail = current[index + 2:]
+            blocking = None
+            for box in bodies:
+                rect = _inflate_box(box, -0.012)
+                if rect[2] <= 0.02 or rect[3] <= 0.02:
+                    continue
+                if _segment_hits_rect(start, end, rect):
+                    blocking = box
+                    break
+            if blocking is None:
+                rebuilt.append(end)
+                continue
+            best = None
+            best_overlap = _body_overlap_length(_compress(rebuilt[:-1] + [start, end] + tail), bodies)
+            for option in _jog_clear_of_box(start, end, blocking, 0.08) or []:
+                trial = _compress(rebuilt[:-1] + list(option) + tail)
+                trial_overlap = _body_overlap_length(trial, bodies)
+                if trial_overlap < best_overlap - 1e-6:
+                    best = option
+                    best_overlap = trial_overlap
+            if best is None:
+                rebuilt.append(end)
+                continue
+            rebuilt.extend(best[1:])
+            improved = True
+        current = _compress(rebuilt)
+        new_overlap = _body_overlap_length(current, bodies)
+        if not improved or new_overlap >= overlap - 1e-6:
+            break
+        overlap = new_overlap
+        if overlap <= 1e-6:
+            break
+    return current
+
+
 def _plan_fast_orthogonal_routes(
     diagram: DiagramSpec,
     boxes: Mapping[str, Box],
@@ -5693,6 +5805,14 @@ def _plan_fast_orthogonal_routes(
             return (hits, cost, bend_count, length, points)
 
         chosen_points, _hits, _alternate = min(pool, key=sort_key)
+        chosen_points = tuple(
+            _separate_route_from_components(
+                chosen_points,
+                normalized_boxes,
+                str(edge.source),
+                str(edge.target),
+            )
+        )
         result.append((chosen_points, _route_direction(chosen_points)))
 
     frozen_result = tuple(result)
