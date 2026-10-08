@@ -3,14 +3,93 @@
   const READY="streamlit:componentReady", SET_VALUE="streamlit:setComponentValue", SET_HEIGHT="streamlit:setFrameHeight", RENDER="streamlit:render";
   const root=document.getElementById("root");
   let argsState={}, routes={}, components={}, selectedEdge=null, selectedComponents=new Set(), clipboard=[], drag=null, zoom=1, panX=0, panY=0, snap=true, grid=.25, lastHeight=-1, contextMenu=null, initialSnapshot=null, history=[], historyIndex=-1, dirty=false, routeIdsByComponent=new Map(), lastRenderRevision="", overlayRenderQueued=false;
+  // deviceId → ohtId for user-linked Valve/FM docks (survives header route rebuild).
+  let explicitOhtInlineAssignments=new Map();
   const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
   const clonePoints=p=>(p||[]).map(q=>[Number(q[0]),Number(q[1])]);
   const cloneBox=b=>Array.isArray(b)&&b.length===4?b.map(Number):[0,0,1,1];
-  const eid=()=>`${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  const eid=()=>{
+    try{
+      if(typeof crypto!=="undefined"&&typeof crypto.randomUUID==="function"){
+        return crypto.randomUUID();
+      }
+    }catch(_){}
+    return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}_${Math.random().toString(36).slice(2)}`;
+  };
   let dragOnlyWindowListeners=[];
   let dragOnlyRouteAction=null;
+  let dragOnlyResizeObserver=null;
   let appliedAutoRouteToken="";
   const worksheetTools={setManualDraw(){}};
+  // Module-level drag lock: Streamlit remounts must not tear down an active
+  // first-grab drag session (local activeDrag dies with renderDragOnly).
+  let liveComponentDrag=null;
+  let liveComponentDragWindowListeners=[];
+
+  function componentAllowsAcronymDisplay(component){
+    // Sump / Bore Well / OHT Tank must always stay graphic icons.
+    return !isPrimaryCanvasComponent(component);
+  }
+  function componentDisplayMode(component){
+    if(!componentAllowsAcronymDisplay(component))return"icons";
+    const raw=component&&(component.display_mode||component.displayMode||component.symbol_mode);
+    const mode=String(raw||"icons").trim().toLowerCase();
+    return mode==="acronyms"||mode==="acronym"||mode==="letters"?"acronyms":"icons";
+  }
+  function componentAcronymText(component){
+    const raw=String(
+      (component&&(component.acronym||component.code||component.title||component.component))||"?"
+    ).trim();
+    return raw||"?";
+  }
+  function acronymFontSizeFromPixels(pxW,pxH,text){
+    const width=Math.max(1,Number(pxW)||1);
+    const height=Math.max(1,Number(pxH)||1);
+    const label=String(text||"?").trim()||"?";
+    const chars=Math.max(1,label.length);
+    // Leave room for border/padding so glyphs never clip the box edges.
+    const pad=Math.max(2,Math.min(width,height)*0.12);
+    const availW=Math.max(2,width-pad*2);
+    const availH=Math.max(2,height-pad*2);
+    const byHeight=availH*0.78;
+    const byWidth=availW/(chars*0.62);
+    return Math.max(5,Math.min(40,Math.floor(Math.min(byHeight,byWidth))));
+  }
+  function acronymFontSizeForBox(box,text){
+    const w=Math.max(0.01,Number(box&&box[2])||0.01);
+    const h=Math.max(0.01,Number(box&&box[3])||0.01);
+    // Fallback estimate when the DOM box has not been measured yet.
+    return acronymFontSizeFromPixels(w*48,h*48,text);
+  }
+  function fitAcronymBoxFont(el,box){
+    if(!el)return;
+    const label=String(el.textContent||"").trim()||"?";
+    let pxW=0;
+    let pxH=0;
+    try{
+      const rect=el.getBoundingClientRect();
+      pxW=Number(rect.width)||0;
+      pxH=Number(rect.height)||0;
+    }catch(_){}
+    if(pxW<2||pxH<2){
+      el.style.fontSize=`${acronymFontSizeForBox(box,label)}px`;
+      return;
+    }
+    el.style.fontSize=`${acronymFontSizeFromPixels(pxW,pxH,label)}px`;
+  }
+  function paintComponentDisplayModeControl(control,component){
+    if(!control)return;
+    const mode=componentDisplayMode(component);
+    if(control.tagName==="SELECT"){
+      control.value=mode;
+    }else{
+      control.textContent=mode==="acronyms"?"Icon":"Aa";
+    }
+    control.title=mode==="acronyms"
+      ?"Display: Acronym Box (switch to Graphic Icon)"
+      :"Display: Graphic Icon (switch to Acronym Box)";
+    control.setAttribute("aria-label","Component display mode");
+  }
 
   // Pointer interaction helpers only. Keep all geometry/routing/rendering logic
   // unchanged while coalescing high-frequency pointermove events to one update
@@ -183,13 +262,613 @@
           manual_drag:!!r.manual_drag,
           points:clonePoints(r.points)
         })),
-        components:Object.values(components).map(c=>({
+        components:Object.values(components).map(c=>{
+          let box=cloneBox(c.box);
+          const parentId=String(c&&c.__oht_parent_id||"");
+          if(c&&c.__oht_attached_sensor&&components[parentId]&&Array.isArray(components[parentId].box)){
+            box=ohtAttachedSensorBox(components[parentId].box);
+          }
+          return {
           instance_id:String(c.instance_id||""),
-          box:cloneBox(c.box)
-        }))
+            box,
+            user_dragged:!!(c&&c.__user_dragged),
+            // Survive Streamlit remounts (e.g. deleting another component).
+            display_mode:componentDisplayMode(c)
+          };
+        })
       }));
     }catch(_){}
   }
+  function pointOnBoxEdge(point, box){
+    if(!Array.isArray(point)||point.length<2||!Array.isArray(box)||box.length<4)return false;
+    const x=Number(box[0]), y=Number(box[1]), w=Number(box[2]), h=Number(box[3]);
+    const px=Number(point[0]), py=Number(point[1]);
+    if(!(w>0)||!(h>0)||!Number.isFinite(px)||!Number.isFinite(py))return false;
+    const tol=0.12;
+    if(px<x-tol||px>x+w+tol||py<y-tol||py>y+h+tol)return false;
+    return Math.abs(px-x)<=tol||Math.abs(px-(x+w))<=tol||Math.abs(py-y)<=tol||Math.abs(py-(y+h))<=tol;
+  }
+
+  function componentWaterKind(component){
+    const name=String(component?.component||"").trim().toLowerCase();
+    const title=String(component?.title||"").trim().toLowerCase();
+    if(name.startsWith("sump")||title.startsWith("sump"))return "sump";
+    if(name.includes("bore")||title.includes("bore")||name==="well"||title==="well")return "bore";
+    if(name.startsWith("oht")||title.startsWith("oht")||name==="oht tank")return "oht";
+    return "";
+  }
+
+  function sharedWaterHeaderY(){
+    let minTop=Infinity;
+    Object.values(components).forEach(component=>{
+      if(!component||component.hidden||!Array.isArray(component.box)||component.box.length<4)return;
+      const kind=componentWaterKind(component);
+      if(kind!=="sump"&&kind!=="oht")return;
+      minTop=Math.min(minTop,Number(component.box[1]));
+    });
+    if(!Number.isFinite(minTop))return null;
+    const [,canvasHeight]=canvasSize();
+    const gap=Math.max(0.32,Number(canvasHeight||7.5)*0.045);
+    return Math.max(0.18,minTop-gap);
+  }
+
+  function boxPort(box, toward){
+    const x=Number(box[0]), y=Number(box[1]), w=Number(box[2]), h=Number(box[3]);
+    const cx=x+w/2, cy=y+h/2;
+    const dx=Number(toward[0])-cx, dy=Number(toward[1])-cy;
+    if(Math.abs(dx)>=Math.abs(dy))return dx>=0?[x+w,cy]:[x,cy];
+    return dy>=0?[cx,y+h]:[cx,y];
+  }
+
+  function waterLoopForComponents(sourceId, targetId){
+    const source=components[sourceId];
+    const target=components[targetId];
+    if(!source||!target||!Array.isArray(source.box)||source.box.length<4||!Array.isArray(target.box)||target.box.length<4)return null;
+    const sourceKind=componentWaterKind(source);
+    const targetKind=componentWaterKind(target);
+    const kinds=new Set([sourceKind, targetKind]);
+    if(kinds.has("sump")&&kinds.has("oht")){
+      const sump=sourceKind==="sump"?source.box:target.box;
+      const tank=sourceKind==="sump"?target.box:source.box;
+      const sx=Number(sump[0]), sy=Number(sump[1]), sw=Number(sump[2]);
+      const tx=Number(tank[0]), ty=Number(tank[1]), tw=Number(tank[2]);
+      const sumpX=sx+sw/2;
+      const [,canvasHeight]=canvasSize();
+      const gap=Math.max(0.32, Number(canvasHeight||7.5)*0.045);
+      let headerY=sharedWaterHeaderY();
+      if(headerY==null)headerY=Math.min(sy, ty)-gap;
+      headerY=Math.max(0.08, Math.min(Number(headerY), Math.min(sy, ty)-gap));
+      const inlet=ohtTankInletPoint(tank);
+      const tankX=inlet[0];
+      const tankEndY=inlet[1];
+      // Continuous rise → header → drop onto the OHT icon inlet.
+      const path=[[sumpX, sy],[sumpX, headerY],[tankX, headerY],[tankX, tankEndY]];
+      if(sourceKind!=="sump")path.reverse();
+      return path;
+    }
+    if(kinds.has("bore")&&kinds.has("sump")){
+      const bore=sourceKind==="bore"?source.box:target.box;
+      const sump=sourceKind==="bore"?target.box:source.box;
+      const bx=Number(bore[0]), by=Number(bore[1]), bw=Number(bore[2]), bh=Number(bore[3]);
+      const sx=Number(sump[0]), sy=Number(sump[1]), sw=Number(sump[2]), sh=Number(sump[3]);
+      const borePoint=bx>=sx?[bx, by+bh/2]:[bx+bw, by+bh/2];
+      const sumpPoint=(sx+sw)<=bx?[sx+sw, sy+sh/2]:[sx, sy+sh/2];
+      let path;
+      if(Math.abs(borePoint[1]-sumpPoint[1])<=0.001)path=[borePoint, sumpPoint];
+      else{
+        const midX=(borePoint[0]+sumpPoint[0])/2;
+        path=[borePoint, [midX, borePoint[1]], [midX, sumpPoint[1]], sumpPoint];
+      }
+      if(sourceKind!=="bore")path=path.slice().reverse();
+      return path;
+    }
+    return null;
+  }
+
+  function isInlineProcessComponent(component){
+    const name=String(component?.component||component?.title||"").toLowerCase();
+    if(name.includes("flow meter")||name.includes("flowmeter"))return true;
+    return (
+      name.includes("motorized valve")||
+      name.includes("pressure relief")||
+      name.includes("non-return")||
+      name.includes("non return")
+    );
+  }
+
+  function routePairIsWater(route){
+    if(!route)return false;
+    if(route.fluid_header||route.sketch_lock)return true;
+    const edgeId=String(route.edge_id||"");
+    if(edgeId.startsWith("fluid_header_"))return true;
+    const sourceId=String(route.source||"");
+    const targetId=String(route.target||"");
+    const waterPrefixes=["sump_","oht_","bore_","well_"];
+    const inlinePrefixes=["mv_","prv_","nrv_","ufm_","ffm_","emfm_"];
+    if(
+      waterPrefixes.some(prefix=>sourceId.startsWith(prefix))&&
+      waterPrefixes.some(prefix=>targetId.startsWith(prefix))
+    )return true;
+    const sourceComp=components[sourceId]||{component:"",title:""};
+    const targetComp=components[targetId]||{component:"",title:""};
+    const sourceKind=componentWaterKind(sourceComp);
+    const targetKind=componentWaterKind(targetComp);
+    if(sourceKind&&targetKind)return true;
+    const sourceWater=!!sourceKind||waterPrefixes.some(prefix=>sourceId.startsWith(prefix));
+    const targetWater=!!targetKind||waterPrefixes.some(prefix=>targetId.startsWith(prefix));
+    const sourceInline=(
+      isInlineProcessComponent(sourceComp)||
+      inlinePrefixes.some(prefix=>sourceId.startsWith(prefix))
+    );
+    const targetInline=(
+      isInlineProcessComponent(targetComp)||
+      inlinePrefixes.some(prefix=>targetId.startsWith(prefix))
+    );
+    return (sourceWater&&targetInline)||(sourceInline&&targetWater);
+  }
+
+  function applySolidBlueWaterStroke(line,route){
+    if(!line)return;
+    const water=routePairIsWater(route);
+    if(water){
+      route.dotted=false;
+      route.color="#123DBD";
+      line.setAttribute("stroke","#123DBD");
+      line.setAttribute("stroke-dasharray","none");
+      line.style.strokeDasharray="none";
+      return;
+    }
+    if(route&&route.dotted){
+      line.setAttribute("stroke","#000000");
+      line.setAttribute("stroke-dasharray","0.026 0.052");
+      line.style.strokeDasharray="0.026 0.052";
+      return;
+    }
+    line.setAttribute("stroke","#123DBD");
+    line.setAttribute("stroke-dasharray","none");
+    line.style.strokeDasharray="none";
+  }
+
+  function hydraulicRoleOf(component){
+    const name=String(component?.component||component?.title||"").toLowerCase();
+    const id=String(component?.instance_id||"").toLowerCase();
+    if(name.includes("motorized valve")||id.startsWith("mv_"))return "mv";
+    if(name.includes("non-return")||name.includes("non return")||id.startsWith("nrv_"))return "nrv";
+    if(name.includes("pressure relief")||id.startsWith("prv_"))return "prv";
+    if(name.startsWith("motor")||id.startsWith("motor_"))return "motor";
+    if(name.includes("flow meter")||name.includes("flowmeter")||id.startsWith("ufm_")||id.startsWith("ffm_")||id.startsWith("emfm_"))return "fm";
+    return "";
+  }
+
+  function purgeSyntheticFluidHeaderRoutes(){
+    // Phantom cleanup ONLY: delete header/dock synthetics. Never delete or
+    // rewrite real Sump↔OHT / Bore↔SMC / LLS↔OHT / user-drawn edges.
+    Object.keys(routes).forEach(edgeId=>{
+      const id=String(edgeId||"");
+      if(
+        id.startsWith("fluid_header_")||
+        id.startsWith("fluid_oht_inline_dock__")
+      ){
+        delete routes[edgeId];
+      }
+    });
+  }
+
+  function restoreHeaderSuppressedSumpOhtRoutes(){
+    Object.values(routes).forEach(route=>{
+      if(!route||!route.hidden_by_fluid_header)return;
+      route.hidden=false;
+      delete route.hidden_by_fluid_header;
+    });
+  }
+
+  function ohtTankInletPoint(tankBox){
+    // The drawn OHT icon is shifted down inside its layout box (viewport
+    // safety inset). The inlet is the top-center of that icon, not the box edge
+    // that sits in the gap above the roof.
+    const x=Number(tankBox[0]), y=Number(tankBox[1]);
+    const w=Number(tankBox[2]), h=Number(tankBox[3]);
+    const [,ch]=canvasSize();
+    const marginY=Math.max(0.02, (18/550)*Number(ch||1));
+    const inletY=Math.min(y+Math.max(0, h)*0.42, Math.max(y, marginY));
+    return [x+w/2, inletY];
+  }
+
+  function classicSumpOhtHeaderPath(sumpBox, tankBox, headerY){
+    const sumpX=Number(sumpBox[0])+Number(sumpBox[2])/2;
+    const sumpTop=Number(sumpBox[1]);
+    const inlet=ohtTankInletPoint(tankBox);
+    const above=Math.min(sumpTop, inlet[1])-0.12;
+    const y=Math.max(0.08, Math.min(Number(headerY), above));
+    return [
+      [sumpX, sumpTop],
+      [sumpX, y],
+      [inlet[0], y],
+      inlet
+    ];
+  }
+
+  function forceUnifiedFluidHeader(){
+    // 1) Clear orphan header synthetics (phantoms).
+    // 2) Restore any previously suppressed Sump↔OHT edges.
+    // 3) For each active Sump↔OHT pair, keep that edge and repair its path to
+    //    the continuous rise→header→drop geometry. User-drawn custom points
+    //    are never overwritten. All other edges stay immutable.
+    const sumps=Object.values(components).filter(c=>c&&!c.hidden&&String(c.instance_id||"").startsWith("sump_")&&Array.isArray(c.box));
+    const ohts=Object.values(components).filter(c=>c&&!c.hidden&&String(c.instance_id||"").startsWith("oht_")&&Array.isArray(c.box));
+    const liveOhtIds=new Set(ohts.map(c=>String(c.instance_id||"")));
+    const liveSumpIds=new Set(sumps.map(c=>String(c.instance_id||"")));
+    purgeSyntheticFluidHeaderRoutes();
+    restoreHeaderSuppressedSumpOhtRoutes();
+    if(!sumps.length||!ohts.length){
+      rebuildRouteConnectionIndex();
+      return;
+    }
+    const activePairs=[];
+    const rememberPair=(sumpId,ohtId)=>{
+      if(!sumpId||!ohtId||connectionPairIsDeleted(sumpId,ohtId))return;
+      if(!liveSumpIds.has(sumpId)||!liveOhtIds.has(ohtId))return;
+      activePairs.push({sumpId,ohtId});
+    };
+    Object.values(routes).forEach(route=>{
+      if(!route||route.hidden)return;
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      const edgeId=String(route.edge_id||"");
+      if(
+        edgeId.startsWith("fluid_header_")||
+        edgeId.startsWith("fluid_oht_inline_dock__")||
+        edgeId.startsWith("fluid_bore_sump__")
+      )return;
+      if(
+        (source.startsWith("sump_")&&target.startsWith("oht_"))||
+        (source.startsWith("oht_")&&target.startsWith("sump_"))
+      ){
+        rememberPair(
+          source.startsWith("sump_")?source:target,
+          source.startsWith("oht_")?source:target
+        );
+      }
+    });
+    if(!activePairs.length){
+      rebuildRouteConnectionIndex();
+      return;
+    }
+    const unique=new Map();
+    activePairs.forEach(pair=>{
+      unique.set(`${pair.sumpId}|${pair.ohtId}`,pair);
+    });
+    const pairs=[...unique.values()];
+    let headerY=sharedWaterHeaderY();
+    if(headerY==null){
+      rebuildRouteConnectionIndex();
+      return;
+    }
+    const expandedHeader=Number(window.__ohtInlineDropHeaderY);
+    if(Number.isFinite(expandedHeader)){
+      headerY=Math.min(Number(headerY),Math.max(0.12,expandedHeader));
+    }
+    const minSpan=0.08;
+    pairs.forEach(({sumpId,ohtId})=>{
+      const sump=components[sumpId];
+      const tank=components[ohtId];
+      if(!sump||!tank||!Array.isArray(sump.box)||!Array.isArray(tank.box))return;
+      const path=classicSumpOhtHeaderPath(sump.box, tank.box, headerY);
+      if(!path||path.length<4)return;
+      const spanHeader=Math.abs(path[1][1]-path[0][1]);
+      const spanDrop=Math.abs(path[3][1]-path[2][1]);
+      const spanTrunk=Math.abs(path[2][0]-path[1][0]);
+      if(spanHeader+spanDrop+spanTrunk<minSpan)return;
+      // Update the existing Sump↔OHT edge in place — never hide it, never
+      // replace it with fragmented trunk/feeder/drop synthetics.
+      Object.values(routes).forEach(route=>{
+        if(!route)return;
+        const source=String(route.source||"");
+        const target=String(route.target||"");
+        const edgeId=String(route.edge_id||"");
+        if(
+          edgeId.startsWith("fluid_header_")||
+          edgeId.startsWith("fluid_bore_sump__")
+        )return;
+        const isPair=(
+          (source===sumpId&&target===ohtId)||
+          (source===ohtId&&target===sumpId)
+        );
+        if(!isPair)return;
+        // Preserve user-drawn / freeze-at-save coordinates.
+        // Note: payload marks all water edges stored_geometry; only custom /
+        // manual_drag means the polyline itself must stay verbatim.
+        if(
+          route.custom||
+          route.manual_drag||
+          String(route.mode||"")==="manual_draw"||
+          String(route.mode||"")==="manual_drag"
+        ){
+          route.hidden=false;
+          delete route.hidden_by_fluid_header;
+          route.dotted=false;
+          route.color="#123DBD";
+          return;
+        }
+        route.points=clonePoints(path);
+        route.original_points=clonePoints(path);
+        route.hidden=false;
+        delete route.hidden_by_fluid_header;
+        route.dotted=false;
+        route.color="#123DBD";
+        route.sketch_lock=true;
+        route.source=sumpId;
+        route.target=ohtId;
+      });
+    });
+    rebuildRouteConnectionIndex();
+  }
+
+  function isBoreSumpPair(sourceId,targetId){
+    const source=String(sourceId||"");
+    const target=String(targetId||"");
+    const sourceKind=componentWaterKind(components[source]||{component:"",title:""});
+    const targetKind=componentWaterKind(components[target]||{component:"",title:""});
+    if(sourceKind==="bore"&&targetKind==="sump")return {boreId:source,sumpId:target};
+    if(sourceKind==="sump"&&targetKind==="bore")return {boreId:target,sumpId:source};
+    const byPrefix=(
+      ((source.startsWith("bore_")||source.startsWith("well_"))&&target.startsWith("sump_"))||
+      ((target.startsWith("bore_")||target.startsWith("well_"))&&source.startsWith("sump_"))
+    );
+    if(!byPrefix)return null;
+    return {
+      boreId:(source.startsWith("bore_")||source.startsWith("well_"))?source:target,
+      sumpId:source.startsWith("sump_")?source:target
+    };
+  }
+
+  function forceBoreSumpReturn(){
+    const pairs=new Map();
+    Object.values(routes).forEach(route=>{
+      if(!route||route.hidden)return;
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      const edgeId=String(route.edge_id||"");
+      const pair=edgeId.startsWith("fluid_bore_sump__")
+        ?isBoreSumpPair(source,target)||(
+          (()=>{
+            const parts=edgeId.split("__");
+            return parts.length>=3?isBoreSumpPair(parts[1],parts[2]):null;
+          })()
+        )
+        :isBoreSumpPair(source,target);
+      if(!pair)return;
+      if(connectionPairIsDeleted(pair.boreId,pair.sumpId)){
+        route.hidden=true;
+        return;
+      }
+      pairs.set(`${pair.boreId}|${pair.sumpId}`,{
+        ...pair,
+        keepEdgeId:edgeId.startsWith("fluid_bore_sump__")?"":edgeId
+      });
+    });
+    // Replace only prior fluid_bore_sump__ synthetics. User/catalog bore↔sump
+    // edges (manual__*, edge__*, pair__*) stay in the map and are never deleted.
+    Object.keys(routes).forEach(edgeId=>{
+      if(String(edgeId||"").startsWith("fluid_bore_sump__"))delete routes[edgeId];
+    });
+    pairs.forEach(({boreId,sumpId,keepEdgeId})=>{
+      const loop=waterLoopForComponents(boreId,sumpId);
+      if(!loop)return;
+      if(keepEdgeId&&routes[keepEdgeId]){
+        const existing=routes[keepEdgeId];
+        // Freeze-at-save / manual bore↔sump polylines must not be rewritten on
+        // Saved reopen or remount (was overwriting sealed X/Y-aligned routes).
+        // Do not key only on stored_geometry — payload sets that for all water.
+        if(
+          existing&&
+          (
+            existing.custom||
+            existing.manual_drag||
+            String(existing.mode||"")==="manual_draw"||
+            String(existing.mode||"")==="manual_drag"
+          )
+        ){
+          existing.hidden=false;
+          existing.dotted=false;
+          existing.color="#123DBD";
+          return;
+        }
+        // Additive geometry update in place — do not delete/recreate the edge.
+        routes[keepEdgeId]={
+          ...existing,
+          points:clonePoints(loop),
+          original_points:clonePoints(loop),
+          color:"#123DBD",
+          dotted:false,
+          hidden:false,
+          sketch_lock:true,
+          fluid_bore_sump:true,
+          fluid_header:false
+        };
+        return;
+      }
+      const edgeId=`fluid_bore_sump__${boreId}__${sumpId}`;
+      routes[edgeId]={
+        edge_id:edgeId,
+        id:edgeId,
+        source:boreId,
+        target:sumpId,
+        sourceHandle:`${boreId}:fluid`,
+        targetHandle:`${sumpId}:fluid`,
+        source_handle:`${boreId}:fluid`,
+        target_handle:`${sumpId}:fluid`,
+        points:clonePoints(loop),
+        original_points:clonePoints(loop),
+        color:"#123DBD",
+        dotted:false,
+        hidden:false,
+        stored_geometry:true,
+        manual_drag:false,
+        sketch_lock:true,
+        fluid_bore_sump:true,
+        fluid_header:false,
+        direction:"source_to_target",
+        original_direction:"source_to_target"
+      };
+    });
+    rebuildRouteConnectionIndex();
+  }
+
+  function purgeUnsolicitedDottedRoutes(){
+    Object.keys(routes).forEach(edgeId=>{
+      const route=routes[edgeId];
+      if(!route)return;
+      if(routePairIsWater(route)||String(edgeId).startsWith("fluid_header_")||String(edgeId).startsWith("fluid_bore_sump__")){
+        route.dotted=false;
+        route.color="#123DBD";
+        return;
+      }
+      if(route.manual_drag||route.custom||String(edgeId).startsWith("manual__"))return;
+      // Keep every non-hidden route Python delivered for this worksheet (Valve,
+      // Flowmeter, control, and explicit sensor lines). Only inventable OHT/TX
+      // stubs that never came from the server are removed.
+      if(Array.isArray(argsState.routes)){
+        const fromServer=argsState.routes.some(item=>
+          item&&String(item.edge_id||"")===String(edgeId)&&!item.hidden
+        );
+        if(fromServer)return;
+      }
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      const sourceName=String(components[source]?.component||"");
+      const targetName=String(components[target]?.component||"");
+      const isUnsolicitedSensorStub=(
+        String(edgeId).startsWith("internal_sensor_tx__")||
+        (source.startsWith("oht_")&&target.startsWith("tx_"))||
+        (source.startsWith("tx_")&&target.startsWith("oht_"))||
+        (sourceName==="OHT Tank"&&targetName==="Transmitter")||
+        (targetName==="OHT Tank"&&sourceName==="Transmitter")||
+        (
+          !route.sensor_transmitter&&
+          (
+            (source.startsWith("lls_")&&target.startsWith("tx_"))||
+            (source.startsWith("tx_")&&target.startsWith("lls_"))||
+            (sourceName==="Linear Level Sensor (LLS)"&&targetName==="Transmitter")||
+            (targetName==="Linear Level Sensor (LLS)"&&sourceName==="Transmitter")
+          )
+        )
+      );
+      if(!isUnsolicitedSensorStub)return;
+      delete routes[edgeId];
+    });
+    rebuildRouteConnectionIndex();
+  }
+
+  function anchorRouteEnds(route){
+    if(!route||!Array.isArray(route.points)||route.points.length<2)return;
+    const sourceBox=components[String(route.source||"")]?.box;
+    const targetBox=components[String(route.target||"")]?.box;
+    if(Array.isArray(sourceBox)&&sourceBox.length===4&&!pointOnBoxEdge(route.points[0], sourceBox)){
+      const toward=route.points[1]||route.points[0];
+      route.points=draftAttachEndpoint(route.points, true, boxPort(sourceBox, toward));
+    }
+    const targetName=String(components[String(route.target||"")]?.component||"");
+    const targetTitle=String(components[String(route.target||"")]?.title||"");
+    const targetIsOht=targetName==="OHT Tank"||targetTitle.startsWith("OHT")||String(route.target||"").startsWith("oht_");
+    if(targetIsOht&&Array.isArray(targetBox)&&targetBox.length===4){
+      route.points=draftAttachEndpoint(route.points, false, ohtTankInletPoint(targetBox));
+    }else if(Array.isArray(targetBox)&&targetBox.length===4&&!pointOnBoxEdge(route.points[route.points.length-1], targetBox)){
+      const toward=route.points[route.points.length-2]||route.points[route.points.length-1];
+      route.points=draftAttachEndpoint(route.points, false, boxPort(targetBox, toward));
+    }
+  }
+
+  function bindLoadedConnectionGeometry(){
+    Object.values(routes).forEach(route=>{
+      if(!route||route.hidden)return;
+      const edgeId=String(route.edge_id||"");
+      if(edgeId.startsWith("fluid_header_")){
+        route.dotted=false;
+        route.color="#123DBD";
+        route.sketch_lock=true;
+        anchorRouteEnds(route);
+        return;
+      }
+      const sourceId=String(route.source||"");
+      const targetId=String(route.target||"");
+      const boreSump=edgeId.startsWith("fluid_bore_sump__")
+        ? (isBoreSumpPair(sourceId,targetId)||null)
+        : isBoreSumpPair(sourceId,targetId);
+      if(boreSump||edgeId.startsWith("fluid_bore_sump__")){
+        const boreId=boreSump?boreSump.boreId:sourceId;
+        const sumpId=boreSump?boreSump.sumpId:targetId;
+        const loop=waterLoopForComponents(boreId,sumpId);
+        if(loop){
+          route.points=clonePoints(loop);
+          route.original_points=clonePoints(loop);
+          route.source=boreId;
+          route.target=sumpId;
+        }
+        route.dotted=false;
+        route.color="#123DBD";
+        route.sketch_lock=true;
+        route.fluid_bore_sump=true;
+        route.fluid_header=false;
+        anchorRouteEnds(route);
+        return;
+      }
+      if(
+        (sourceId.startsWith("sump_")&&targetId.startsWith("oht_"))||
+        (sourceId.startsWith("oht_")&&targetId.startsWith("sump_"))
+      ){
+        // Keep the real edge visible. Repair auto geometry to the classic
+        // rise→header→drop path; never hide it for phantom cleanup.
+        if(route.hidden_by_fluid_header){
+          route.hidden=false;
+          delete route.hidden_by_fluid_header;
+        }
+        route.dotted=false;
+        route.color="#123DBD";
+        route.sketch_lock=true;
+        if(
+          route.custom||
+          route.manual_drag||
+          String(route.mode||"")==="manual_draw"
+        ){
+          anchorRouteEnds(route);
+          return;
+        }
+        const sumpId=sourceId.startsWith("sump_")?sourceId:targetId;
+        const ohtId=sourceId.startsWith("oht_")?sourceId:targetId;
+        const sump=components[sumpId];
+        const tank=components[ohtId];
+        let headerY=sharedWaterHeaderY();
+        if(sump&&tank&&Array.isArray(sump.box)&&Array.isArray(tank.box)&&headerY!=null){
+          const path=classicSumpOhtHeaderPath(sump.box, tank.box, headerY);
+          if(path&&path.length>=4){
+            route.points=clonePoints(path);
+            route.original_points=clonePoints(path);
+            route.source=sumpId;
+            route.target=ohtId;
+          }
+        }
+        anchorRouteEnds(route);
+        return;
+      }
+      if(!Array.isArray(route.points)||route.points.length<2)return;
+      // Only re-anchor routes Python already marked as explicit sensor↔transmitter.
+      // Never invent dotted stubs from tank/transmitter geometry.
+      if(route.sensor_transmitter){
+        const sensorPin=nestedSensorPinForTransmitterRoute(route);
+        if(sensorPin){
+          route.points=draftAttachEndpoint(route.points, sensorPin.isSource, sensorPin.point);
+          route.original_points=clonePoints(route.points);
+          route.dotted=true;
+          route.color="#000000";
+          return;
+        }
+      }
+      anchorRouteEnds(route);
+      route.original_points=clonePoints(route.points);
+    });
+  }
+
   function restoreMovementDraft(){
     const key=movementDraftStorageKey();
     if(!key)return;
@@ -207,9 +886,23 @@
 
     function savedRouteFor(route){
       const byId=savedRoutes.get(String(route.edge_id||""));
-      if(byId)return byId;
       const source=String(route.source||"");
       const target=String(route.target||"");
+      const sourceName=String(components[source]?.component||"");
+      const targetName=String(components[target]?.component||"");
+      const names=new Set([sourceName,targetName]);
+      if(names.has("Transmitter")&&names.has("Linear Level Sensor (LLS)")){
+        const manual=savedRouteList.find(item=>{
+          if(!item||!item.manual_drag)return false;
+          const itemSource=String(item.source||"");
+          const itemTarget=String(item.target||"");
+          return String(item.edge_id||"")===String(route.edge_id||"")||
+            (itemSource===source&&itemTarget===target)||
+            (itemSource===target&&itemTarget===source);
+        });
+        if(manual)return manual;
+      }
+      if(byId)return byId;
       if(!source||!target)return null;
       return savedRouteList.find(item=>String(item.source||"")===source&&String(item.target||"")===target)||null;
     }
@@ -243,46 +936,73 @@
 
     // A new connection adds a route. Keep every component and line the user
     // already placed, and leave only the new route on its generated path.
-    Object.values(components).forEach(c=>{
-      const s=savedComponents.get(String(c.instance_id||""));
-      if(s&&Array.isArray(s.box)&&s.box.length===4)c.box=cloneBox(s.box);
-    });
+    // Valve/FM must restore too — skipping them made the first drop snap back
+    // when Streamlit remounted before server overrides arrived.
+      Object.values(components).forEach(c=>{
+      if(isEmbeddedOhtSensor(c))return;
+        const s=savedComponents.get(String(c.instance_id||""));
+        if(!s)return;
+        if(Array.isArray(s.box)&&s.box.length===4){
+          c.box=cloneBox(s.box);
+          if(s.user_dragged)c.__user_dragged=true;
+        }
+        // Prefer the locally saved Acronym Box / Icon choice over a stale
+        // payload default that can appear after unrelated component deletes.
+        const savedMode=String(s.display_mode||"").trim().toLowerCase();
+        if(savedMode==="acronyms"||savedMode==="acronym"||savedMode==="letters"){
+          c.display_mode="acronyms";
+        }else if(savedMode==="icons"||savedMode==="icon"){
+          c.display_mode="icons";
+        }
+      });
     Object.values(routes).forEach(r=>{
+      if(r.stored_geometry)return;
       const s=savedRouteFor(r);
       if(!s)return;
       if(s.manual_drag)r.manual_drag=true;
-      if(Array.isArray(s.points)&&s.points.length>=2)r.points=clonePoints(s.points);
+      if(Array.isArray(s.points)&&s.points.length>=2){
+        r.points=clonePoints(s.points);
+        r.historical_points=true;
+      }
+    });
+    savedRouteList.forEach(item=>{
+      const edgeId=String(item&&item.edge_id||"");
+      if(!edgeId.startsWith("internal_sensor_tx__")||routes[edgeId])return;
+      // Do not invent sensor/transmitter stub lines from an old browser draft.
+      // Only an explicit server-provided or Manual Draw route may create them.
+      return;
     });
 
     // Re-anchor only automatic terminals. A dropped line keeps its saved points.
-    Object.values(routes).forEach(r=>{
-      if(!Array.isArray(r.points)||r.points.length<2)return;
-      if(r.manual_drag)return;
-      const edgeId=String(r.edge_id||"");
-      const sourceId=String(r.source||"");
-      const targetId=String(r.target||"");
-      const sourceBox=components[sourceId]?.box;
-      const targetBox=components[targetId]?.box;
+      Object.values(routes).forEach(r=>{
+        if(!Array.isArray(r.points)||r.points.length<2)return;
+      if(r.manual_drag||r.stored_geometry||r.historical_points)return;
+        const edgeId=String(r.edge_id||"");
+        const sourceId=String(r.source||"");
+        const targetId=String(r.target||"");
+        const sourceBox=components[sourceId]?.box;
+        const targetBox=components[targetId]?.box;
       const wasSaved=!!savedRouteFor(r);
-      const generatedRefs=generatedPortRefs.get(edgeId)||{};
+        const generatedRefs=generatedPortRefs.get(edgeId)||{};
 
       if(Array.isArray(sourceBox)&&sourceBox.length===4&&!dottedTransmitterUsesInternalTank(r,true)){
-        const sourceRef=wasSaved
-          ?draftPortReference(sourceBox,r.points[0])
-          :generatedRefs.source;
-        const sourcePort=draftResolvePortReference(sourceBox,sourceRef);
-        if(sourcePort)r.points=draftAttachEndpoint(r.points,true,sourcePort);
-      }
+          const sourceRef=wasSaved
+            ?draftPortReference(sourceBox,r.points[0])
+            :generatedRefs.source;
+          const sourcePort=draftResolvePortReference(sourceBox,sourceRef);
+          if(sourcePort)r.points=draftAttachEndpoint(r.points,true,sourcePort);
+        }
 
       if(Array.isArray(targetBox)&&targetBox.length===4&&!dottedTransmitterUsesInternalTank(r,false)){
-        const last=r.points.length-1;
-        const targetRef=wasSaved
-          ?draftPortReference(targetBox,r.points[last])
-          :generatedRefs.target;
-        const targetPort=draftResolvePortReference(targetBox,targetRef);
-        if(targetPort)r.points=draftAttachEndpoint(r.points,false,targetPort);
-      }
-    });
+          const last=r.points.length-1;
+          const targetRef=wasSaved
+            ?draftPortReference(targetBox,r.points[last])
+            :generatedRefs.target;
+          const targetPort=draftResolvePortReference(targetBox,targetRef);
+          if(targetPort)r.points=draftAttachEndpoint(r.points,false,targetPort);
+        }
+      });
+    bindLoadedConnectionGeometry();
   }
 
   function isInlinePipeSymbol(component){
@@ -368,7 +1088,10 @@
       component.box=[cx-targetW/2,cy-targetH/2,targetW,targetH];
     });
     Object.values(routes).forEach(route=>{
-      if(!route||route.hidden||route.manual_drag||route.dotted)return;
+      if(!route||route.hidden||route.manual_drag||route.stored_geometry||route.historical_points)return;
+      // Seat process lines through valve/flowmeter centers even when the pair
+      // was temporarily marked dotted before water classification.
+      if(route.dotted&&!routePairIsWater(route))return;
       const source=components[String(route.source||"")];
       const target=components[String(route.target||"")];
       if(source&&isInlinePipeSymbol(source))route.points=pullEndpointThroughSymbol(route.points,true,source.box);
@@ -525,7 +1248,8 @@
         "border:2px solid #000",
         "border-radius:8px",
         "box-shadow:none",
-        "overflow:auto",
+        // No internal scrollbar when the note is resized smaller.
+        "overflow:hidden",
         "resize:none",
         "background:transparent",
         "cursor:grab",
@@ -566,7 +1290,7 @@
       field.setAttribute("contenteditable","true");
       field.setAttribute("role","textbox");
       field.setAttribute("aria-label","Annotation note");
-      field.style.cssText=`flex:1 1 auto;width:100%;min-height:48px;margin:0;border:0;outline:none;resize:none;background:transparent;color:${ink};font:13px/1.35 sans-serif;padding:6px 8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;overflow:auto;user-select:text;cursor:text;touch-action:none;`;
+      field.style.cssText=`flex:1 1 auto;width:100%;min-height:0;margin:0;border:0;outline:none;resize:none;background:transparent;color:${ink};font:13px/1.35 sans-serif;padding:6px 8px;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;overflow:hidden;user-select:text;cursor:text;touch-action:none;`;
       const initialHtml=sanitizeAnnotationHtml(note.text||"");
       if(initialHtml && String(initialHtml).replace(/<[^>]+>/g,"").trim())field.innerHTML=initialHtml;
       const readField=()=>sanitizeAnnotationHtml(field.innerHTML);
@@ -612,12 +1336,12 @@
       const bindTypingColor=element=>{
         element.addEventListener("beforeinput",event=>{
           if((event.inputType!=="insertText"&&event.inputType!=="insertCompositionText")||!event.data)return;
-          const colorName=String(argsState.annotation_format_color||note.color||"Black");
-          const hex=ANNOTATION_COLORS[colorName]||ink;
-          if(ANNOTATION_COLORS[colorName]){
-            note.color=colorName;
-            card.dataset.annotationColor=colorName;
-          }
+          // Color picker next to Add Annotation = letter/text color for newly
+          // typed characters only. Never recolor the whole Annotation Box.
+          const pickerName=String(argsState.annotation_format_color||"");
+          const hex=ANNOTATION_COLORS[pickerName]
+            || annotationColorValue(element.dataset.pendingInk)
+            || ANNOTATION_COLORS.Black;
           event.preventDefault();
           const safe=String(event.data).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
           document.execCommand("insertHTML",false,`<span style="color:${hex}">${safe}</span>`);
@@ -819,7 +1543,6 @@
       try{sessionStorage.setItem("rts:annotation-format-applied",token);}catch(_){}
       let saved=null;
       try{saved=JSON.parse(sessionStorage.getItem("rts:annotation-format-target")||"null");}catch(_){saved=null;}
-      const colorName=String(argsState.annotation_format_color||"Black");
       let card=null;
       if(saved&&saved.id!=null){
         card=layer.querySelector(`[data-annotation-id="${String(saved.id).replace(/"/g,"")}"]`);
@@ -830,26 +1553,26 @@
       }
       if(!card||!card._annotationNote)return;
       const note=card._annotationNote;
-      note.color=colorName;
-      card.dataset.annotationColor=colorName;
-      card.style.color=hex;
+      // Text-color only: remember ink for the next characters / selection.
+      // Do not recolor the Annotation Box or any existing unselected text.
       card.querySelectorAll("[data-annotation-title],[data-annotation-field]").forEach(element=>{
-        element.style.color=hex;
         element.dataset.pendingInk=hex;
       });
       if(saved&&Number(saved.end)>Number(saved.start)){
         const element=card.querySelector(saved.part==="title"?"[data-annotation-title]":"[data-annotation-field]");
-        if(element)paintFormatRange(element,Number(saved.start)||0,Number(saved.end)||0,hex);
+        if(element){
+          paintFormatRange(element,Number(saved.start)||0,Number(saved.end)||0,hex);
+          note.title=card._readTitle();
+          note.text=card._readField();
+          emit("annotation_update",{action:"text",id:note.id,annotation:payload(note,note.text)});
+        }
       }
-      note.title=card._readTitle();
-      note.text=card._readField();
-      emit("annotation_update",{action:"text",id:note.id,annotation:payload(note,note.text)});
     };
     applyAnnotationFormatColor();
   }
 
   function snapshot(){return {routes:Object.values(routes).map(r=>({...r,points:clonePoints(r.points),original_points:clonePoints(r.original_points||r.points)})),components:Object.values(components).map(c=>({...c,box:cloneBox(c.box)}))};}
-  function applySnapshot(state){routes={};components={};for(const r of (state?.routes||[])){const id=String(r.edge_id||"");if(id)routes[id]={...r,edge_id:id,points:clonePoints(r.points),original_points:clonePoints(r.original_points||r.points),hidden:!!r.hidden};}for(const c of (state?.components||[])){const id=String(c.instance_id||"");if(id)components[id]={...c,instance_id:id,box:cloneBox(c.box),hidden:!!c.hidden};}rebuildRouteConnectionIndex();selectedEdge=null;selectedComponents.clear();renderOverlay();}
+  function applySnapshot(state){routes={};components={};for(const r of (state?.routes||[])){const id=String(r.edge_id||r.id||"");if(!id)continue;const source=String(r.source||"");const target=String(r.target||"");const sourceHandle=String(r.sourceHandle||r.source_handle||(source?`${source}:auto`:""));const targetHandle=String(r.targetHandle||r.target_handle||(target?`${target}:auto`:""));routes[id]={...r,edge_id:id,id,source,target,sourceHandle,targetHandle,source_handle:sourceHandle,target_handle:targetHandle,points:clonePoints(r.points),original_points:clonePoints(r.original_points||r.points),hidden:!!r.hidden};}for(const c of (state?.components||[])){const id=String(c.instance_id||"");if(id)components[id]={...c,instance_id:id,box:cloneBox(c.box),hidden:!!c.hidden};}rebuildRouteConnectionIndex();selectedEdge=null;selectedComponents.clear();renderOverlay();}
   function checkpoint(){const s=snapshot();history=history.slice(0,historyIndex+1);history.push(JSON.parse(JSON.stringify(s)));if(history.length>100)history=history.slice(-100);historyIndex=history.length-1;dirty=true;}
   function undoLocal(){if(historyIndex<=0)return;historyIndex--;applySnapshot(history[historyIndex]);dirty=historyIndex>0;}
   function redoLocal(){if(historyIndex>=history.length-1)return;historyIndex++;applySnapshot(history[historyIndex]);dirty=true;}
@@ -1193,21 +1916,76 @@
     )||null;
   }
 
+  function sensorDrawnInsideTank(tankId){
+    const flagged=internalSensorForTank(tankId);
+    if(flagged)return flagged;
+    const embeds=Array.isArray(argsState.oht_sensor_embeds)?argsState.oht_sensor_embeds:[];
+    const match=embeds.find(item=>String(item&&item.tank_id||"")===String(tankId||""));
+    if(match&&components[String(match.sensor_id||"")])return components[String(match.sensor_id||"")];
+    const tank=components[String(tankId||"")];
+    if(!tank||!Array.isArray(tank.box)||tank.box.length<4)return null;
+    const [tx,ty,tw,th]=tank.box.map(Number);
+    return Object.values(components).find(component=>{
+      if(!component||component.hidden)return false;
+      if(String(component.component||"")!=="Linear Level Sensor (LLS)")return false;
+      if(!Array.isArray(component.box)||component.box.length<4)return false;
+      const [x,y,w,h]=component.box.map(Number);
+      const cx=x+w/2, cy=y+h/2;
+      return cx>=tx&&cx<=tx+tw&&cy>=ty&&cy<=ty+th;
+    })||null;
+  }
+
+  function nestedSensorPinForTransmitterRoute(route){
+    if(!route)return null;
+    const sourceId=String(route.source||"");
+    const targetId=String(route.target||"");
+    const sourceName=String(components[sourceId]?.component||"");
+    const targetName=String(components[targetId]?.component||"");
+    let tankId="";
+    let sensorId="";
+    let tankIsSource=false;
+    if(sourceName==="OHT Tank"&&targetName==="Transmitter"){
+      tankId=sourceId;
+      tankIsSource=true;
+    }else if(targetName==="OHT Tank"&&sourceName==="Transmitter"){
+      tankId=targetId;
+    }else if(sourceName==="Linear Level Sensor (LLS)"&&targetName==="Transmitter"){
+      sensorId=sourceId;
+      tankIsSource=true;
+    }else if(targetName==="Linear Level Sensor (LLS)"&&sourceName==="Transmitter"){
+      sensorId=targetId;
+    }else if(route.sensor_transmitter){
+      sensorId=sourceName==="Transmitter"?targetId:sourceId;
+      tankIsSource=sensorId===sourceId;
+    }else{
+      return null;
+    }
+    let sensor=sensorId?components[sensorId]:sensorDrawnInsideTank(tankId);
+    if(!sensor&&tankId)sensor=sensorDrawnInsideTank(tankId);
+    if(!sensor)return null;
+    const tank=components[String(sensor.__oht_parent_id||tankId||"")];
+    const sensorBox=(sensor.__oht_attached_sensor||tank)&&Array.isArray(tank?.box)
+      ?ohtAttachedSensorBox(tank.box)
+      :sensor.box;
+    if(!Array.isArray(sensorBox)||sensorBox.length<4)return null;
+    return {isSource:tankIsSource||sensorId===sourceId, point:sensorAnchorPoint(sensorBox)};
+  }
+
   function forceDottedOhtTransmitterOntoSensor(){
-    for(const route of Object.values(routes)){
-      if(!route||route.hidden||!route.dotted||route.manual_drag)continue;
+    // Do not invent sensor stubs from tank↔transmitter lines.
+    Object.values(routes).forEach(route=>{
+      if(!route||route.hidden)return;
       const source=String(route.source||"");
       const target=String(route.target||"");
       const sourceName=String(components[source]?.component||"");
       const targetName=String(components[target]?.component||"");
-      let tankId="";
-      if(sourceName==="OHT Tank"&&targetName==="Transmitter")tankId=source;
-      else if(targetName==="OHT Tank"&&sourceName==="Transmitter")tankId=target;
-      else continue;
-      const sensor=internalSensorForTank(tankId);
-      if(!sensor)continue;
-      attachEndpointToPoint(route,source===tankId,sensorAnchorPoint(sensor.box));
-    }
+      if(
+        (sourceName==="OHT Tank"&&targetName==="Transmitter")||
+        (targetName==="OHT Tank"&&sourceName==="Transmitter")
+      ){
+        route.hidden=true;
+      }
+    });
   }
 
   function prepareOhtTankSensorAttachments(){
@@ -1216,6 +1994,14 @@
       delete component.__oht_attached_sensor;
       delete component.__oht_parent_id;
     });
+  }
+
+  function isEmbeddedOhtSensor(component){
+    if(!component)return false;
+    if(component.__oht_attached_sensor)return true;
+    const sensorId=String(component.instance_id||"");
+    const embeds=Array.isArray(argsState.oht_sensor_embeds)?argsState.oht_sensor_embeds:[];
+    return embeds.some(item=>String(item&&item.sensor_id||"")===sensorId);
   }
 
   function applyClickedOhtSensorEmbeds(){
@@ -1232,6 +2018,279 @@
       sensor.box=ohtAttachedSensorBox(tank.box);
       attachSensorLinksToLivePoint(sensorId,sensor.box);
     });
+    hideEmbeddedOhtSensorRoutes();
+    anchorInternalSensorTransmitterLines();
+  }
+
+  function routeLinksEmbeddedOhtSensor(route){
+    if(!route)return false;
+    const embeds=Array.isArray(argsState.oht_sensor_embeds)?argsState.oht_sensor_embeds:[];
+    const source=String(route.source||"");
+    const target=String(route.target||"");
+    const tokens=String(route.edge_id||"").split("__");
+    return embeds.some(item=>{
+      const tank=String(item&&item.tank_id||"");
+      const sensor=String(item&&item.sensor_id||"");
+      if(!tank||!sensor)return false;
+      if((source===tank&&target===sensor)||(source===sensor&&target===tank))return true;
+      return tokens.includes(tank)&&tokens.includes(sensor);
+    });
+  }
+
+  function hideEmbeddedOhtSensorRoutes(){
+    Object.values(routes).forEach(route=>{
+      if(routeLinksEmbeddedOhtSensor(route))route.hidden=true;
+    });
+  }
+
+  function sensorTransmitterElbow(sensorBox,transmitterBox){
+    const start=sensorAnchorPoint(sensorBox);
+    const [x,y,w,h]=transmitterBox.map(Number);
+    const center=[x+w/2,y+h/2];
+    const end=Math.abs(start[0]-center[0])>=Math.abs(start[1]-center[1])
+      ?[start[0]>=center[0]?x+w:x,center[1]]
+      :[center[0],start[1]>=center[1]?y+h:y];
+    if(Math.abs(end[0]-start[0])>=Math.abs(end[1]-start[1])){
+      const bend=(start[0]+end[0])/2;
+      return [start,[bend,start[1]],[bend,end[1]],end];
+    }
+    const bend=(start[1]+end[1])/2;
+    return [start,[start[0],bend],[end[0],bend],end];
+  }
+
+  function embeddedSensorTransmitterPairs(){
+    const embeds=Array.isArray(argsState.oht_sensor_embeds)?argsState.oht_sensor_embeds:[];
+    const transmitters=Object.values(components).filter(component=>
+      component&&!component.hidden&&String(component.component||"")==="Transmitter"&&Array.isArray(component.box)
+    );
+    const pairs=[];
+    embeds.forEach(item=>{
+      const tank=components[String(item&&item.tank_id||"")];
+      const sensor=components[String(item&&item.sensor_id||"")];
+      if(!tank||!sensor||tank.hidden||sensor.hidden||!Array.isArray(sensor.box))return;
+      transmitters.forEach(transmitter=>pairs.push({tank,sensor,transmitter}));
+    });
+    return pairs;
+  }
+
+  function routeJoins(route,firstId,secondId){
+    const ends=new Set([String(route&&route.source||""),String(route&&route.target||"")]);
+    return ends.has(String(firstId))&&ends.has(String(secondId));
+  }
+
+  function deletedConnectionPairSet(){
+    return new Set(
+      (Array.isArray(argsState.deleted_connection_pairs)?argsState.deleted_connection_pairs:[])
+        .map(value=>String(value||"").trim())
+        .filter(Boolean)
+    );
+  }
+
+  function sortedConnectionPairKey(sourceId,targetId){
+    const ends=[String(sourceId||"").trim(),String(targetId||"").trim()].filter(Boolean).sort();
+    if(ends.length!==2||ends[0]===ends[1])return "";
+    return `${ends[0]}|${ends[1]}`;
+  }
+
+  function connectionPairIsDeleted(sourceId,targetId){
+    const pair=sortedConnectionPairKey(sourceId,targetId);
+    return !!pair&&deletedConnectionPairSet().has(pair);
+  }
+
+  function stripRouteFromMovementDraft(edgeId,sourceId,targetId){
+    const key=movementDraftStorageKey();
+    if(!key)return;
+    try{
+      const saved=JSON.parse(sessionStorage.getItem(key)||"null");
+      if(!saved||typeof saved!=="object"||!Array.isArray(saved.routes))return;
+      const id=String(edgeId||"");
+      // Exact edge-id match only — never cascade-remove sibling routes by pair.
+      saved.routes=saved.routes.filter(item=>{
+        if(!item)return false;
+        const itemId=String(item.edge_id||item.id||"");
+        return !(id&&itemId===id);
+      });
+      saved.route_draft_version="orthogonal-candidate-v83";
+      sessionStorage.setItem(key,JSON.stringify(saved));
+    }catch(_){}
+  }
+
+  function emitConnectionDelete(edgeId,sourceId,targetId){
+    const id=String(edgeId||"");
+    const route=routes[id]||{};
+    emit("connection_delete",{
+      edge_id:id,
+      source:String(sourceId||route.source||""),
+      target:String(targetId||route.target||"")
+    });
+  }
+
+  function permanentlyRemoveRoute(edgeId){
+    // Strict deletion scoping: only the exact edge id is removed.
+    const id=String(edgeId||"");
+    const route=routes[id];
+    if(!route)return null;
+    const source=String(route.source||"");
+    const target=String(route.target||"");
+    delete routes[id];
+    stripRouteFromMovementDraft(id,source,target);
+    if(selectedEdge===id)selectedEdge=null;
+    rebuildRouteConnectionIndex();
+    return {edge_id:id,source,target};
+  }
+
+  function seedInternalSensorTransmitterLines(){
+    // Global guardrail: never invent sensor/transmitter dotted stubs on the client.
+  }
+
+  function anchorInternalSensorTransmitterLines(){
+    embeddedSensorTransmitterPairs().forEach(({tank,sensor,transmitter})=>{
+      const sensorId=String(sensor.instance_id||"");
+      const transmitterId=String(transmitter.instance_id||"");
+      const tankId=String(tank.instance_id||"");
+      Object.values(routes).forEach(route=>{
+        if(!route)return;
+        if(routeJoins(route,tankId,transmitterId)){
+          route.hidden=true;
+          return;
+        }
+        if(!routeJoins(route,sensorId,transmitterId))return;
+        if(!(route.sensor_transmitter||route.manual_drag)){
+          route.hidden=true;
+          return;
+        }
+        route.dotted=true;
+        route.color="#000000";
+        const pin=sensorAnchorPoint(sensor.box);
+        const sensorIsSource=String(route.source||"")!==transmitterId;
+        attachEndpointToPoint(route,sensorIsSource,pin);
+      });
+    });
+    rebuildRouteConnectionIndex();
+  }
+
+  function seatInlineDevicesOnOhtDrops(){
+    // User-triggered only: dock MV/FM onto an OHT drop after an explicit
+    // Valve/Flowmeter ↔ OHT connection exists (Connect panel or click pair).
+    const assignments=new Map();
+    // Server-authored dock tags survive fluid-header rebuilds that strip
+    // the temporary Valve/FM ↔ OHT edge objects from the route map.
+    Object.values(components).forEach(component=>{
+      if(!component||component.hidden)return;
+      const deviceId=String(component.instance_id||"");
+      const tankId=String(component.oht_drop_tank_id||"");
+      const role=hydraulicRoleOf(component);
+      if(!deviceId||!tankId.startsWith("oht_")||(role!=="fm"&&role!=="mv"))return;
+      if(connectionPairIsDeleted(deviceId,tankId))return;
+      assignments.set(deviceId,tankId);
+    });
+    Object.values(routes).forEach(route=>{
+      if(!route||route.hidden)return;
+      const source=String(route.source||"");
+      const target=String(route.target||"");
+      if(connectionPairIsDeleted(source,target))return;
+      const sourceComp=components[source];
+      const targetComp=components[target];
+      if(!sourceComp||!targetComp)return;
+      if(target.startsWith("oht_")&&(hydraulicRoleOf(sourceComp)==="mv"||hydraulicRoleOf(sourceComp)==="fm")){
+        assignments.set(source,target);
+        sourceComp.oht_drop_tank_id=target;
+      }else if(source.startsWith("oht_")&&(hydraulicRoleOf(targetComp)==="mv"||hydraulicRoleOf(targetComp)==="fm")){
+        assignments.set(target,source);
+        targetComp.oht_drop_tank_id=source;
+      }
+    });
+    // Preserve in-session docks when a later header rebuild removed route edges.
+    explicitOhtInlineAssignments.forEach((tankId,deviceId)=>{
+      if(assignments.has(deviceId))return;
+      if(!components[deviceId]||!components[tankId]||connectionPairIsDeleted(deviceId,tankId))return;
+      assignments.set(deviceId,tankId);
+      if(components[deviceId])components[deviceId].oht_drop_tank_id=tankId;
+    });
+    [...assignments.entries()].forEach(([deviceId,tankId])=>{
+      if(!components[deviceId]||!components[tankId]||connectionPairIsDeleted(deviceId,tankId)){
+        assignments.delete(deviceId);
+      }
+    });
+    explicitOhtInlineAssignments=assignments;
+    if(!assignments.size)return;
+
+    // Group every docked Valve and Flowmeter by tank, then apply one shared
+    // even-spacing / dynamic-drop layout to both component types.
+    const byTank=new Map();
+    assignments.forEach((tankId,deviceId)=>{
+      const device=components[deviceId];
+      const tank=components[tankId];
+      if(!device||!tank||!Array.isArray(device.box)||!Array.isArray(tank.box))return;
+      const role=hydraulicRoleOf(device);
+      if(role!=="fm"&&role!=="mv")return;
+      const list=byTank.get(tankId)||[];
+      const rawWidth=Math.max(0.01,Number(device.box[2]));
+      const rawHeight=Math.max(0.01,Number(device.box[3]));
+      const minimumScale=Math.max(0.42/rawWidth,0.32/rawHeight);
+      const maximumScale=Math.min(0.62/rawWidth,0.46/rawHeight);
+      let scale=Math.min(1,maximumScale);
+      if(minimumScale<=maximumScale)scale=Math.max(minimumScale,scale);
+      list.push({
+        deviceId,
+        role,
+        width:rawWidth*scale,
+        height:rawHeight*scale,
+        tank
+      });
+      byTank.set(tankId,list);
+    });
+    if(!byTank.size)return;
+
+    let headerY=sharedWaterHeaderY();
+    byTank.forEach(devices=>{
+      const tank=devices[0].tank;
+      const tankTop=Number(tank.box[1]);
+      const count=devices.length;
+      const maxH=Math.max(...devices.map(item=>item.height));
+      const pad=Math.max(0.10,maxH*0.45);
+      const gap=Math.max(0.08,maxH*0.28);
+      let needed=(2*pad)+devices.reduce((sum,item)=>sum+item.height,0);
+      if(count>1)needed+=gap*(count-1);
+      needed=Math.max(needed,0.34+0.22*count);
+      const neededHeader=Math.max(0.12,tankTop-needed);
+      if(headerY==null)headerY=neededHeader;
+      else headerY=Math.min(Number(headerY),neededHeader);
+    });
+    if(headerY==null)return;
+    window.__ohtInlineDropHeaderY=Number(headerY);
+
+    byTank.forEach((devices,tankId)=>{
+      devices.sort((a,b)=>{
+        const rank=role=>(role==="fm"?0:role==="mv"?1:9);
+        return rank(a.role)-rank(b.role)||a.deviceId.localeCompare(b.deviceId);
+      });
+      const tank=devices[0].tank;
+      const tankX=Number(tank.box[0])+Number(tank.box[2])/2;
+      const tankTop=Number(tank.box[1]);
+      const count=devices.length;
+      const maxHeight=Math.max(...devices.map(item=>item.height));
+      const pad=Math.max(0.10,maxHeight*0.45);
+      const gap=Math.max(0.08,maxHeight*0.28);
+      const stackHeight=devices.reduce((sum,item)=>sum+item.height,0)+gap*Math.max(0,count-1);
+      const freePad=Math.max(pad,(tankTop-Number(headerY)-stackHeight)/2);
+      let cursorY=Number(headerY)+freePad;
+      devices.forEach(item=>{
+        const centerY=cursorY+item.height/2;
+        const device=components[item.deviceId];
+        if(!device){cursorY+=item.height+gap;return;}
+        // A Valve/FM the user already dragged must keep that box across remounts.
+        // Reseating here was the first-drag snap-back for docked inline devices.
+        if(device.__user_dragged){
+          device.oht_drop_tank_id=tankId;
+          cursorY+=item.height+gap;
+          return;
+        }
+        device.box=[tankX-item.width/2,centerY-item.height/2,item.width,item.height];
+        device.oht_drop_tank_id=tankId;
+        cursorY+=item.height+gap;
+      });
+    });
   }
 
   function separateComponentsFromTanks(){
@@ -1244,7 +2303,9 @@
     let moved=false;
     Object.values(components).forEach(component=>{
       if(!component||component.hidden||isPrimaryCanvasComponent(component))return;
-      if(component.__oht_attached_sensor)return;
+      if(component.__oht_attached_sensor||isEmbeddedOhtSensor(component))return;
+      // Keep valves/flowmeters on the OHT drop; do not exile them mid-canvas.
+      if(isInlineProcessComponent(component)||isInlinePipeSymbol(component))return;
       if(!Array.isArray(component.box)||component.box.length!==4)return;
       const [x,y,w,h]=component.box.map(Number);
       if(!(w>0)||!(h>0))return;
@@ -1457,7 +2518,43 @@
       g.appendChild(v);
     }
   }
-  function drawComponent(g,svg,c){const [x,y,w,h]=c.box,img=svgEl("image",{x,y,width:w,height:h,href:`data:image/png;base64,${c.image_b64||""}`,class:"component-image",preserveAspectRatio:"none"});img.addEventListener("click",e=>{e.stopPropagation();selectComponent(c.instance_id,e.shiftKey||e.ctrlKey||e.metaKey);});img.addEventListener("contextmenu",e=>{e.preventDefault();e.stopPropagation();if(!selectedComponents.has(c.instance_id))selectComponent(c.instance_id,false);openContext(e.clientX,e.clientY,"component",c.instance_id);});img.addEventListener("pointerdown",e=>{if(e.button!==0)return;e.preventDefault();e.stopPropagation();if(!selectedComponents.has(c.instance_id))selectComponent(c.instance_id,e.shiftKey||e.ctrlKey||e.metaKey);const p=clientToCanvas(svg,e),ids=[...selectedComponents],boxes=Object.fromEntries(ids.map(id=>[id,cloneBox(components[id].box)])),routeBase=Object.fromEntries(Object.values(routes).map(r=>[r.edge_id,clonePoints(r.points)]));drag={kind:"components",ids,start:p,boxes,routeBase,pid:e.pointerId};try{svg.setPointerCapture(e.pointerId);}catch(_){}});g.appendChild(img);}
+  function drawComponent(g,svg,c){
+    const [x,y,w,h]=c.box;
+    const bindComponentPointer=(node)=>{
+      node.addEventListener("click",e=>{e.stopPropagation();selectComponent(c.instance_id,e.shiftKey||e.ctrlKey||e.metaKey);});
+      node.addEventListener("contextmenu",e=>{e.preventDefault();e.stopPropagation();if(!selectedComponents.has(c.instance_id))selectComponent(c.instance_id,false);openContext(e.clientX,e.clientY,"component",c.instance_id);});
+      node.addEventListener("pointerdown",e=>{if(e.button!==0)return;e.preventDefault();e.stopPropagation();if(!selectedComponents.has(c.instance_id))selectComponent(c.instance_id,e.shiftKey||e.ctrlKey||e.metaKey);const p=clientToCanvas(svg,e),ids=[...selectedComponents],boxes=Object.fromEntries(ids.map(id=>[id,cloneBox(components[id].box)])),routeBase=Object.fromEntries(Object.values(routes).map(r=>[r.edge_id,clonePoints(r.points)]));drag={kind:"components",ids,start:p,boxes,routeBase,pid:e.pointerId};try{svg.setPointerCapture(e.pointerId);}catch(_){}});
+    };
+    if(componentDisplayMode(c)==="acronyms"){
+      const plate=svgEl("g",{class:"component-acronym-svg"});
+      const rect=svgEl("rect",{x,y,width:w,height:h,fill:"#ffffff",stroke:"#0f172a","stroke-width":Math.max(0.012,Math.min(w,h)*0.06)});
+      const acronymText=componentAcronymText(c);
+      const svgFont=Math.max(
+        0.08,
+        Math.min(
+          Math.min(w,h)*0.52,
+          (w*0.86)/Math.max(1,acronymText.length*0.62)
+        )
+      );
+      const label=svgEl("text",{
+        x:x+w/2,y:y+h/2,
+        "text-anchor":"middle","dominant-baseline":"middle",
+        fill:"#0f172a",
+        "font-family":"Segoe UI, Arial, sans-serif",
+        "font-weight":"700",
+        "font-size":svgFont
+      });
+      label.textContent=acronymText;
+      plate.appendChild(rect);
+      plate.appendChild(label);
+      bindComponentPointer(plate);
+      g.appendChild(plate);
+      return;
+    }
+    const img=svgEl("image",{x,y,width:w,height:h,href:`data:image/png;base64,${c.image_b64||""}`,class:"component-image",preserveAspectRatio:"none"});
+    bindComponentPointer(img);
+    g.appendChild(img);
+  }
   function drawSelection(g,svg,c){const [x,y,w,h]=c.box;g.appendChild(svgEl("rect",{x,y,width:w,height:h,class:"component-selection"}));if(selectedComponents.size===1){const size=.13;for(const [name,cx,cy] of [["nw",x,y],["ne",x+w,y],["sw",x,y+h],["se",x+w,y+h]]){const hnd=svgEl("rect",{x:cx-size/2,y:cy-size/2,width:size,height:size,class:`resize-handle resize-${name}`});hnd.addEventListener("pointerdown",e=>{e.preventDefault();e.stopPropagation();drag={kind:"resize",id:c.instance_id,corner:name,start:clientToCanvas(svg,e),box:cloneBox(c.box),pid:e.pointerId};try{svg.setPointerCapture(e.pointerId);}catch(_){}});g.appendChild(hnd);}for(const side of ["left","right","top","bottom"]){const p=sidePort(c.box,side),ph=svgEl("circle",{cx:p[0],cy:p[1],r:.065,class:"port-handle"});ph.addEventListener("pointerdown",e=>{e.preventDefault();e.stopPropagation();drag={kind:"newConnection",source:c.instance_id,start:p,current:p,pid:e.pointerId};try{svg.setPointerCapture(e.pointerId);}catch(_){}renderOverlay();});g.appendChild(ph);}}}
   function moveSelected(p){const dx=snapPoint([p[0]-drag.start[0],p[1]-drag.start[1]])[0],dy=snapPoint([p[0]-drag.start[0],p[1]-drag.start[1]])[1];for(const id of drag.ids){const b=drag.boxes[id];components[id].box=[b[0]+dx,b[1]+dy,b[2],b[3]];}for(const [rid,pts] of Object.entries(drag.routeBase))routes[rid].points=clonePoints(pts);for(const id of drag.ids){for(const r of connectedRoutes(id)){if(r.source===id){r.points[0][0]+=dx;r.points[0][1]+=dy;if(r.points.length>2){r.points[1][0]+=dx;r.points[1][1]+=dy;}}if(r.target===id){const n=r.points.length;r.points[n-1][0]+=dx;r.points[n-1][1]+=dy;if(n>2){r.points[n-2][0]+=dx;r.points[n-2][1]+=dy;}}}}}
   function drawGrid(g){if(!snap)return;const [w,h]=canvasSize();for(let x=0;x<=w;x+=grid)g.appendChild(svgEl("line",{x1:x,y1:0,x2:x,y2:h,class:"grid-line"}));for(let y=0;y<=h;y+=grid)g.appendChild(svgEl("line",{x1:0,y1:y,x2:w,y2:y,class:"grid-line"}));}
@@ -1468,27 +2565,51 @@
   function zoomBy(factor){const [w,h]=canvasSize(),oldW=w/zoom,oldH=h/zoom,cx=panX+oldW/2,cy=panY+oldH/2;zoom=clamp(zoom*factor,.35,4);const nw=w/zoom,nh=h/zoom;panX=cx-nw/2;panY=cy-nh/2;updateView();}
   function align(kind){const ids=[...selectedComponents].filter(id=>components[id]&&!components[id].hidden);if(ids.length<2)return;const boxes=ids.map(id=>components[id].box);if(kind==="h"){const cy=boxes.reduce((s,b)=>s+b[1]+b[3]/2,0)/boxes.length;ids.forEach(id=>{const b=components[id].box,dy=cy-(b[1]+b[3]/2);b[1]+=dy;connectedRoutes(id).forEach(r=>{if(r.source===id){r.points[0][1]+=dy;if(r.points.length>2)r.points[1][1]+=dy;}if(r.target===id){const n=r.points.length;r.points[n-1][1]+=dy;if(n>2)r.points[n-2][1]+=dy;}});});}else{const cx=boxes.reduce((s,b)=>s+b[0]+b[2]/2,0)/boxes.length;ids.forEach(id=>{const b=components[id].box,dx=cx-(b[0]+b[2]/2);b[0]+=dx;connectedRoutes(id).forEach(r=>{if(r.source===id){r.points[0][0]+=dx;if(r.points.length>2)r.points[1][0]+=dx;}if(r.target===id){const n=r.points.length;r.points[n-1][0]+=dx;if(n>2)r.points[n-2][0]+=dx;}});});}checkpoint();renderOverlay();}
   function emitComponentBatch(ids){checkpoint();}
-  function openContext(x,y,type,id){closeContext();const menu=document.createElement("div");menu.className="context";menu.style.left=`${Math.min(x,window.innerWidth-170)}px`;menu.style.top=`${Math.min(y,window.innerHeight-180)}px`;const add=(label,fn,danger=false)=>{const b=document.createElement("button");b.type="button";b.textContent=label;if(danger)b.className="danger";b.addEventListener("click",()=>{fn();closeContext();});menu.appendChild(b);};if(type==="edge"){add("Reverse direction",()=>{const r=routes[id];r.direction=r.direction==="target_to_source"?"source_to_target":"target_to_source";checkpoint();renderOverlay();});add("Reset route",()=>{const r=routes[id];r.points=clonePoints(r.original_points||r.points);r.direction=r.original_direction||"source_to_target";r.hidden=false;checkpoint();renderOverlay();});add("Delete connection",()=>{const r=routes[id];if(!r)return;if(argsState.drag_only){r.hidden=true;selectedEdge=null;emit("connection_delete",{edge_id:id});}else{r.hidden=true;selectedEdge=null;checkpoint();renderOverlay();}},true);}else{add("Duplicate",()=>duplicateIds([...selectedComponents]));add("Copy",()=>{clipboard=[...selectedComponents];});add("Delete",()=>deleteSelection(),true);}document.body.appendChild(menu);contextMenu=menu;}
-  function openContext(x,y,type,id){closeContext();const menu=document.createElement("div");menu.className="context";menu.style.left=`${Math.min(x,window.innerWidth-170)}px`;menu.style.top=`${Math.min(y,window.innerHeight-180)}px`;const add=(label,fn,danger=false)=>{const b=document.createElement("button");b.type="button";b.textContent=label;if(danger)b.className="danger";b.addEventListener("click",()=>{fn();closeContext();});menu.appendChild(b);};if(type==="edge"){add("Reverse direction",()=>{const r=routes[id];r.direction=r.direction==="target_to_source"?"source_to_target":"target_to_source";checkpoint();renderOverlay();});add("Reset route",()=>{const r=routes[id];r.points=clonePoints(r.original_points||r.points);r.direction=r.original_direction||"source_to_target";r.hidden=false;checkpoint();renderOverlay();});add("Delete connection",()=>{const r=routes[id];if(!r)return;if(argsState.drag_only){if(dragOnlyRouteAction)dragOnlyRouteAction.remove(id);else r.hidden=true;emit("connection_delete",{edge_id:id});}else{r.hidden=true;selectedEdge=null;checkpoint();renderOverlay();}},true);}else{add("Duplicate",()=>duplicateIds([...selectedComponents]));add("Copy",()=>{clipboard=[...selectedComponents];});add("Delete",()=>deleteSelection(),true);}document.body.appendChild(menu);contextMenu=menu;}
+  function openContext(x,y,type,id){closeContext();const menu=document.createElement("div");menu.className="context";menu.style.left=`${Math.min(x,window.innerWidth-170)}px`;menu.style.top=`${Math.min(y,window.innerHeight-180)}px`;const add=(label,fn,danger=false)=>{const b=document.createElement("button");b.type="button";b.textContent=label;if(danger)b.className="danger";b.addEventListener("click",()=>{fn();closeContext();});menu.appendChild(b);};if(type==="edge"){add("Reverse direction",()=>{const r=routes[id];r.direction=r.direction==="target_to_source"?"source_to_target":"target_to_source";checkpoint();renderOverlay();});add("Reset route",()=>{const r=routes[id];r.points=clonePoints(r.original_points||r.points);r.direction=r.original_direction||"source_to_target";r.hidden=false;checkpoint();renderOverlay();});add("Delete connection",()=>{const r=routes[id];if(!r)return;if(argsState.drag_only){const source=String(r.source||"");const target=String(r.target||"");if(dragOnlyRouteAction)dragOnlyRouteAction.remove(id);else permanentlyRemoveRoute(id);emitConnectionDelete(id,source,target);}else{permanentlyRemoveRoute(id);checkpoint();renderOverlay();}},true);}else{
+      const selectedId=String(id||"");
+      const selectedComp=components[selectedId];
+      if(selectedComp&&componentAllowsAcronymDisplay(selectedComp)){
+        const acronyms=componentDisplayMode(selectedComp)==="acronyms";
+        add(acronyms?"Show graphic icon":"Show engineering acronym",()=>{
+          const next=acronyms?"icons":"acronyms";
+          selectedComp.display_mode=next;
+          emit("component_display_mode",{
+            instance_id:selectedId,
+            display_mode:next,
+            component:String(selectedComp.component||"")
+          });
+          renderOverlay();
+        });
+      }
+      add("Duplicate",()=>duplicateIds([...selectedComponents]));
+      add("Copy",()=>{clipboard=[...selectedComponents];});
+      add("Delete",()=>deleteSelection(),true);
+    }
+    document.body.appendChild(menu);contextMenu=menu;}
   function closeContext(){if(contextMenu){contextMenu.remove();contextMenu=null;}}
   function deleteSelection(){
     if(argsState.drag_only&&dragOnlyRouteAction&&dragOnlyRouteAction.selected){
       const edgeId=dragOnlyRouteAction.selected;
+      const route=routes[edgeId]||{};
+      const source=String(route.source||"");
+      const target=String(route.target||"");
       dragOnlyRouteAction.remove(edgeId);
-      emit("connection_delete",{edge_id:edgeId});
+      emitConnectionDelete(edgeId,source,target);
       return;
     }
     // Delete a selected connection by itself, exactly as before.
     if(selectedEdge){
       const edge=routes[selectedEdge];
       if(edge){
+        const source=String(edge.source||"");
+        const target=String(edge.target||"");
         if(argsState.drag_only&&dragOnlyRouteAction){
           dragOnlyRouteAction.remove(selectedEdge);
         }else{
-          edge.hidden=true;
+          permanentlyRemoveRoute(selectedEdge);
         }
         if(argsState.drag_only){
-          emit("connection_delete",{edge_id:selectedEdge});
+          emitConnectionDelete(selectedEdge,source,target);
         }
       }
       selectedEdge=null;
@@ -1528,7 +2649,7 @@
   }
   function copySelection(){clipboard=[...selectedComponents];}
   function pasteSelection(){if(clipboard.length)duplicateIds(clipboard);}
-  async function saveEditor(){const b=document.getElementById("saveEditorBtn");if(b){b.disabled=true;b.textContent="Saving...";}try{const image_b64=await composeEditedPng();emit("save_editor",{image_b64,routes:Object.values(routes).map(r=>({...r,points:clonePoints(r.points)})),components:Object.values(components).map(c=>({...c,box:cloneBox(c.box)})),canvas_width:canvasSize()[0],canvas_height:canvasSize()[1]});}catch(err){console.error(err);alert("Could not save the edited diagram. Please try again.");if(b){b.disabled=false;b.textContent="Save";}}}
+  async function saveEditor(){const b=document.getElementById("saveEditorBtn");if(b){b.disabled=true;b.textContent="Saving...";}try{const image_b64=await composeEditedPng();emit("save_editor",{image_b64,routes:Object.values(routes).map(r=>({...r,points:clonePoints(r.points)})),components:Object.values(components).map(c=>({...c,box:cloneBox(c.box)})),canvas_width:canvasSize()[0],canvas_height:canvasSize()[1],viewport:{zoom:Number(zoom)||1,pan_x:Number(panX)||0,pan_y:Number(panY)||0}});}catch(err){console.error(err);alert("Could not save the edited diagram. Please try again.");if(b){b.disabled=false;b.textContent="Save";}}}
   function loadImage(src){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(img);img.onerror=reject;img.src=src;});}
   async function composeEditedPng(){const [cw,ch]=canvasSize();const bg=await loadImage(`data:image/png;base64,${argsState.image_b64||""}`);const canvas=document.createElement("canvas");canvas.width=bg.naturalWidth||1600;canvas.height=bg.naturalHeight||900;const ctx=canvas.getContext("2d");ctx.drawImage(bg,0,0,canvas.width,canvas.height);const sx=canvas.width/cw,sy=canvas.height/ch;ctx.save();ctx.scale(sx,sy);for(const r of Object.values(routes)){if(r.hidden||!r.points?.length)continue;ctx.lineJoin="round";ctx.lineCap="round";ctx.strokeStyle="#fff";ctx.lineWidth=.030;ctx.setLineDash([]);drawCanvasPolyline(ctx,r.points);ctx.strokeStyle=r.dotted?"#000000":"#123DBD";ctx.lineWidth=.015;ctx.setLineDash(r.dotted?[.018,.095]:[]);drawCanvasPolyline(ctx,r.points);drawCanvasArrow(ctx,r);}ctx.restore();for(const c of Object.values(components)){if(c.hidden||!c.image_b64)continue;try{const img=await loadImage(`data:image/png;base64,${c.image_b64}`);const [x,y,w,h]=c.box;ctx.drawImage(img,x*sx,y*sy,w*sx,h*sy);}catch(_){}}return canvas.toDataURL("image/png").split(",")[1];}
   function drawCanvasPolyline(ctx,pts){ctx.beginPath();ctx.moveTo(pts[0][0],pts[0][1]);for(let i=1;i<pts.length;i++)ctx.lineTo(pts[i][0],pts[i][1]);ctx.stroke();}
@@ -1562,8 +2683,12 @@
         const tp=boundaryPoint(target.box,d.current);
         const pts=routeNewConnectionWithTypeScript(svg,d.source,target.instance_id,sp,tp);
         const rid=`manual_${eid()}`;
+        const sourceId=String(d.source||"");
+        const targetId=String(target.instance_id||"");
         routes[rid]={
-          edge_id:rid,label:"Manual connection",source:d.source,target:target.instance_id,
+          edge_id:rid,id:rid,label:"Manual connection",source:sourceId,target:targetId,
+          sourceHandle:`${sourceId}:auto`,targetHandle:`${targetId}:auto`,
+          source_handle:`${sourceId}:auto`,target_handle:`${targetId}:auto`,
           points:pts,original_points:clonePoints(pts),
           direction:"source_to_target",original_direction:"source_to_target",
           color:"#123DBD",dotted:false,hidden:false,custom:true
@@ -1731,6 +2856,10 @@
       window.removeEventListener(type,listener);
     }
     dragOnlyWindowListeners=[];
+    if(dragOnlyResizeObserver){
+      dragOnlyResizeObserver.disconnect();
+      dragOnlyResizeObserver=null;
+    }
 
     const addDragOnlyWindowListener=(type,listener)=>{
       window.addEventListener(type,listener);
@@ -1748,9 +2877,8 @@
     const [cw,ch]=canvasSize();
 
     // Worksheet fill fix only:
-    // In the normal Worksheet app.py passes fixed_screen_height=None.
-    // Use the existing iframe/Worksheet height instead of silently creating
-    // a separate 700px surface, which was pushing the rendered diagram down.
+    // Use the same standard height as the Worksheet container so the
+    // aspect-preserving diagram fit is stable after project restoration.
     const rawFixedHeight=Number(argsState.fixed_screen_height);
     const hasFixedHeight=Number.isFinite(rawFixedHeight)&&rawFixedHeight>0;
     const fixedScreenHeight=hasFixedHeight?Math.max(1,rawFixedHeight):0;
@@ -1766,9 +2894,30 @@
 
     const stage=document.createElement("div");
     stage.style.cssText=argsState.fit_screen
-      ? "position:absolute;inset:0;width:100%;height:100%;overflow:hidden;touch-action:none;user-select:none;"
+      ? "position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);overflow:hidden;touch-action:none;user-select:none;"
       : `position:relative;width:100%;aspect-ratio:${cw}/${ch};overflow:hidden;touch-action:none;user-select:none;`;
     root.appendChild(stage);
+    if(argsState.fit_screen){
+      const fitStageToViewport=()=>{
+        const bounds=root.getBoundingClientRect();
+        const logicalWidth=Math.max(1,Number(cw)||1);
+        const logicalHeight=Math.max(1,Number(ch)||1);
+        const scale=Math.min(
+          bounds.width/logicalWidth,
+          bounds.height/logicalHeight
+        );
+        if(!Number.isFinite(scale)||scale<=0)return;
+        stage.style.width=`${logicalWidth*scale}px`;
+        stage.style.height=`${logicalHeight*scale}px`;
+      };
+      fitStageToViewport();
+      addDragOnlyWindowListener("resize",fitStageToViewport);
+      if(typeof ResizeObserver==="function"){
+        dragOnlyResizeObserver=new ResizeObserver(fitStageToViewport);
+        dragOnlyResizeObserver.observe(root);
+      }
+      requestAnimationFrame(fitStageToViewport);
+    }
 
     const bg=document.createElement("img");
     bg.src=`data:image/png;base64,${argsState.image_b64||""}`;
@@ -2934,6 +4083,7 @@
         // Preserve all existing line/arrow behavior: only move the endpoint that
         // belongs to this shifted component by the same visibility correction.
         for(const route of connectedRoutes(id)){
+          if(route.stored_geometry||route.sketch_lock||route.manual_drag)continue;
           if(String(route.source||"")===id){
             route.points=moveConnectedRouteEndpoint(route.points,true,dx,dy);
           }
@@ -2967,8 +4117,11 @@
         event.stopPropagation();
         const edgeId=dragOnlyRouteAction?.selected;
         if(!edgeId)return;
+        const route=routes[edgeId]||{};
+        const source=String(route.source||"");
+        const target=String(route.target||"");
         dragOnlyRouteAction.remove(edgeId);
-        emit("connection_delete",{edge_id:edgeId});
+        emitConnectionDelete(edgeId,source,target);
       });
       stage.appendChild(deleteRouteButton);
       dragOnlyRouteAction={
@@ -2976,18 +4129,22 @@
         select(edgeId){
           this.selected=String(edgeId||"");
           deleteRouteButton.style.display=this.selected?"block":"none";
+          if(this.selected)root.focus({preventScroll:true});
           for(const [id,visual] of routeVisuals){
             const active=id===this.selected;
-            visual.line.setAttribute("stroke",active?"#0a66e3":(routes[id]?.dotted?"#000000":"#123DBD"));
+            visual.line.setAttribute("stroke",active?"#0a66e3":(routePairIsWater(routes[id])?"#123DBD":(routes[id]?.dotted?"#000000":"#123DBD")));
+            if(!active&&routePairIsWater(routes[id])){
+              visual.line.setAttribute("stroke-dasharray","none");
+              visual.line.style.strokeDasharray="none";
+            }
             visual.line.setAttribute("stroke-width",active?"0.026":"0.015");
             visual.under.setAttribute("stroke",active?"#b9d7ff":"#ffffff");
           }
         },
         remove(edgeId){
           const id=String(edgeId||"");
-          const route=routes[id];
-          if(!route)return;
-          route.hidden=true;
+          const removed=permanentlyRemoveRoute(id);
+          if(!removed)return;
           if(this.selected===id){
             this.selected=null;
             deleteRouteButton.style.display="none";
@@ -3004,7 +4161,6 @@
             visual.sourceEndpointHandle?.remove();
           }
           routeVisuals.delete(id);
-          rebuildRouteConnectionIndex();
         }
       };
 
@@ -3028,9 +4184,26 @@
         return pose?pose.angle:0;
       };
 
-      forceDottedOhtTransmitterOntoSensor();
+      // Saved-project freeze: paint sealed payload only — do not rewrite routes
+      // or invent fluid_bore_sump / header geometry over freeze-at-save lines.
+      if(!argsState.freeze_saved_geometry){
+        forceDottedOhtTransmitterOntoSensor();
+        hideEmbeddedOhtSensorRoutes();
+        purgeUnsolicitedDottedRoutes();
+        seatInlineDevicesOnOhtDrops();
+        forceUnifiedFluidHeader();
+        forceBoreSumpReturn();
+        bindLoadedConnectionGeometry();
+        seatInlineDevicesOnOhtDrops();
+        forceUnifiedFluidHeader();
+        forceBoreSumpReturn();
+        purgeUnsolicitedDottedRoutes();
+      }else{
+        hideEmbeddedOhtSensorRoutes();
+        bindLoadedConnectionGeometry();
+      }
       for(const route of Object.values(routes)){
-        if(route.hidden)continue;
+        if(route.hidden||routeLinksEmbeddedOhtSensor(route))continue;
         const pts=Array.isArray(route.points)?route.points:[];
         if(pts.length<2)continue;
         const edgeId=String(route.edge_id||"");
@@ -3041,26 +4214,22 @@
 
         const sourceName=String(components[String(route.source||"")]?.component||"");
         const targetName=String(components[String(route.target||"")]?.component||"");
-        const attachedLevelSensor=(componentId)=>{
-          const component=components[String(componentId||"")];
-          return !!(
-            component &&
-            component.__oht_attached_sensor &&
-            String(component.component||"")==="Linear Level Sensor (LLS)"
-          );
-        };
+        const waterLine=routePairIsWater(route);
+        if(waterLine){
+          route.dotted=false;
+          route.color="#123DBD";
+          route.fluid_header=true;
+        }
         const drawsOverTank=!!(
-          route.dotted &&
-          (
+          !waterLine && (
+            route.sensor_transmitter ||
             (
+              route.dotted &&
               (
-                (sourceName==="OHT Tank"&&targetName==="Transmitter") ||
-                (targetName==="OHT Tank"&&sourceName==="Transmitter")
-              ) &&
-              internalSensorForTank(sourceName==="OHT Tank"?route.source:route.target)
-            ) ||
-            (sourceName==="OHT Tank"&&attachedLevelSensor(route.target)) ||
-            (targetName==="OHT Tank"&&attachedLevelSensor(route.source))
+                (sourceName==="Linear Level Sensor (LLS)"&&targetName==="Transmitter") ||
+                (targetName==="Linear Level Sensor (LLS)"&&sourceName==="Transmitter")
+              )
+            )
           )
         );
         const routeHost=drawsOverTank?sensorRouteSvg:routeSvg;
@@ -3073,12 +4242,12 @@
 
         const line=routeEl("polyline",{
           points,fill:"none",
-          stroke:route.dotted?"#000000":"#123DBD",
-          "stroke-width":"0.015","stroke-linejoin":"round","stroke-linecap":"round",
+          stroke:waterLine?"#123DBD":(route.dotted?"#000000":"#123DBD"),
+          "stroke-width":"0.018","stroke-linejoin":"round","stroke-linecap":"round",
           "stroke-opacity":"1",
           "pointer-events":"none"
         });
-        if(route.dotted)line.setAttribute("stroke-dasharray","0.026 0.052");
+        applySolidBlueWaterStroke(line,route);
         const direction=String(route.direction||"source_to_target");
         routeHost.appendChild(line);
 
@@ -3759,6 +4928,7 @@
                 ?[Number(route.arrow_control[0]),Number(route.arrow_control[1])]
                 :null
             });
+            applyClickedOhtSensorEmbeds();
           }
         };
         hit.addEventListener("pointerup",finishRouteDrag);
@@ -3832,25 +5002,50 @@
     const componentVisuals=new Map();
     let activeLabelEditor=null;
 
+    // Presentation only: acronym boxes hide the under-component title label;
+    // graphic icons keep it. Does not move boxes or touch routes.
+    const applyComponentLabelVisibility=(labelPair,component)=>{
+      if(!labelPair)return;
+      const show=componentDisplayMode(component)!=="acronyms";
+      const display=show?"":"none";
+      if(labelPair.main){
+        labelPair.main.style.display=display;
+        labelPair.main.style.visibility=show?"visible":"hidden";
+      }
+      if(labelPair.under){
+        labelPair.under.style.display=display;
+        labelPair.under.style.visibility=show?"visible":"hidden";
+      }
+    };
+
     const finishLabelEdit=(save=true)=>{
       if(!activeLabelEditor)return;
       const editor=activeLabelEditor;
       activeLabelEditor=null;
       const next=String(editor.input.value||"").trim();
       editor.input.remove();
-      editor.labelPair.main.style.display="";
-      editor.labelPair.under.style.display="";
-      if(!save||!next||next===editor.original)return;
-      editor.component.title=next;
-      editor.labelPair.main.textContent=next;
-      editor.labelPair.under.textContent=next;
-      emit("component_label_edit",{instance_id:editor.id,title:next});
+      if(save&&next&&next!==editor.original){
+        editor.component.title=next;
+        editor.component.label=next;
+        editor.component.acronym=next;
+        editor.labelPair.main.textContent=next;
+        editor.labelPair.under.textContent=next;
+        emit("component_label_edit",{
+          instance_id:editor.id,
+          title:next,
+          label:next,
+          acronym:next
+        });
+      }
+      applyComponentLabelVisibility(editor.labelPair,editor.component);
     };
 
     const beginLabelEdit=(id,labelPair,event)=>{
       if(activeLabelEditor)finishLabelEdit(true);
       const component=components[id];
       if(!component||!labelPair)return;
+      // Acronym mode has no under-box label to edit.
+      if(componentDisplayMode(component)==="acronyms")return;
       const input=document.createElement("input");
       input.type="text";
       input.value=String(component.title||component.component||id);
@@ -3962,15 +5157,22 @@
 
     const applyVisibleComponentImageBox=(el,box)=>{
       applyBox(el,visibleComponentImageBox(box));
+      if(el&&el.classList&&el.classList.contains("component-acronym-box")){
+        // Measure the laid-out box so font tracks live resize in CSS pixels.
+        fitAcronymBoxFont(el,box);
+      }
     };
 
-    const canvasPoint=(ev)=>{
+    const canvasPointFromClient=(clientX,clientY)=>{
       const r=stage.getBoundingClientRect();
-      if(!r.width||!r.height)return[0,0];
+      if(!r.width||!r.height)return null;
       return[
-        clamp((ev.clientX-r.left)/r.width*cw,0,cw),
-        clamp((ev.clientY-r.top)/r.height*ch,0,ch)
+        clamp((Number(clientX)-r.left)/r.width*cw,0,cw),
+        clamp((Number(clientY)-r.top)/r.height*ch,0,ch)
       ];
+    };
+    const canvasPoint=(ev)=>{
+      return canvasPointFromClient(ev&&ev.clientX,ev&&ev.clientY)||[0,0];
     };
 
     // Manual Draw stays in the browser until a line is finished. Toggling the
@@ -4020,9 +5222,27 @@
       if(Math.hypot(next[0]-prev[0],next[1]-prev[1])<0.02)return;
       points.push(next);
     };
+    const waterNames=new Set(["Sump","OHT Tank","Bore Well","Well"]);
+    const pairIsWater=(fromId,toId)=>{
+      const sourceComp=components[fromId]||{component:""};
+      const targetComp=components[toId]||{component:""};
+      const sourceName=String(sourceComp.component||"");
+      const targetName=String(targetComp.component||"");
+      if(waterNames.has(sourceName)&&waterNames.has(targetName))return true;
+      const sourceWater=waterNames.has(sourceName);
+      const targetWater=waterNames.has(targetName);
+      const sourceInline=isInlineProcessComponent(sourceComp);
+      const targetInline=isInlineProcessComponent(targetComp);
+      return (sourceWater&&targetInline)||(sourceInline&&targetWater);
+    };
     const showManualPreview=(extra)=>{
       const pts=manualDraw.points.map(p=>[p[0],p[1]]);
       if(extra)pushOrtho(pts,extra);
+      const sourceName=String(components[manualDraw.source]?.component||"");
+      const waterStart=waterNames.has(sourceName);
+      manualPreviewLine.setAttribute("stroke",waterStart?"#123DBD":"#000000");
+      if(waterStart)manualPreviewLine.removeAttribute("stroke-dasharray");
+      else manualPreviewLine.setAttribute("stroke-dasharray","0.026 0.052");
       manualPreviewLine.setAttribute("points",pts.map(p=>`${p[0]},${p[1]}`).join(" "));
     };
     const highlightManualSource=(id)=>{
@@ -4051,30 +5271,55 @@
       if(clean.length<2){manualDraw.cancel();return;}
       const fromId=String(sourceId||"");
       const toId=String(targetId||"");
+      const waterLine=pairIsWater(fromId,toId);
+      const stroke=waterLine?"#123DBD":"#000000";
       const existing=Object.values(routes).find(route=>!route.hidden&&fromId&&toId&&(
         (String(route.source||"")===fromId&&String(route.target||"")===toId)||
         (String(route.source||"")===toId&&String(route.target||"")===fromId)
       ));
       const edgeId=existing
-        ?String(existing.edge_id||"")
-        :`manual__${fromId||"canvas"}__${toId||"canvas"}__${Date.now().toString(36)}`;
+        ?String(existing.edge_id||existing.id||"")
+        :`manual__${eid()}`;
       if(existing){
         existing.points=clean;
         existing.original_points=clonePoints(clean);
+        existing.dotted=!waterLine;
+        existing.color=stroke;
+        existing.custom=true;
+        existing.manual_drag=true;
+        existing.stored_geometry=true;
+        existing.hidden=false;
+        existing.sourceHandle=existing.sourceHandle||existing.source_handle||`${fromId}:auto`;
+        existing.targetHandle=existing.targetHandle||existing.target_handle||`${toId}:auto`;
+        existing.source_handle=existing.sourceHandle;
+        existing.target_handle=existing.targetHandle;
         updateRouteVisual(edgeId);
+        const visual=routeVisuals.get(edgeId);
+        if(visual&&visual.line){
+          visual.line.setAttribute("stroke",stroke);
+          if(waterLine)visual.line.removeAttribute("stroke-dasharray");
+          else visual.line.setAttribute("stroke-dasharray","0.026 0.052");
+        }
       }else{
         routes[edgeId]={
           edge_id:edgeId,
+          id:edgeId,
           points:clean,
           original_points:clonePoints(clean),
           source:fromId,
           target:toId,
-          color:"#123DBD",
-          dotted:false,
+          sourceHandle:`${fromId}:auto`,
+          targetHandle:`${toId}:auto`,
+          source_handle:`${fromId}:auto`,
+          target_handle:`${toId}:auto`,
+          color:stroke,
+          dotted:!waterLine,
           direction:"source_to_target",
           original_direction:"source_to_target",
           hidden:false,
-          custom:true
+          custom:true,
+          manual_drag:true,
+          stored_geometry:true
         };
         const drawn=clean.map(p=>`${p[0]},${p[1]}`).join(" ");
         const strokeUnder=routeEl("polyline",{
@@ -4082,9 +5327,10 @@
           "stroke-linejoin":"round","stroke-linecap":"round","pointer-events":"none"
         });
         const strokeLine=routeEl("polyline",{
-          points:drawn,fill:"none",stroke:"#123DBD","stroke-width":"0.015",
+          points:drawn,fill:"none",stroke:stroke,"stroke-width":"0.015",
           "stroke-linejoin":"round","stroke-linecap":"round","pointer-events":"none"
         });
+        if(!waterLine)strokeLine.setAttribute("stroke-dasharray","0.026 0.052");
         strokeUnder.setAttribute("data-manual-stroke","1");
         strokeLine.setAttribute("data-manual-stroke","1");
         routeSvg.appendChild(strokeUnder);
@@ -4159,6 +5405,14 @@
     });
 
     const makeGhostFromPreview=(component)=>{
+      if(componentDisplayMode(component)==="acronyms"){
+        const ghost=document.createElement("div");
+        ghost.className="component-acronym-box";
+        ghost.textContent=componentAcronymText(component);
+        ghost.style.cssText="position:absolute;z-index:40;pointer-events:none;user-select:none;filter:drop-shadow(0 5px 8px rgba(0,0,0,.18));";
+        applyVisibleComponentImageBox(ghost,component.box);
+        return ghost;
+      }
       const ghost=document.createElement("img");
       ghost.draggable=false;
       ghost.style.cssText="position:absolute;z-index:40;pointer-events:none;user-select:none;object-fit:contain;filter:drop-shadow(0 5px 8px rgba(0,0,0,.18));";
@@ -4174,13 +5428,87 @@
       return ghost;
     };
 
+    // Acronym corner resize grips sit at NW/NE; keep + / × on a top action
+    // dock so they stay visible and clickable without switching back to icons.
+    const layoutComponentActionControls=(addBtn,delBtn,component)=>{
+      const acronym=componentDisplayMode(component)==="acronyms";
+      if(addBtn){
+        addBtn.style.zIndex="46";
+        if(acronym){
+          addBtn.style.left="calc(50% + 4px)";
+          addBtn.style.right="auto";
+          addBtn.style.top="-38px";
+          addBtn.style.transform="none";
+        }else{
+          addBtn.style.left="auto";
+          addBtn.style.right="-13px";
+          addBtn.style.top="-13px";
+          addBtn.style.transform="none";
+        }
+      }
+      if(delBtn){
+        delBtn.style.zIndex="46";
+        if(acronym){
+          delBtn.style.left="calc(50% - 34px)";
+          delBtn.style.right="auto";
+          delBtn.style.top="-38px";
+          delBtn.style.transform="none";
+        }else{
+          delBtn.style.left="-13px";
+          delBtn.style.right="auto";
+          delBtn.style.top="-13px";
+          delBtn.style.transform="none";
+        }
+      }
+    };
+
     const setComponentControlsVisible=(id,visible)=>{
       const item=overlays.get(String(id||""));
       if(!item)return;
-      item.add.style.opacity=visible?"1":"0";
-      item.add.style.pointerEvents=visible?"auto":"none";
-      item.del.style.opacity=visible?"1":"0";
-      item.del.style.pointerEvents=visible?"auto":"none";
+      if(item.add){
+        item.add.style.opacity=visible?"1":"0";
+        item.add.style.pointerEvents=visible?"auto":"none";
+      }
+      if(item.del){
+        item.del.style.opacity=visible?"1":"0";
+        item.del.style.pointerEvents=visible?"auto":"none";
+      }
+      if(item.modeSelect){
+        item.modeSelect.style.opacity=visible?"1":"0";
+        item.modeSelect.style.pointerEvents=visible?"auto":"none";
+      }
+      if(item.resizeHandles&&item.resizeHandles.length){
+        for(const handle of item.resizeHandles){
+          handle.style.opacity=visible?"1":"0";
+          handle.style.pointerEvents=visible?"auto":"none";
+        }
+      }
+    };
+
+    const ACRONYM_MIN_W=0.32;
+    const ACRONYM_MIN_H=0.24;
+    const ACRONYM_MAX_W=2.8;
+    const ACRONYM_MAX_H=2.2;
+    const resizeAcronymBox=(baseBox,corner,dx,dy)=>{
+      let [x,y,w,h]=cloneBox(baseBox);
+      if(corner==="se"){
+        w=clamp(w+dx,ACRONYM_MIN_W,ACRONYM_MAX_W);
+        h=clamp(h+dy,ACRONYM_MIN_H,ACRONYM_MAX_H);
+      }else if(corner==="sw"){
+        w=clamp(w-dx,ACRONYM_MIN_W,ACRONYM_MAX_W);
+        h=clamp(h+dy,ACRONYM_MIN_H,ACRONYM_MAX_H);
+        x=baseBox[0]+baseBox[2]-w;
+      }else if(corner==="ne"){
+        w=clamp(w+dx,ACRONYM_MIN_W,ACRONYM_MAX_W);
+        h=clamp(h-dy,ACRONYM_MIN_H,ACRONYM_MAX_H);
+        y=baseBox[1]+baseBox[3]-h;
+      }else{
+        w=clamp(w-dx,ACRONYM_MIN_W,ACRONYM_MAX_W);
+        h=clamp(h-dy,ACRONYM_MIN_H,ACRONYM_MAX_H);
+        x=baseBox[0]+baseBox[2]-w;
+        y=baseBox[1]+baseBox[3]-h;
+      }
+      return[x,y,w,h];
     };
 
     const clearComponentHoverTimer=(id)=>{
@@ -4261,14 +5589,27 @@
       // transparent pointer target so the component itself moves immediately.
       // Secondary cards sit above Sump, Bore Well, and OHT Tank so a tank image
       // cannot cover them or steal their drag target.
-      const visual=document.createElement("img");
-      visual.draggable=false;
-      visual.alt=String(c.title||c.component||id);
-      visual.src=`data:image/png;base64,${String(c.image_b64||"").trim()}`;
-      visual.style.cssText=`position:absolute;z-index:${visualZ};pointer-events:none;user-select:none;object-fit:${String(c.image_fit||"contain")};`;
-      if(c.__oht_attached_sensor)revealInternalSensorGlyph(visual);
-      applyVisibleComponentImageBox(visual,c.box);
+      let visual;
+      if(componentDisplayMode(c)==="acronyms"){
+        visual=document.createElement("div");
+        visual.className="component-acronym-box";
+        visual.textContent=componentAcronymText(c);
+        visual.title=String(c.title||c.component||id);
+        visual.style.cssText=`position:absolute;z-index:${visualZ};pointer-events:none;user-select:none;`;
+        applyVisibleComponentImageBox(visual,c.box);
+      }else{
+        visual=document.createElement("img");
+        visual.draggable=false;
+        visual.alt=String(c.title||c.component||id);
+        visual.src=`data:image/png;base64,${String(c.image_b64||"").trim()}`;
+        visual.style.cssText=`position:absolute;z-index:${visualZ};pointer-events:none;user-select:none;object-fit:${String(c.image_fit||"contain")};`;
+        if(c.__oht_attached_sensor)revealInternalSensorGlyph(visual);
+        applyVisibleComponentImageBox(visual,c.box);
+      }
       stage.appendChild(visual);
+      if(visual.classList&&visual.classList.contains("component-acronym-box")){
+        fitAcronymBoxFont(visual,c.box);
+      }
       componentVisuals.set(id,visual);
 
       // The OHT-associated LLS is part of the tank presentation only: no
@@ -4366,13 +5707,14 @@
       routeSvg.appendChild(labelMain);
 
       componentLabels.set(id,{under:labelUnder,main:labelMain});
+      applyComponentLabelVisibility(componentLabels.get(id),c);
       labelMain.addEventListener("click",event=>beginLabelEdit(id,{under:labelUnder,main:labelMain},event));
       labelUnder.addEventListener("click",event=>beginLabelEdit(id,{under:labelUnder,main:labelMain},event));
 
       const hit=document.createElement("div");
       hit.dataset.componentId=id;
       hit.title=String(c.title||c.component||id);
-      hit.style.cssText=`position:absolute;z-index:${hitZ};box-sizing:border-box;cursor:grab;background:rgba(0,0,0,0.001);touch-action:none;pointer-events:auto;-webkit-user-select:none;user-select:none;`;
+      hit.style.cssText=`position:absolute;z-index:${hitZ};box-sizing:border-box;cursor:grab;background:rgba(0,0,0,0.001);touch-action:none;pointer-events:auto;-webkit-user-select:none;user-select:none;overflow:visible;`;
       applyBox(hit,c.box);
 
       if(id===pendingId){
@@ -4385,16 +5727,104 @@
       add.type="button";
       add.textContent="+";
       add.title="Add another component";
-      add.style.cssText="position:absolute;right:-13px;top:-13px;width:30px;height:30px;border-radius:50%;border:2px solid #fff;background:#0a66e3;color:#fff;font:bold 21px/24px Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:30;opacity:0;pointer-events:none;cursor:pointer;padding:0;";
+      add.setAttribute("aria-label",`Add another ${String(c.title||c.component||"component")}`);
+      add.style.cssText="position:absolute;right:-13px;top:-13px;width:30px;height:30px;border-radius:50%;border:2px solid #fff;background:#0a66e3;color:#fff;font:bold 21px/24px Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:46;opacity:0;pointer-events:none;cursor:pointer;padding:0;";
 
       const del=document.createElement("button");
       del.type="button";
       del.textContent="×";
       del.title="Delete component";
-      del.style.cssText="position:absolute;left:-13px;top:-13px;width:30px;height:30px;border-radius:50%;border:2px solid #fff;background:#dc2626;color:#fff;font:bold 20px/24px Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:30;opacity:0;pointer-events:none;cursor:pointer;padding:0;";
+      del.setAttribute("aria-label",`Delete ${String(c.title||c.component||"component")}`);
+      del.style.cssText="position:absolute;left:-13px;top:-13px;width:30px;height:30px;border-radius:50%;border:2px solid #fff;background:#dc2626;color:#fff;font:bold 20px/24px Arial,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:46;opacity:0;pointer-events:none;cursor:pointer;padding:0;";
+      layoutComponentActionControls(add,del,c);
+
+      // Clear per-component display selector (Graphic Icon <-> Acronym Box).
+      // Placed below the box so it never fights corner resize handles.
+      const modeSelect=document.createElement("select");
+      modeSelect.title="Display mode for this component";
+      modeSelect.innerHTML='<option value="icons">Graphic Icon</option><option value="acronyms">Acronym Box</option>';
+      modeSelect.style.cssText=[
+        "position:absolute",
+        "left:50%",
+        "bottom:-30px",
+        "transform:translateX(-50%)",
+        "min-width:118px",
+        "height:24px",
+        "border:1px solid #173f75",
+        "border-radius:6px",
+        "background:#fff",
+        "color:#173f75",
+        "font:600 11px/22px Segoe UI,Arial,sans-serif",
+        "box-shadow:0 2px 8px rgba(15,23,42,.18)",
+        "z-index:40",
+        "opacity:0",
+        "pointer-events:none",
+        "cursor:pointer",
+        "padding:0 4px"
+      ].join(";");
+      paintComponentDisplayModeControl(modeSelect,c);
+
+      const applyLocalDisplayMode=(next)=>{
+        // Core hosts (Sump / Bore Well / OHT Tank) cannot switch to acronym boxes.
+        if(!componentAllowsAcronymDisplay(c))return;
+        const mode=String(next||"icons")==="acronyms"?"acronyms":"icons";
+        c.display_mode=mode;
+        paintComponentDisplayModeControl(modeSelect,c);
+        const oldVisual=componentVisuals.get(id);
+        let nextVisual;
+        const visualZ=c.__oht_attached_sensor?19:(isPrimaryCanvasComponent(c)?15:28);
+        if(mode==="acronyms"){
+          nextVisual=document.createElement("div");
+          nextVisual.className="component-acronym-box";
+          nextVisual.textContent=componentAcronymText(c);
+          nextVisual.title=String(c.title||c.component||id);
+          nextVisual.style.cssText=`position:absolute;z-index:${visualZ};pointer-events:none;user-select:none;`;
+          applyVisibleComponentImageBox(nextVisual,c.box);
+        }else{
+          nextVisual=document.createElement("img");
+          nextVisual.draggable=false;
+          nextVisual.alt=String(c.title||c.component||id);
+          nextVisual.src=`data:image/png;base64,${String(c.image_b64||"").trim()}`;
+          nextVisual.style.cssText=`position:absolute;z-index:${visualZ};pointer-events:none;user-select:none;object-fit:${String(c.image_fit||"contain")};`;
+          if(c.__oht_attached_sensor)revealInternalSensorGlyph(nextVisual);
+          applyVisibleComponentImageBox(nextVisual,c.box);
+        }
+        if(oldVisual&&oldVisual.parentNode){
+          oldVisual.parentNode.replaceChild(nextVisual,oldVisual);
+        }else{
+          stage.appendChild(nextVisual);
+        }
+        if(mode==="acronyms"){
+          fitAcronymBoxFont(nextVisual,c.box);
+        }
+        componentVisuals.set(id,nextVisual);
+        applyComponentLabelVisibility(componentLabels.get(id),c);
+        layoutComponentActionControls(add,del,c);
+        const overlayItem=overlays.get(id);
+        if(overlayItem){
+          overlayItem.visual=nextVisual;
+          if(overlayItem.resizeHandles&&overlayItem.resizeHandles.length){
+            const showResize=mode==="acronyms";
+            for(const handle of overlayItem.resizeHandles){
+              handle.style.display=showResize?"":"none";
+            }
+          }
+        }
+        // Keep + / delete immediately available after switching into acronym mode.
+        showControlsForTwoSeconds(id,{persist:true});
+        // Persist presentation mode in the movement draft so a later remount
+        // (delete/add of a different component) cannot reset this box to icons.
+        saveMovementDraft();
+        emit("component_display_mode",{
+          instance_id:id,
+          display_mode:mode,
+          component:String(c.component||"")
+        });
+      };
 
       add.addEventListener("pointerdown",e=>{e.preventDefault();e.stopPropagation();});
       del.addEventListener("pointerdown",e=>{e.preventDefault();e.stopPropagation();});
+      modeSelect.addEventListener("pointerdown",e=>{e.stopPropagation();});
       add.addEventListener("click",e=>{
         e.preventDefault();e.stopPropagation();
         requestWorksheetComponentAdd(String(c.component||""),id,c);
@@ -4404,7 +5834,62 @@
         optimisticWorksheetDelete(id);
         emit("component_delete",{component:String(c.component||""),instance_id:id});
       });
+      modeSelect.addEventListener("change",e=>{
+        e.preventDefault();
+        e.stopPropagation();
+        applyLocalDisplayMode(modeSelect.value);
+      });
+      modeSelect.addEventListener("click",e=>{
+        e.stopPropagation();
+        showControlsForTwoSeconds(id,{persist:true});
+      });
 
+      hit.addEventListener("contextmenu",e=>{
+        e.preventDefault();
+        e.stopPropagation();
+        showControlsForTwoSeconds(id,{persist:true});
+        closeContext();
+        const menu=document.createElement("div");
+        menu.className="context";
+        menu.style.left=`${Math.min(e.clientX,window.innerWidth-180)}px`;
+        menu.style.top=`${Math.min(e.clientY,window.innerHeight-160)}px`;
+        const addAction=(label,fn,danger=false)=>{
+          const b=document.createElement("button");
+          b.type="button";
+          b.textContent=label;
+          if(danger)b.className="danger";
+          b.addEventListener("click",()=>{
+            fn();
+            closeContext();
+          });
+          menu.appendChild(b);
+        };
+        // Always offer count/delete actions — including while in Acronym Box mode.
+        addAction("Add another (+)",()=>{
+          requestWorksheetComponentAdd(String(c.component||""),id,c);
+        });
+        addAction("Delete component",()=>{
+          optimisticWorksheetDelete(id);
+          emit("component_delete",{component:String(c.component||""),instance_id:id});
+        },true);
+        if(componentAllowsAcronymDisplay(c)){
+          const addMode=(label,mode)=>{
+            const b=document.createElement("button");
+            b.type="button";
+            b.textContent=label;
+            if(componentDisplayMode(c)===mode)b.style.fontWeight="700";
+            b.addEventListener("click",()=>{
+              applyLocalDisplayMode(mode);
+              closeContext();
+            });
+            menu.appendChild(b);
+          };
+          addMode("Graphic Icon","icons");
+          addMode("Acronym Box","acronyms");
+        }
+        document.body.appendChild(menu);
+        contextMenu=menu;
+      });
       hit.addEventListener("pointerenter",()=>{
         showControlsForTwoSeconds(id);
       });
@@ -4413,9 +5898,15 @@
         // for the full 2 seconds from the original hover/touch moment.
       });
 
+      const detachActiveDragWindowListeners=()=>{
+        clearLiveComponentDragWindowListeners();
+        if(activeDrag)activeDrag.windowListeners=null;
+      };
+
       hit.addEventListener("pointerdown",e=>{
         if(e.button!==0&&e.pointerType!=="touch"&&e.pointerType!=="pen")return;
-        if(e.target===add||e.target===del)return;
+        if(e.target===add||e.target===del||e.target===modeSelect||(e.target&&e.target.dataset&&e.target.dataset.acronymResize))return;
+        if(liveComponentDrag&&liveComponentDrag.active)return;
 
         if(e.pointerType==="touch"||e.pointerType==="pen"){
           showControlsForTwoSeconds(id,{persist:true});
@@ -4424,7 +5915,10 @@
         e.preventDefault();
         e.stopPropagation();
 
-        const start=canvasPoint(e);
+        // Register grab origin from this exact pointerdown. Prefer a real stage
+        // CTM/rect; if layout is not ready yet, re-baseline on the first move.
+        const startClient=[Number(e.clientX)||0,Number(e.clientY)||0];
+        const start=canvasPointFromClient(startClient[0],startClient[1]);
         const attachedRoutes=connectedRoutes(id);
         const attachedComponents=Object.values(components)
           .filter(child=>
@@ -4467,7 +5961,9 @@
           id,
           component:c,
           pointerId:e.pointerId,
-          start,
+          start:start||[0,0],
+          startClient,
+          startReady:!!start,
           base:cloneBox(c.box),
           attachedRoutes,
           attachedComponents,
@@ -4501,21 +5997,62 @@
           ),
 
           moved:false,
-          ghost:makeGhostFromPreview(c)
+          ghost:makeGhostFromPreview(c),
+          windowListeners:null
         };
+        liveComponentDrag={active:true,id,pointerId:e.pointerId};
         stage.appendChild(activeDrag.ghost);
         hit.style.cursor="grabbing";
         hit.style.outline="2px dashed #0a66e3";
         hit.style.outlineOffset="2px";
         try{hit.setPointerCapture(e.pointerId);}catch(_){}
+
+        const onWindowMove=ev=>{
+          if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==ev.pointerId)return;
+          scheduleActiveDragMove(ev);
+        };
+        const onWindowUp=ev=>{
+          if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==ev.pointerId)return;
+          finish(ev);
+        };
+        const onWindowCancel=ev=>{
+          if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==ev.pointerId)return;
+          // A cancelled gesture that already translated must keep the live box
+          // (same as pointerup). Resetting to base caused the first-drag jump.
+          if(activeDrag.moved)finish(ev);
+          else cancelActiveDrag(ev);
+        };
+        clearLiveComponentDragWindowListeners();
+        activeDrag.windowListeners=[
+          ["pointermove",onWindowMove],
+          ["pointerup",onWindowUp],
+          ["pointercancel",onWindowCancel]
+        ];
+        liveComponentDragWindowListeners=activeDrag.windowListeners.slice();
+        for(const [type,listener] of liveComponentDragWindowListeners){
+          window.addEventListener(type,listener);
+        }
       });
 
       const moveActiveDrag=e=>{
         if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==e.pointerId)return;
-        e.preventDefault();
-        e.stopPropagation();
+        if(typeof e.preventDefault==="function"){
+          e.preventDefault();
+          e.stopPropagation();
+        }
 
-        const p=canvasPoint(e);
+        let p=canvasPointFromClient(e.clientX,e.clientY);
+        if(!p)return;
+        // First usable layout rect: lock startX/startY from the original
+        // pointerdown client coordinates so delta math never uses [0,0].
+        if(!activeDrag.startReady){
+          const rebased=canvasPointFromClient(
+            activeDrag.startClient[0],
+            activeDrag.startClient[1]
+          );
+          activeDrag.start=rebased||p;
+          activeDrag.startReady=true;
+        }
         const [bx,by,bw,bh]=activeDrag.base;
         const dx=p[0]-activeDrag.start[0];
         const dy=p[1]-activeDrag.start[1];
@@ -4526,8 +6063,12 @@
           bh
         ];
         const snappedBox=snapBoxToConnectedRoute(activeDrag,proposedBox,stage,cw,ch);
-        const nx=snappedBox[0];
-        const ny=snappedBox[1];
+        // Suppress snap that rubber-bands the card back toward its grab origin.
+        const away=Math.hypot(proposedBox[0]-bx,proposedBox[1]-by);
+        const snapAway=Math.hypot(snappedBox[0]-bx,snappedBox[1]-by);
+        const useFree=away>0.03&&snapAway<away*0.45;
+        const nx=useFree?proposedBox[0]:snappedBox[0];
+        const ny=useFree?proposedBox[1]:snappedBox[1];
 
         c.box=[nx,ny,bw,bh];
         applyBox(hit,c.box);
@@ -4564,14 +6105,14 @@
             route.points=clonePoints(basePoints);
             const sensorPoint=sensorAnchorPoint(child.box);
             if(String(route.source||"")===childState.id){
-              route.points=moveConnectedRouteEndpointToPort(
+                route.points=moveConnectedRouteEndpointToPort(
                 route.points,true,sensorPoint
-              );
+                );
             }
             if(String(route.target||"")===childState.id){
-              route.points=moveConnectedRouteEndpointToPort(
+                route.points=moveConnectedRouteEndpointToPort(
                 route.points,false,sensorPoint
-              );
+                );
             }
 
             route.points=cleanDraggedRoutePoints(route.points);
@@ -4593,13 +6134,7 @@
           const otherId=String(route.source||"")===id
             ?String(route.target||"")
             :String(route.source||"");
-          const internalSensor=(activeDrag.attachedComponents||[]).find(childState=>childState&&childState.component);
-          const transmitterSensorAnchor=(
-            !c.__oht_attached_sensor &&
-            String(components[otherId]?.component||"")==="Transmitter" &&
-            internalSensor
-          )?sensorAnchorPoint(internalSensor.component.box):null;
-          const sensorPoint=c.__oht_attached_sensor?sensorAnchorPoint(c.box):transmitterSensorAnchor;
+          const sensorPoint=c.__oht_attached_sensor?sensorAnchorPoint(c.box):null;
 
           if(String(route.source||"")===id){
             const sourcePort=sensorPoint||resolvePortReference(c.box,portRefs.source);
@@ -4641,41 +6176,90 @@
         activeDrag.moved=activeDrag.moved||Math.hypot(nx-bx,ny-by)>.02;
       };
 
-      let dragFrame=0;
-      let pendingDragEvent=null;
+      // Snapshot clientX/Y per frame (same helper as route dragging). Holding the
+      // live PointerEvent across rAF can lose coordinates on the first gesture.
+      const dragPointerQueue=createRafPointerQueue(eventLike=>{
+        if(!activeDrag||activeDrag.id!==id)return;
+        moveActiveDrag(eventLike);
+      });
       const scheduleActiveDragMove=e=>{
         if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==e.pointerId)return;
-        e.preventDefault();
-        e.stopPropagation();
-        pendingDragEvent=e;
-        if(dragFrame)return;
-        dragFrame=requestAnimationFrame(()=>{
-          dragFrame=0;
-          const next=pendingDragEvent;
-          pendingDragEvent=null;
-          if(next)moveActiveDrag(next);
-        });
+        if(typeof e.preventDefault==="function"){
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        dragPointerQueue.push(e);
       };
-      const flushActiveDragMove=()=>{
-        if(!dragFrame)return;
-        cancelAnimationFrame(dragFrame);
-        dragFrame=0;
-        const next=pendingDragEvent;
-        pendingDragEvent=null;
-        if(next)moveActiveDrag(next);
+      const flushActiveDragMove=e=>{
+        dragPointerQueue.flush(e||null);
       };
 
       hit.addEventListener("pointermove",scheduleActiveDragMove);
       stage.addEventListener("pointermove",scheduleActiveDragMove);
 
+      const cancelActiveDrag=e=>{
+        if(!activeDrag||activeDrag.id!==id)return;
+        if(e&&activeDrag.pointerId!==e.pointerId)return;
+        dragPointerQueue.cancel();
+        const d=activeDrag;
+        detachActiveDragWindowListeners();
+        activeDrag=null;
+        liveComponentDrag=null;
+        try{if(e)hit.releasePointerCapture(e.pointerId);}catch(_){}
+
+        c.box=cloneBox(d.base);
+        applyBox(hit,c.box);
+        applyVisibleComponentImageBox(visual,c.box);
+        positionWifiBadge();
+
+        for(const childState of (d.attachedComponents||[])){
+          childState.component.box=cloneBox(childState.base);
+          const childVisual=componentVisuals.get(childState.id);
+          if(childVisual){
+            applyVisibleComponentImageBox(childVisual,childState.component.box);
+          }
+          for(const [edgeId,points] of Object.entries(childState.routeBase||{})){
+            if(!routes[edgeId])continue;
+            routes[edgeId].points=clonePoints(points);
+            updateRouteVisual(edgeId);
+          }
+        }
+
+        for(const [edgeId,points] of Object.entries(d.routeBase||{})){
+          if(!routes[edgeId])continue;
+          routes[edgeId].points=clonePoints(points);
+          updateRouteVisual(edgeId);
+        }
+
+        const labelPair=componentLabels.get(id);
+        if(labelPair){
+          const [rx,ry,rw,rh]=cloneBox(c.box);
+          const labelX=rx+(rw/2);
+          const labelY=ry+rh+0.18;
+          labelPair.under.setAttribute("x",String(labelX));
+          labelPair.under.setAttribute("y",String(labelY));
+          labelPair.main.setAttribute("x",String(labelX));
+          labelPair.main.setAttribute("y",String(labelY));
+        }
+
+        if(d.ghost&&d.ghost.parentNode)d.ghost.parentNode.removeChild(d.ghost);
+        hit.style.cursor="grab";
+        hit.style.outline=id===pendingId?"3px solid #0a66e3":"none";
+        hit.style.outlineOffset=id===pendingId?"2px":"0";
+      };
+
       const finish=e=>{
         if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==e.pointerId)return;
-        flushActiveDragMove();
-        e.preventDefault();
-        e.stopPropagation();
+        flushActiveDragMove(e);
+        if(typeof e.preventDefault==="function"){
+          e.preventDefault();
+          e.stopPropagation();
+        }
 
         const d=activeDrag;
+        detachActiveDragWindowListeners();
         activeDrag=null;
+        liveComponentDrag=null;
         try{hit.releasePointerCapture(e.pointerId);}catch(_){}
         if(d.ghost&&d.ghost.parentNode)d.ghost.parentNode.removeChild(d.ghost);
         hit.style.cursor="grab";
@@ -4683,6 +6267,10 @@
         hit.style.outlineOffset=id===pendingId?"2px":"0";
 
         if(d.moved){
+          c.__user_dragged=true;
+          for(const childState of (d.attachedComponents||[])){
+            if(childState.component)childState.component.__user_dragged=true;
+          }
           saveMovementDraft();
           suppressComponentClick=true;
           const movedComponents=[{
@@ -4700,11 +6288,40 @@
               box:cloneBox(child.box)
             });
           }
-          emit("component_move",{
+          const movedRoutesById=new Map();
+          for(const route of [
+            ...(d.attachedRoutes||[]),
+            ...(d.attachedComponents||[]).flatMap(
+              childState=>childState.routes||[]
+            )
+          ]){
+            const edgeId=String(route&&route.edge_id||"");
+            if(!edgeId||!Array.isArray(route.points)||route.points.length<2)continue;
+            movedRoutesById.set(edgeId,{
+              edge_id:edgeId,
+              source:String(route.source||""),
+              target:String(route.target||""),
+              points:clonePoints(route.points)
+            });
+          }
+          // Emit after the drag lock clears so the Streamlit remount cannot
+          // interrupt the just-finished first grab.
+          const movePayload={
             instance_id:id,
             component:String(c.component||""),
             box:cloneBox(c.box),
-            moved_components:movedComponents
+            moved_components:movedComponents,
+            moved_routes:[...movedRoutesById.values()]
+          };
+          setTimeout(()=>emit("component_move",movePayload),0);
+        }else if(String(c.component||"")==="Transmitter"){
+          // pointerdown preventDefault can drop the click on the first
+          // Transmitter press. Emit that selection here and ignore the click
+          // that would otherwise cancel it.
+          suppressComponentClick=true;
+          emit("component_select",{
+            instance_id:id,
+            component:"Transmitter"
           });
         }else{
           // Selection is emitted by the normal click event below.
@@ -4725,56 +6342,124 @@
       });
       hit.addEventListener("pointercancel",e=>{
         if(!activeDrag||activeDrag.id!==id||activeDrag.pointerId!==e.pointerId)return;
-        if(dragFrame)cancelAnimationFrame(dragFrame);
-        dragFrame=0;
-        pendingDragEvent=null;
-        const d=activeDrag;
-        activeDrag=null;
-        c.box=cloneBox(d.base);
-        applyBox(hit,c.box);
-        applyVisibleComponentImageBox(visual,c.box);
-        positionWifiBadge();
-
-        for(const childState of (d.attachedComponents||[])){
-          childState.component.box=cloneBox(childState.base);
-          const childVisual=componentVisuals.get(childState.id);
-          if(childVisual){
-            applyVisibleComponentImageBox(childVisual,childState.component.box);
-          }
-          for(const [edgeId,points] of Object.entries(childState.routeBase||{})){
-            if(!routes[edgeId])continue;
-            routes[edgeId].points=clonePoints(points);
-            updateRouteVisual(edgeId);
-          }
-        }
-
-        // A cancelled component drag must also restore the exact connected-line
-        // geometry that existed when the drag started.
-        for(const [edgeId,points] of Object.entries(d.routeBase||{})){
-          if(!routes[edgeId])continue;
-          routes[edgeId].points=clonePoints(points);
-          updateRouteVisual(edgeId);
-        }
-
-        const labelPair=componentLabels.get(id);
-        if(labelPair){
-          const [rx,ry,rw,rh]=cloneBox(c.box);
-          const labelX=rx+(rw/2);
-          const labelY=ry+rh+0.18;
-          labelPair.under.setAttribute("x",String(labelX));
-          labelPair.under.setAttribute("y",String(labelY));
-          labelPair.main.setAttribute("x",String(labelX));
-          labelPair.main.setAttribute("y",String(labelY));
-        }
-
-        if(d.ghost&&d.ghost.parentNode)d.ghost.parentNode.removeChild(d.ghost);
-        hit.style.cursor="grab";
+        if(activeDrag.moved)finish(e);
+        else cancelActiveDrag(e);
       });
 
+      const resizeHandles=[];
+      if(componentDisplayMode(c)==="acronyms"){
+        const cornerStyle={
+          nw:["left:-6px","top:-6px","cursor:nwse-resize"],
+          ne:["right:-6px","top:-6px","cursor:nesw-resize"],
+          sw:["left:-6px","bottom:-6px","cursor:nesw-resize"],
+          se:["right:-6px","bottom:-6px","cursor:nwse-resize"]
+        };
+        for(const corner of ["nw","ne","sw","se"]){
+          const handle=document.createElement("div");
+          handle.dataset.acronymResize=corner;
+          handle.title="Resize acronym box";
+          handle.style.cssText=[
+            "position:absolute",
+            ...cornerStyle[corner],
+            "width:14px",
+            "height:14px",
+            "border-radius:3px",
+            "border:2px solid #2563eb",
+            "background:#fff",
+            "box-shadow:0 1px 4px rgba(15,23,42,.25)",
+            "z-index:32",
+            "opacity:0",
+            "pointer-events:none",
+            "touch-action:none"
+          ].join(";");
+          let resizeSession=null;
+          const stopResize=ev=>{
+            if(!resizeSession||resizeSession.pointerId!==ev.pointerId)return;
+            if(typeof ev.preventDefault==="function"){
+              ev.preventDefault();
+              ev.stopPropagation();
+            }
+            const session=resizeSession;
+            resizeSession=null;
+            try{handle.releasePointerCapture(ev.pointerId);}catch(_){}
+            window.removeEventListener("pointermove",onResizeMove,true);
+            window.removeEventListener("pointerup",stopResize,true);
+            window.removeEventListener("pointercancel",stopResize,true);
+            if(!session.moved)return;
+            c.__user_dragged=true;
+            saveMovementDraft();
+            suppressComponentClick=true;
+            setTimeout(()=>emit("component_move",{
+              instance_id:id,
+              component:String(c.component||""),
+              box:cloneBox(c.box),
+              moved_components:[{
+                instance_id:id,
+                component:String(c.component||""),
+                box:cloneBox(c.box)
+              }]
+            }),0);
+          };
+          const onResizeMove=ev=>{
+            if(!resizeSession||resizeSession.pointerId!==ev.pointerId)return;
+            const point=canvasPoint(ev);
+            if(!point)return;
+            const dx=point[0]-resizeSession.start[0];
+            const dy=point[1]-resizeSession.start[1];
+            if(Math.abs(dx)>0.01||Math.abs(dy)>0.01)resizeSession.moved=true;
+            c.box=resizeAcronymBox(resizeSession.box,corner,dx,dy);
+            applyBox(hit,c.box);
+            applyVisibleComponentImageBox(visual,c.box);
+            const labelPair=componentLabels.get(id);
+            if(labelPair){
+              const [rx,ry,rw,rh]=cloneBox(c.box);
+              const labelX=rx+(rw/2);
+              const labelY=ry+rh+0.18;
+              labelPair.under.setAttribute("x",String(labelX));
+              labelPair.under.setAttribute("y",String(labelY));
+              labelPair.main.setAttribute("x",String(labelX));
+              labelPair.main.setAttribute("y",String(labelY));
+            }
+            if(wifiBadge)positionWifiBadge();
+          };
+          handle.addEventListener("pointerdown",ev=>{
+            if(ev.button!==0&&ev.pointerType!=="touch"&&ev.pointerType!=="pen")return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            showControlsForTwoSeconds(id,{persist:true});
+            resizeSession={
+              pointerId:ev.pointerId,
+              start:canvasPoint(ev),
+              box:cloneBox(c.box),
+              moved:false
+            };
+            try{handle.setPointerCapture(ev.pointerId);}catch(_){}
+            window.addEventListener("pointermove",onResizeMove,true);
+            window.addEventListener("pointerup",stopResize,true);
+            window.addEventListener("pointercancel",stopResize,true);
+          });
+          hit.appendChild(handle);
+          resizeHandles.push(handle);
+        }
+      }
+
+      // Append actions after resize grips so + / delete paint above them.
       hit.appendChild(add);
       hit.appendChild(del);
+      // Acronym toggle/resize UI is secondary-components only.
+      if(componentAllowsAcronymDisplay(c)){
+        hit.appendChild(modeSelect);
+      }
+      layoutComponentActionControls(add,del,c);
       stage.appendChild(hit);
-      overlays.set(id,{hit,add,del,visual});
+      overlays.set(id,{
+        hit,
+        add,
+        del,
+        modeSelect:componentAllowsAcronymDisplay(c)?modeSelect:null,
+        resizeHandles,
+        visual
+      });
     }
 
     for(const c of Object.values(components)){
@@ -5017,12 +6702,41 @@
     }catch(_){}
   }
 
+  function clearLiveComponentDragWindowListeners(){
+    for(const [type,listener] of liveComponentDragWindowListeners){
+      window.removeEventListener(type,listener);
+    }
+    liveComponentDragWindowListeners=[];
+  }
+
   function render(args){
     const incoming=args||{};
     consumeAutoRouteToken(incoming);
     worksheetTools.setManualDraw(!!incoming.manual_draw);
     const revision=String(incoming.render_revision||"");
     const compact=!!incoming.compact_payload;
+
+    // An in-flight component grab owns the stage. Accept payload metadata but
+    // never wipe DOM / rebind listeners mid-drag (that caused first-try stutter).
+    if(liveComponentDrag&&liveComponentDrag.active){
+      if(compact){
+        argsState={...argsState,...incoming,
+          image_b64:argsState.image_b64||"",
+          routes:argsState.routes||[],
+          hotspots:argsState.hotspots||[],
+          components:argsState.components||[]
+        };
+      }else{
+        argsState={...argsState,...incoming,
+          image_b64:incoming.image_b64||argsState.image_b64||"",
+          routes:argsState.routes||incoming.routes||[],
+          hotspots:argsState.hotspots||incoming.hotspots||[],
+          components:argsState.components||incoming.components||[]
+        };
+        if(revision)lastRenderRevision=revision;
+      }
+      return;
+    }
 
     // Streamlit reruns can resend this component dozens of times while the
     // Worksheet visual state itself has not changed. In compact mode Python
@@ -5059,18 +6773,103 @@
     }
     argsState=incoming;
     lastRenderRevision=revision;
+    // Preserve already-mounted edges across rerenders so a new draw/add never
+    // replaces the whole collection. Explicit edge delete is the only remover.
+    // Saved-project freeze: do NOT merge prior-session routes — payload only.
+    const preservedRoutes={};
+    if(!argsState.freeze_saved_geometry){
+      Object.entries(routes||{}).forEach(([id,route])=>{
+        if(!id||!route||route.hidden)return;
+        preservedRoutes[id]={
+          ...route,
+          points:clonePoints(route.points),
+          original_points:clonePoints(route.original_points||route.points)
+        };
+      });
+    }
     routes={};components={};selectedEdge=null;selectedComponents.clear();drag=null;zoom=1;panX=0;panY=0;
     const saved=(argsState.edit_mode&&argsState.editor_state&&Array.isArray(argsState.editor_state.routes)&&Array.isArray(argsState.editor_state.components))?argsState.editor_state:null;
+    if(saved&&saved.viewport&&typeof saved.viewport==="object"){
+      const savedZoom=Number(saved.viewport.zoom);
+      const savedPanX=Number(saved.viewport.pan_x);
+      const savedPanY=Number(saved.viewport.pan_y);
+      if(Number.isFinite(savedZoom))zoom=clamp(savedZoom,.35,4);
+      if(Number.isFinite(savedPanX))panX=savedPanX;
+      if(Number.isFinite(savedPanY))panY=savedPanY;
+    }
     const rr=saved?saved.routes:(argsState.routes||[]),cc=saved?saved.components:(argsState.components||[]);
-    rr.forEach(r=>{const id=String(r.edge_id||"");if(id)routes[id]={...r,edge_id:id,points:clonePoints(r.points),original_points:clonePoints(r.original_points||r.points),hidden:!!r.hidden};});
+    rr.forEach(r=>{
+      const id=String(r.edge_id||r.id||"");
+      if(!id)return;
+      if(connectionPairIsDeleted(r.source,r.target))return;
+      const source=String(r.source||"");
+      const target=String(r.target||"");
+      const sourceHandle=String(r.sourceHandle||r.source_handle||(source?`${source}:auto`:""));
+      const targetHandle=String(r.targetHandle||r.target_handle||(target?`${target}:auto`:""));
+      const next={
+        ...r,
+        edge_id:id,
+        id,
+        source,
+        target,
+        sourceHandle,
+        targetHandle,
+        source_handle:sourceHandle,
+        target_handle:targetHandle,
+        points:clonePoints(r.points),
+        original_points:clonePoints(r.original_points||r.points),
+        hidden:!!r.hidden
+      };
+      routes[id]=next;
+    });
+    // Pure additive merge: keep any prior edge the new payload omitted.
+    // Skipped for Saved freeze so session/topology edges cannot reappear.
+    if(!argsState.freeze_saved_geometry){
+      Object.entries(preservedRoutes).forEach(([id,route])=>{
+        if(!id||routes[id])return;
+        if(connectionPairIsDeleted(route.source,route.target))return;
+        routes[id]=route;
+      });
+    }
     cc.forEach(c=>{const id=String(c.instance_id||"");if(id)components[id]={...c,instance_id:id,box:cloneBox(c.box),hidden:!!c.hidden};});
+    Object.values(routes).forEach(route=>{
+      if(!routePairIsWater(route))return;
+      route.dotted=false;
+      route.color="#123DBD";
+      route.sketch_lock=true;
+    });
     rebuildRouteConnectionIndex();
     if(argsState.drag_only){
-      restoreMovementDraft();
+      seedInternalSensorTransmitterLines();
+      rebuildRouteConnectionIndex();
+      // Saved-project freeze: server payload is the source of truth. Do not
+      // restore a stale browser draft or regenerate water-loop geometry.
+      if(argsState.freeze_saved_geometry){
+        try{
+          const key=movementDraftStorageKey();
+          if(key)sessionStorage.removeItem(key);
+        }catch(_){}
+      }else{
+        restoreMovementDraft();
+      }
       seatInlinePipeSymbols();
       prepareOhtTankSensorAttachments();
       applyClickedOhtSensorEmbeds();
-      separateComponentsFromTanks();
+      if(!argsState.freeze_saved_geometry){
+        separateComponentsFromTanks();
+      }
+      if(!argsState.freeze_saved_geometry){
+        seatInlineDevicesOnOhtDrops();
+        forceDottedOhtTransmitterOntoSensor();
+      }
+      hideEmbeddedOhtSensorRoutes();
+      if(!argsState.freeze_saved_geometry){
+        forceUnifiedFluidHeader();
+        forceBoreSumpReturn();
+      }
+      if(!argsState.freeze_saved_geometry){
+        purgeUnsolicitedDottedRoutes();
+      }
     }
     if(argsState.edit_mode){initialSnapshot=snapshot();history=[JSON.parse(JSON.stringify(initialSnapshot))];historyIndex=0;dirty=false;renderEditor();}
     else if(argsState.drag_only){renderDragOnly();}
