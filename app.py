@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 from collections import Counter
 from functools import lru_cache, wraps
 from pathlib import Path
@@ -55,6 +56,89 @@ from src.renderers import (
     png_to_pdf,
     _manual_asset_for_component,
 )
+import src.project_store as project_store_module
+import src.stable_identity as stable_identity_module
+
+# Streamlit keeps imported modules in sys.modules across reruns. Reload this
+# helper module so newly added exports (e.g. resolve_component_display_mode)
+# are always visible and cannot crash startup with ImportError.
+import importlib
+import sys as _sys
+
+import src as _src_pkg  # noqa: F401  # ensure parent package is present for reload
+_component_display_mod_name = "src.component_display"
+try:
+    if _component_display_mod_name in _sys.modules:
+        _component_display = importlib.reload(
+            _sys.modules[_component_display_mod_name]
+        )
+    else:
+        _component_display = importlib.import_module(_component_display_mod_name)
+    component_acronym_for_name = _component_display.component_acronym_for_name
+    normalize_component_display_mode = (
+        _component_display.normalize_component_display_mode
+    )
+    resolve_component_display_mode = getattr(
+        _component_display,
+        "resolve_component_display_mode",
+        None,
+    )
+    component_allows_acronym_display = getattr(
+        _component_display,
+        "component_allows_acronym_display",
+        None,
+    )
+except Exception:
+    component_acronym_for_name = None
+    normalize_component_display_mode = None
+    resolve_component_display_mode = None
+    component_allows_acronym_display = None
+
+if normalize_component_display_mode is None:
+
+    def normalize_component_display_mode(value: object) -> str:
+        text = str(value or "").strip().lower()
+        if text in {"acronyms", "acronym", "letters", "letter", "symbols", "symbol"}:
+            return "acronyms"
+        return "icons"
+
+if component_allows_acronym_display is None:
+
+    def component_allows_acronym_display(component_name: object) -> bool:
+        name = str(component_name or "").strip()
+        return name not in {
+            "Sump",
+            "Bore Well",
+            "OHT Tank",
+            "OHT Tank with Valve",
+            "OHT Tank without Valve",
+        }
+
+if resolve_component_display_mode is None:
+
+    def resolve_component_display_mode(
+        *candidates: object, component_name: object = None
+    ) -> str:
+        """Inline fallback if a stale module object is still missing the helper."""
+        if component_name is not None and not component_allows_acronym_display(
+            component_name
+        ):
+            return "icons"
+        for value in candidates:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            return normalize_component_display_mode(text)
+        return "icons"
+
+if component_acronym_for_name is None:
+
+    def component_acronym_for_name(component_name: object) -> str:
+        name = str(component_name or "").strip()
+        return name[:3].upper() if name else "?"
+
 from src.ppt_template_manager import (
     fixed_template_signature,
     generate_combined_ppt_from_session,
@@ -289,7 +373,11 @@ def _cached_allowed_connection_options(
     truth. A fresh list is returned by the public wrapper, so no caller can
     mutate the cached tuple.
     """
-    cache = st.session_state.setdefault("_allowed_connection_options_cache", {})
+    # Bump when ALLOWED_CONNECTION_RULES gains append-only entries so sessions
+    # do not keep a stale option list that omits Valve/Flowmeter↔tank pairs.
+    cache = st.session_state.setdefault(
+        "_allowed_connection_options_cache_valve_fm_oht_drop_v3", {}
+    )
     cached = cache.get(selected_names)
     if cached is not None:
         return cached
@@ -328,7 +416,7 @@ def _cached_conservative_allowed_connection_options(
 ) -> tuple:
     """Memoize the unchanged conservative/trained connection expansion."""
     cache = st.session_state.setdefault(
-        "_conservative_allowed_connection_options_cache", {}
+        "_conservative_allowed_connection_options_cache_valve_fm_oht_drop_v3", {}
     )
     cached = cache.get(selected_names)
     if cached is not None:
@@ -428,17 +516,20 @@ st.set_page_config(
 # arrow behavior, component behavior, or renderer styling are changed.
 def _activate_current_connection_router_runtime() -> None:
     global component_catalog_module, get_preview_route_geometry, renderers_module
-    global COMPONENT_CATALOG, build_selected_component_diagram
-    runtime_fix_key = "_connection_router_runtime_orthogonal_candidates_v97"
+    global COMPONENT_CATALOG, build_selected_component_diagram, stable_identity_module
+    runtime_fix_key = "_connection_router_runtime_orthogonal_candidates_v115"
     if st.session_state.get(runtime_fix_key):
         return
 
     try:
+        models_module = importlib.import_module("src.models")
+        importlib.reload(models_module)
         connection_router_module = importlib.import_module("src.connection_router")
         connection_router_module = importlib.reload(connection_router_module)
         topology_module = importlib.import_module("src.topology")
         importlib.reload(topology_module)
         component_catalog_module = importlib.reload(component_catalog_module)
+        stable_identity_module = importlib.reload(stable_identity_module)
         renderers_module = importlib.reload(renderers_module)
 
         # build_edge_routes() resolves this global from src.renderers at call time.
@@ -452,10 +543,21 @@ def _activate_current_connection_router_runtime() -> None:
         )
         for cache_key in (
             "_allowed_connection_options_cache",
+            "_allowed_connection_options_cache_valve_fm_oht_v1",
+            "_allowed_connection_options_cache_valve_fm_map_v2",
+            "_allowed_connection_options_cache_valve_fm_oht_drop_v3",
             "_conservative_allowed_connection_options_cache",
+            "_conservative_allowed_connection_options_cache_valve_fm_oht_v1",
+            "_conservative_allowed_connection_options_cache_valve_fm_map_v2",
+            "_conservative_allowed_connection_options_cache_valve_fm_oht_drop_v3",
             "_allowed_connection_id_set_cache",
         ):
             st.session_state.pop(cache_key, None)
+        try:
+            component_catalog_module._planned_connection_options_cached.cache_clear()
+            component_catalog_module._selected_instances_cached.cache_clear()
+        except Exception:
+            pass
 
         geometry_cache = getattr(
             renderers_module,
@@ -708,6 +810,7 @@ div[data-testid="stElementContainer"]:has(> .mobile-section-anchor) {
     min-height: 42px !important;
     max-height: 42px !important;
     overflow: visible !important;
+    margin-left: 0 !important;
 }
 [class*="st-key-worksheet_dropdown_double_click_rename"] iframe {
     height: 42px !important;
@@ -2031,8 +2134,8 @@ div[role="dialog"],
 /* ============================================================
    FINAL RESPONSIVE SINGLE-SCREEN / NO-SCROLL FIX ONLY
    Current UI design, widths, colors, controls and layout are preserved.
-   The Worksheet size is driven only by the available screen height, never
-   by component count, so selecting components cannot shrink or move it.
+   The Worksheet keeps its standard 700px height, independent of viewport
+   height or component count, so loading a project cannot shrink the canvas.
    ============================================================ */
 
 :root {
@@ -2040,11 +2143,7 @@ div[role="dialog"],
     --rts-footer-space: 38px;
     --rts-toolbar-space: 58px;
     --rts-workspace-height: calc(100dvh - var(--rts-header-space) - var(--rts-footer-space));
-    --rts-worksheet-height: clamp(
-        300px,
-        calc(100dvh - var(--rts-header-space) - var(--rts-footer-space) - var(--rts-toolbar-space)),
-        700px
-    );
+    --rts-worksheet-height: 700px;
 }
 
 html,
@@ -2537,6 +2636,55 @@ div[class*="st-key-direct_component_remove_"] [data-testid^="stBaseButton"] {
    ============================================================ */
 div[data-testid="stHorizontalBlock"]:has(
     [class*="st-key-add_worksheet_button_top"]
+) {
+    align-items: center !important;
+}
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:first-child {
+    display: flex !important;
+    align-items: center !important;
+    overflow: visible !important;
+}
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:first-child [data-testid="stElementContainer"],
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:first-child [data-testid="stMarkdownContainer"] {
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+}
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:first-child .panel-title,
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:first-child .generated-diagram-toolbar-title {
+    margin: 0 !important;
+    padding: 0 8px 0 0 !important;
+    height: 42px !important;
+    line-height: 42px !important;
+    display: flex !important;
+    align-items: center !important;
+    white-space: nowrap !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+}
+/* Keep Worksheet selector clear of the title (no overlap). */
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:nth-child(2) {
+    padding-left: 12px !important;
+    margin-left: 0 !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+}
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
 ) button {
     height: 42px !important;
     min-height: 42px !important;
@@ -2546,6 +2694,77 @@ div[data-testid="stHorizontalBlock"]:has(
     align-items: center !important;
     justify-content: center !important;
     line-height: 1 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+}
+/* Toolbar action icons (Save / Undo / Delete / Zoom / + / PPT): dead-center glyphs. */
+[class*="st-key-save_worksheet_button_"] button,
+[class*="st-key-zoom_in_worksheet_"] button,
+[class*="st-key-worksheet_undo_"] button,
+[class*="st-key-delete_worksheet_button_"] button,
+[class*="st-key-add_worksheet_button_top"] button {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) button > div,
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) button p,
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) button span,
+[class*="st-key-save_worksheet_button_"] button > div,
+[class*="st-key-zoom_in_worksheet_"] button > div,
+[class*="st-key-worksheet_undo_"] button > div,
+[class*="st-key-delete_worksheet_button_"] button > div,
+[class*="st-key-add_worksheet_button_top"] button > div,
+[class*="st-key-save_worksheet_button_"] button p,
+[class*="st-key-zoom_in_worksheet_"] button p,
+[class*="st-key-worksheet_undo_"] button p,
+[class*="st-key-delete_worksheet_button_"] button p,
+[class*="st-key-add_worksheet_button_top"] button p,
+[class*="st-key-save_worksheet_button_"] button span,
+[class*="st-key-zoom_in_worksheet_"] button span,
+[class*="st-key-worksheet_undo_"] button span,
+[class*="st-key-delete_worksheet_button_"] button span,
+[class*="st-key-add_worksheet_button_top"] button span {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    line-height: 1 !important;
+    text-align: center !important;
+}
+/* Generated Diagram Download control: icon-only trigger; keep popover caret/menu. */
+[class*="st-key-top_download_menu_"] [data-testid="stPopover"] > button,
+[class*="st-key-top_download_disabled_"] button {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 2px !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    /* Smaller than the shared 42px toolbar height — Download icon only. */
+    height: 30px !important;
+    min-height: 30px !important;
+    max-height: 30px !important;
+    max-width: 36px !important;
+    width: 36px !important;
+}
+[class*="st-key-top_download_menu_"] [data-testid="stPopover"] > button p,
+[class*="st-key-top_download_disabled_"] button p {
+    display: none !important;
+}
+[class*="st-key-top_download_menu_"] [data-testid="stPopover"] > button svg,
+[class*="st-key-top_download_disabled_"] button svg {
+    width: 16px !important;
+    height: 16px !important;
+    margin: 0 !important;
 }
 [class*="st-key-manual_draw_toolbar_"] button {
     width: 100% !important;
@@ -2564,6 +2783,24 @@ div[data-testid="stHorizontalBlock"]:has(
 }
 [class*="st-key-manual_draw_toolbar_"] button[kind="primary"] {
     box-shadow: inset 0 0 0 2px #ffffff !important;
+}
+/* Tighten only the gap between Manual Draw and Download. */
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:has([class*="st-key-manual_draw_toolbar_"]) {
+    padding-right: 0 !important;
+}
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:has([class*="st-key-top_download_menu_"]),
+div[data-testid="stHorizontalBlock"]:has(
+    [class*="st-key-add_worksheet_button_top"]
+) > [data-testid="stColumn"]:has([class*="st-key-top_download_disabled_"]) {
+    margin-left: -14px !important;
+    padding-left: 0 !important;
+    display: flex !important;
+    justify-content: flex-start !important;
+    align-items: center !important;
 }
 
 /* ============================================================
@@ -2587,37 +2824,29 @@ div[data-testid="stHorizontalBlock"]:has(
 }
 
 /* ============================================================
-   RIGHT-SIDE GENERATED DIAGRAM WIDTH EXPANSION ONLY
-   - Keeps the left column and its three current 80% section widths unchanged.
-   - Reclaims only the unused 20% portion of the left column for the right panel.
-   - Preserves the existing Streamlit small gap between the visible panels.
-   - Height, vertical alignment, controls, styling and functionality are unchanged.
+   LEFT SIDEBAR ↔ RIGHT CANVAS GAP RESTORE
+   The prior right-panel pull (negative margin / >100% width) collapsed the
+   horizontal space between the component palette and the diagram workspace.
+   Keep each column in its Streamlit slot so the natural gap is restored.
    ============================================================ */
 @media (min-width: 769px) {
     [data-testid="stHorizontalBlock"]:has(.mobile-left-marker):has(.mobile-center-marker)
     > [data-testid="stColumn"]:last-child
     > [data-testid="stVerticalBlock"] {
-        margin-left: calc(-10.2% + 14px) !important;
-        width: 110.2% !important;
-        max-width: 110.2% !important;
+        margin-left: 0 !important;
+        width: 100% !important;
+        max-width: 100% !important;
         box-sizing: border-box !important;
     }
 
-    /* Visibility fix only: the expanded right panel crosses its original
-       Streamlit column boundary.  Every parent wrapper on that exact right-side
-       path must allow horizontal overflow; otherwise Streamlit clips the left
-       edge even though the panel width itself is correct.  No width, position,
-       height, spacing, styling or functionality is changed here. */
-    [data-testid="stHorizontalBlock"]:has(.mobile-left-marker):has(.mobile-center-marker),
+    /* Keep a clear gutter between the left palette column and right canvas. */
     [data-testid="stHorizontalBlock"]:has(.mobile-left-marker):has(.mobile-center-marker)
-    > [data-testid="stColumn"]:last-child,
+    > [data-testid="stColumn"]:first-child {
+        padding-right: 10px !important;
+    }
     [data-testid="stHorizontalBlock"]:has(.mobile-left-marker):has(.mobile-center-marker)
-    > [data-testid="stColumn"]:last-child > div,
-    [data-testid="stHorizontalBlock"]:has(.mobile-left-marker):has(.mobile-center-marker)
-    > [data-testid="stColumn"]:last-child [data-testid="stVerticalBlockBorderWrapper"],
-    [data-testid="stHorizontalBlock"]:has(.mobile-left-marker):has(.mobile-center-marker)
-    > [data-testid="stColumn"]:last-child [data-testid="stVerticalBlock"] {
-        overflow: visible !important;
+    > [data-testid="stColumn"]:last-child {
+        padding-left: 10px !important;
     }
 }
 
@@ -3898,28 +4127,79 @@ div[data-baseweb="popover"] {
     background: #0b4f8a !important;
     background-color: #0b4f8a !important;
 }
-[class*="st-key-saved_worksheet_ppt_selector_"] input,
-[class*="st-key-saved_worksheet_ppt_selector_"] [data-baseweb="select"] span {
+/* Full exact project name inside the fixed Saved box (size unchanged). */
+[class*="st-key-saved_worksheet_ppt_selector_"] input {
     font-family: Inter, "Segoe UI", Arial, sans-serif !important;
     font-size: 11px !important;
     line-height: 18px !important;
     color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
-    text-align: center !important;
+    text-align: left !important;
+    white-space: nowrap !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    text-overflow: clip !important;
+    max-width: 100% !important;
 }
-[class*="st-key-saved_worksheet_ppt_selector_"] [data-baseweb="select"] > div > div:first-child {
-    justify-content: center !important;
-    text-align: center !important;
-}
+[class*="st-key-saved_worksheet_ppt_selector_"] [data-baseweb="select"] span,
 [class*="st-key-saved_worksheet_ppt_selector_"] [data-baseweb="select"] > div > div:first-child > div {
+    font-family: Inter, "Segoe UI", Arial, sans-serif !important;
+    font-size: 11px !important;
+    line-height: 1.15 !important;
     color: #ffffff !important;
     -webkit-text-fill-color: #ffffff !important;
-    font-size: 11px !important;
-    text-align: center !important;
+    text-align: left !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    text-overflow: clip !important;
+    max-width: 100% !important;
+    max-height: 100% !important;
+    hyphens: none !important;
+}
+[class*="st-key-saved_worksheet_ppt_selector_"] [data-baseweb="select"] > div > div:first-child {
+    justify-content: flex-start !important;
+    align-items: flex-start !important;
+    text-align: left !important;
+    overflow-x: hidden !important;
+    overflow-y: auto !important;
+    min-width: 0 !important;
+    flex: 1 1 auto !important;
 }
 [class*="st-key-saved_worksheet_ppt_selector_"] svg {
     width: 12px !important;
     height: 12px !important;
+}
+
+/* Saved open-menu names only: keep container size unchanged; make labels readable. */
+body:has([class*="st-key-saved_worksheet_ppt_selector_"] [aria-expanded="true"])
+[data-baseweb="popover"] [role="listbox"],
+body:has([class*="st-key-saved_worksheet_ppt_selector_"] [aria-expanded="true"])
+[data-baseweb="popover"] [role="listbox"] [role="option"],
+body:has([class*="st-key-saved_worksheet_ppt_selector_"] [aria-expanded="true"])
+[data-baseweb="popover"] [role="listbox"] [role="option"] * {
+    color: #0f172a !important;
+    -webkit-text-fill-color: #0f172a !important;
+    opacity: 1 !important;
+}
+body:has([class*="st-key-saved_worksheet_ppt_selector_"] [aria-expanded="true"])
+[data-baseweb="popover"] [role="listbox"] [role="option"] {
+    background-color: #ffffff !important;
+    font-size: 13px !important;
+    line-height: 1.35 !important;
+    white-space: nowrap !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+}
+body:has([class*="st-key-saved_worksheet_ppt_selector_"] [aria-expanded="true"])
+[data-baseweb="popover"] [role="listbox"] [role="option"]:hover,
+body:has([class*="st-key-saved_worksheet_ppt_selector_"] [aria-expanded="true"])
+[data-baseweb="popover"] [role="listbox"] [role="option"][aria-selected="true"] {
+    background-color: #e8f1fb !important;
+    color: #0f172a !important;
+    -webkit-text-fill-color: #0f172a !important;
 }
 
 /* Saved-project delete control only. */
@@ -5996,9 +6276,16 @@ components.html(
     // Worksheet loading indicator is allowed to start.
     const option = target.closest('[role="option"]');
     if (option && Date.now() <= state.selectArmedUntil) {
+      const connectionChoice = state.connectionConfigAwaitingChoice;
       state.connectionConfigAwaitingChoice = false;
-      showOverlay(true);
       state.selectArmedUntil = 0;
+      // Required-connection choices update the canvas in this same script run.
+      // Starting the worksheet loader here keeps it spinning across that update.
+      if (connectionChoice) {
+        hideOverlay();
+      } else {
+        showOverlay(true);
+      }
     }
   }, { capture: true, signal });
 
@@ -6242,15 +6529,23 @@ components.html(
       node.style.setProperty("max-width", "none", "important");
     }
 
-    // Preserve the existing option appearance; change only clipping behavior.
+    // Visibility only: full unclipped names with readable contrast.
     for (const option of options) {
       option.style.setProperty("white-space", "nowrap", "important");
       option.style.setProperty("overflow", "visible", "important");
       option.style.setProperty("text-overflow", "clip", "important");
+      option.style.setProperty("color", "#0f172a", "important");
+      option.style.setProperty("-webkit-text-fill-color", "#0f172a", "important");
+      option.style.setProperty("opacity", "1", "important");
+      option.style.setProperty("font-size", "13px", "important");
+      option.style.setProperty("background-color", "#ffffff", "important");
       for (const child of option.querySelectorAll("*")) {
         child.style.setProperty("white-space", "nowrap", "important");
         child.style.setProperty("overflow", "visible", "important");
         child.style.setProperty("text-overflow", "clip", "important");
+        child.style.setProperty("color", "#0f172a", "important");
+        child.style.setProperty("-webkit-text-fill-color", "#0f172a", "important");
+        child.style.setProperty("opacity", "1", "important");
       }
     }
   }
@@ -6599,6 +6894,7 @@ WORKSHEET_OUTPUT_KEYS = (
 # Transmitter and Repeater are selectable here; the Distance + Interference
 # rule can still add the communication chain when that rule applies.
 REQUIREMENT_COMPONENT_OPTION_PREFIX = "requirement_component::"
+CONNECTION_CONTROL_PLACEHOLDER = "__select_connection_or_control__"
 PROTECTED_WIRELESS_AUTO_COMPONENTS = {"Master"}
 REQUIREMENT_OPTION_DISPLAY_NAMES = {
     "Flush Flow Meter": "Pluse Flow meter",
@@ -6633,6 +6929,10 @@ DEFAULT_REQUIREMENT_OPTION_LABELS = {
 }
 
 
+def _connection_control_widget_key(worksheet_id: int) -> str:
+    return f"connection_config_target_{int(worksheet_id)}"
+
+
 def _requirement_component_option_id(component_name: str) -> str:
     return f"{REQUIREMENT_COMPONENT_OPTION_PREFIX}{component_name}"
 
@@ -6660,7 +6960,7 @@ def _sanitize_requirement_components(values) -> list[str]:
 
 def _new_worksheet(worksheet_id: int, number: int) -> dict:
     """Create one blank worksheet without changing any diagram functionality."""
-    return {
+    return stable_identity_module.ensure_worksheet_identity({
         "id": worksheet_id,
         "name": f"Worksheet {number}",
         "selected_components": [],
@@ -6672,11 +6972,26 @@ def _new_worksheet(worksheet_id: int, number: int) -> dict:
         "preview_png": None,
         "pdf_bytes": None,
         "processed_hash": None,
-    }
+    })
+
+
+def _queue_latest_saved_project_restore_if_needed() -> None:
+    """Fresh start stays empty: never auto-load a saved project/components.
+
+    Explicit SAVED-dropdown restore still stages ``_pending_saved_project_restore``
+    via ``_restore_saved_worksheet_ppt`` and is applied separately.
+    """
+    if st.session_state.get("_startup_layout_restore_attempted"):
+        return
+    st.session_state["_startup_layout_restore_attempted"] = True
+    # Intentionally do not scan pickle/Postgres for a default project.
 
 
 def ensure_worksheet_state() -> None:
     """Initialize the multi-worksheet container with the existing first worksheet."""
+    _queue_latest_saved_project_restore_if_needed()
+    # Apply only an explicitly staged restore (SAVED dropdown), never an
+    # automatic newest-project hydrate.
     _apply_pending_saved_project_restore_if_needed()
 
     # Finish deletion cleanup before any worksheet-specific widgets are created in
@@ -6738,6 +7053,23 @@ def ensure_worksheet_state() -> None:
         sheet.setdefault("selected_connections", [])
         sheet.setdefault("connection_transport_settings", {})
         sheet.setdefault("inline_flow_meter_settings", {})
+        stable_identity_module.ensure_worksheet_identity(sheet)
+        _commit_identity_result(
+            int(sheet.get("id") or 0),
+            sheet,
+            stable_identity_module.sync_worksheet_identities(
+                sheet,
+                list(sheet.get("selected_components") or []),
+                list(sheet.get("selected_connections") or []),
+            ),
+        )
+
+    st.session_state["site_project"] = stable_identity_module.refresh_site_worksheet_index(
+        stable_identity_module.ensure_site_project(
+            st.session_state.get("site_project")
+        ),
+        worksheets,
+    )
 
     valid_ids = [sheet["id"] for sheet in worksheets]
     if not valid_ids:
@@ -6814,6 +7146,21 @@ def load_active_worksheet_state() -> None:
             st.session_state.pop(key, None)
         else:
             st.session_state[key] = value
+
+
+def _trigger_saved_project_canvas_refresh(worksheet_ids) -> None:
+    """Advance the live canvas revision after a saved worksheet is restored."""
+    for raw_id in list(worksheet_ids or []):
+        try:
+            worksheet_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        key = f"_saved_project_canvas_refresh_generation_{worksheet_id}"
+        try:
+            generation = int(st.session_state.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            generation = 0
+        st.session_state[key] = generation + 1
 
 
 _ANNOTATION_COLORS = {
@@ -7216,7 +7563,7 @@ def _consume_pending_annotation_updates(worksheet_id: int) -> None:
     """Store a note change before this run draws the worksheet."""
     worksheet_id = int(worksheet_id)
     for view_key in ("inline", "expanded"):
-        surface_key = f"diagram_normal_surface_{worksheet_id}_{view_key}"
+        surface_key = _diagram_normal_surface_key(worksheet_id, view_key)
         event = st.session_state.get(surface_key)
         if (
             not isinstance(event, dict)
@@ -7248,9 +7595,244 @@ def _on_annotation_color_picked(worksheet_id: int) -> None:
         _replace_worksheet_annotations(worksheet_id, notes)
 
 
+def _commit_identity_result(worksheet_id: int, sheet: dict, result: dict) -> None:
+    """Write legacy-id rewrites back into the existing worksheet maps.
+
+    No rewrite is applied when the permanent-id sync did not renumber or
+    remove a node. Worksheet switching keys stay on the integer worksheet id.
+    """
+    worksheet_id = int(worksheet_id)
+    if not dict(result.get("renames") or {}) and not list(result.get("removed_node_ids") or []):
+        return
+    active = int(st.session_state.get("active_worksheet_id") or 0) == worksheet_id
+    if active:
+        connection_ids = list(st.session_state.get("selected_connections", []) or [])
+        transport = dict(st.session_state.get("connection_transport_settings", {}) or {})
+        inline_settings = dict(st.session_state.get("inline_flow_meter_settings", {}) or {})
+    else:
+        connection_ids = list(sheet.get("selected_connections") or [])
+        transport = dict(sheet.get("connection_transport_settings") or {})
+        inline_settings = dict(sheet.get("inline_flow_meter_settings") or {})
+    try:
+        canvas_sheet = dict(_canvas_component_sheet(worksheet_id, publish=False) or {})
+    except Exception:
+        canvas_sheet = {}
+    mapped = stable_identity_module.apply_runtime_identity_maps(
+        result,
+        selected_connections=connection_ids,
+        connection_transport_settings=transport,
+        route_overrides=dict(
+            st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}
+        ),
+        component_overrides=dict(
+            st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+        ),
+        deleted_connection_ids=list(
+            st.session_state.get(_deleted_connection_ids_key(worksheet_id), []) or []
+        ),
+        explicit_connection_ids=list(
+            st.session_state.get(_explicit_user_connection_ids_key(worksheet_id), []) or []
+        ),
+        oht_sensor_embeds=list(
+            st.session_state.get(f"oht_sensor_embeds_{worksheet_id}") or []
+        ),
+        manual_draw_pairs=dict(
+            st.session_state.get(f"_manual_draw_pairs_{worksheet_id}", {}) or {}
+        ),
+        canvas_components=canvas_sheet,
+        inline_flow_meter_settings=inline_settings,
+    )
+    if not mapped.get("changed"):
+        return
+    # Keep every active pair that does not use a node this sync removed.
+    # A rename that already rewrote the id is left as the rewritten value.
+    removed_node_ids = {
+        str(node_id)
+        for node_id in list(result.get("removed_node_ids") or [])
+        if str(node_id or "").strip()
+    }
+    renames = {
+        str(old_id): str(new_id)
+        for old_id, new_id in dict(result.get("renames") or {}).items()
+        if str(old_id or "").strip() and str(new_id or "").strip()
+    }
+    kept_connections = [str(item) for item in list(mapped["selected_connections"]) if str(item or "").strip()]
+    seen_connections = set(kept_connections)
+    for raw_connection_id in connection_ids:
+        connection_id = str(raw_connection_id or "").strip()
+        if not connection_id or connection_id in seen_connections:
+            continue
+        if any(
+            _connection_mentions_component(connection_id, node_id)
+            for node_id in removed_node_ids
+        ):
+            continue
+        renamed_connection_id = stable_identity_module.rewrite_connection_like(
+            connection_id,
+            renames,
+        )
+        keep_id = str(renamed_connection_id or connection_id).strip()
+        if not keep_id or keep_id in seen_connections:
+            continue
+        kept_connections.append(keep_id)
+        seen_connections.add(keep_id)
+    mapped["selected_connections"] = kept_connections
+    sheet["selected_connections"] = list(mapped["selected_connections"])
+    sheet["connection_transport_settings"] = dict(mapped["connection_transport_settings"])
+    sheet["inline_flow_meter_settings"] = dict(mapped["inline_flow_meter_settings"])
+    if active:
+        st.session_state["selected_connections"] = list(mapped["selected_connections"])
+        st.session_state["connection_transport_settings"] = dict(
+            mapped["connection_transport_settings"]
+        )
+        st.session_state["inline_flow_meter_settings"] = dict(
+            mapped["inline_flow_meter_settings"]
+        )
+    st.session_state[_manual_connection_overrides_key(worksheet_id)] = dict(
+        mapped["route_overrides"]
+    )
+    st.session_state[_manual_component_overrides_key(worksheet_id)] = dict(
+        mapped["component_overrides"]
+    )
+    st.session_state[_deleted_connection_ids_key(worksheet_id)] = list(
+        mapped["deleted_connection_ids"]
+    )
+    st.session_state[_explicit_user_connection_ids_key(worksheet_id)] = list(
+        mapped["explicit_connection_ids"]
+    )
+    st.session_state[f"oht_sensor_embeds_{worksheet_id}"] = list(
+        mapped["oht_sensor_embeds"]
+    )
+    st.session_state[f"_manual_draw_pairs_{worksheet_id}"] = dict(
+        mapped["manual_draw_pairs"]
+    )
+    registry = _canvas_component_registry()
+    registry["by_worksheet"][str(worksheet_id)] = dict(mapped["canvas_components"])
+    if int(registry.get("active_worksheet_id") or -1) == worksheet_id:
+        registry["components"] = dict(mapped["canvas_components"])
+    st.session_state["canvas_components"] = registry
+
+
+def _connection_master_key(worksheet_id: int) -> str:
+    return f"connection_master_{int(worksheet_id)}"
+
+
+def _connection_master(worksheet_id: int) -> dict:
+    stored = st.session_state.get(_connection_master_key(worksheet_id))
+    return dict(stored) if isinstance(stored, dict) else {}
+
+
+def _remember_connection_record(worksheet_id: int, connection_id: str) -> None:
+    """Index one connection by its id. Other entries in the master map stay."""
+    connection_id = str(connection_id or "").strip()
+    if not connection_id:
+        return
+    master = _connection_master(worksheet_id)
+    record = dict(master.get(connection_id) or {})
+    record["connection_id"] = connection_id
+    master[connection_id] = record
+    st.session_state[_connection_master_key(worksheet_id)] = master
+
+
+def _forget_connection_records(worksheet_id: int, *connection_ids: str) -> None:
+    master = _connection_master(worksheet_id)
+    for raw_id in connection_ids:
+        connection_id = str(raw_id or "").strip()
+        if not connection_id:
+            continue
+        master.pop(connection_id, None)
+        if connection_id.startswith("edge__"):
+            master.pop(connection_id[6:], None)
+        else:
+            master.pop(f"edge__{connection_id}", None)
+    st.session_state[_connection_master_key(worksheet_id)] = master
+
+
+def _restore_connection_master(worksheet_id: int) -> list[str]:
+    """Union the master map back into the active connection list.
+
+    A later component move or new line must append. It must not replace this
+    map with a new array that drops Sensor-to-Transmitter or Sump-to-OHT.
+    """
+    worksheet_id = int(worksheet_id)
+    deleted = {
+        str(value)
+        for value in st.session_state.get(_deleted_connection_ids_key(worksheet_id), [])
+        or []
+    }
+    master = _connection_master(worksheet_id)
+    current: list[str] = []
+    seen: set[str] = set()
+    for raw_id in list(st.session_state.get("selected_connections") or []):
+        connection_id = str(raw_id or "").strip()
+        if (
+            not connection_id
+            or connection_id in seen
+            or connection_id in deleted
+            or f"edge__{connection_id}" in deleted
+        ):
+            continue
+        seen.add(connection_id)
+        current.append(connection_id)
+        record = dict(master.get(connection_id) or {})
+        record["connection_id"] = connection_id
+        master[connection_id] = record
+    for connection_id in list(master):
+        if connection_id in deleted or f"edge__{connection_id}" in deleted:
+            master.pop(connection_id, None)
+            continue
+        if connection_id not in seen:
+            current.append(connection_id)
+            seen.add(connection_id)
+    st.session_state[_connection_master_key(worksheet_id)] = master
+    st.session_state["selected_connections"] = current
+    return current
+
+
+def _append_selected_connection(
+    worksheet_id: int,
+    connection_id: str,
+    *,
+    remember: bool = True,
+) -> bool:
+    """Immutably append one connection id. Never replaces or filters the list."""
+    worksheet_id = int(worksheet_id)
+    connection_id = str(connection_id or "").strip()
+    if not connection_id:
+        return False
+    existing = [
+        str(item).strip()
+        for item in list(st.session_state.get("selected_connections", []) or [])
+        if str(item or "").strip()
+    ]
+    if connection_id in existing:
+        if remember:
+            _remember_connection_record(worksheet_id, connection_id)
+            _remember_explicit_user_connection(worksheet_id, connection_id)
+        return False
+    st.session_state["selected_connections"] = [*existing, connection_id]
+    _mark_saved_diagram_user_edit(worksheet_id)
+    transport_settings = dict(
+        st.session_state.get("connection_transport_settings", {}) or {}
+    )
+    transport_settings.setdefault(
+        connection_id,
+        _default_connection_transport_setting(),
+    )
+    st.session_state["connection_transport_settings"] = transport_settings
+    if remember:
+        _remember_connection_record(worksheet_id, connection_id)
+        _remember_explicit_user_connection(worksheet_id, connection_id)
+    return True
+
+
 def persist_active_worksheet_state() -> None:
     """Save the current legacy state keys back into the active worksheet."""
     sheet = get_active_worksheet()
+    worksheet_id = int(sheet.get("id") or 0)
+    geometry_only = bool(st.session_state.pop("_persist_geometry_only", False))
+    if not geometry_only:
+        _restore_connection_master(worksheet_id)
     sheet["selected_components"] = list(
         st.session_state.get("selected_components", []) or []
     )
@@ -7266,9 +7848,90 @@ def persist_active_worksheet_state() -> None:
     sheet["inline_flow_meter_settings"] = dict(
         st.session_state.get("inline_flow_meter_settings", {}) or {}
     )
-    sheet["annotations"] = _worksheet_annotations(int(sheet.get("id") or 0))
+    sheet["annotations"] = _worksheet_annotations(worksheet_id)
     for key in WORKSHEET_OUTPUT_KEYS:
         sheet[key] = st.session_state.get(key)
+    stable_identity_module.ensure_worksheet_identity(sheet)
+    # Geometry-only persists (component drag) must not touch identity/connection
+    # maps. A component delete already removed that id and its own links.
+    if not geometry_only:
+        removed_legacy_ids = [
+            str(node_id).strip()
+            for node_id in list(
+                st.session_state.pop("_pending_removed_legacy_ids", None) or []
+            )
+            if str(node_id or "").strip()
+        ]
+        removed_occurrence = st.session_state.pop("_pending_removed_occurrence", None)
+        if removed_legacy_ids:
+            _commit_identity_result(
+                worksheet_id,
+                sheet,
+                stable_identity_module.sync_worksheet_identities(
+                    sheet,
+                    list(sheet.get("selected_components") or []),
+                    list(sheet.get("selected_connections") or []),
+                    removed_legacy_ids=removed_legacy_ids,
+                ),
+            )
+        elif isinstance(removed_occurrence, tuple) and len(removed_occurrence) == 2:
+            _commit_identity_result(
+                worksheet_id,
+                sheet,
+                stable_identity_module.sync_worksheet_identities(
+                    sheet,
+                    list(sheet.get("selected_components") or []),
+                    list(sheet.get("selected_connections") or []),
+                    removed_occurrence=(
+                        str(removed_occurrence[0] or ""),
+                        int(removed_occurrence[1]),
+                    ),
+                ),
+            )
+        elif not st.session_state.get("_skip_connection_identity_sync"):
+            _commit_identity_result(
+                worksheet_id,
+                sheet,
+                stable_identity_module.sync_worksheet_identities(
+                    sheet,
+                    list(sheet.get("selected_components") or []),
+                    list(sheet.get("selected_connections") or []),
+                ),
+            )
+    else:
+        st.session_state.pop("_pending_removed_legacy_ids", None)
+        st.session_state.pop("_pending_removed_occurrence", None)
+    # Stamp live canvas boxes + display modes onto identity rows so project
+    # saves keep geometry and presentation even if a caller omits the
+    # auxiliary override map.
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+    if overrides and isinstance(sheet.get("component_instances"), list):
+        stamped = []
+        for item in sheet["component_instances"]:
+            if not isinstance(item, dict):
+                continue
+            record = dict(item)
+            node_id = str(record.get("legacy_node_id") or "")
+            override = overrides.get(node_id)
+            if isinstance(override, dict):
+                box = override.get("box")
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    try:
+                        record["box"] = [float(value) for value in box]
+                        record["position"] = {
+                            "x": float(box[0]) + float(box[2]) / 2.0,
+                            "y": float(box[1]) + float(box[3]) / 2.0,
+                        }
+                    except (TypeError, ValueError):
+                        pass
+                if override.get("display_mode") is not None:
+                    record["display_mode"] = normalize_component_display_mode(
+                        override.get("display_mode")
+                    )
+            stamped.append(record)
+        sheet["component_instances"] = stamped
 
 
 def add_worksheet() -> None:
@@ -8649,19 +9312,41 @@ def _commit_component_editor_state(editor_key: str, worksheet_id: int) -> None:
 
     # Keep only connection intents whose exact instance endpoints still exist.
     # Newly available connections are intentionally left unchecked, preserving
-    # the existing 2A behavior.
+    # the existing 2A behavior. Never auto-add saved PostgreSQL connections.
     valid_option_ids = {option.id for option in allowed_connection_options(merged_selected)}
+    live_ids = _live_component_node_ids(merged_selected)
     st.session_state["selected_connections"] = [
         connection_id
         for connection_id in list(st.session_state.get("selected_connections", []) or [])
         if connection_id in valid_option_ids
+        or (
+            (ends := _explicit_pair_endpoints(connection_id)) is not None
+            and ends[0] in live_ids
+            and ends[1] in live_ids
+        )
     ]
+    # Sync identities for the new selection, then place any PG-saved boxes.
+    try:
+        active_sheet = get_active_worksheet()
+        _commit_identity_result(
+            int(worksheet_id),
+            active_sheet,
+            stable_identity_module.sync_worksheet_identities(
+                active_sheet,
+                list(merged_selected),
+                list(st.session_state.get("selected_connections") or []),
+            ),
+        )
+        _apply_saved_pg_positions_for_live_components(int(worksheet_id))
+    except Exception as exc:
+        log_app_error("Apply saved positions after component select", exc)
+    kept_connection_ids = set(st.session_state["selected_connections"])
     st.session_state["connection_transport_settings"] = {
         connection_id: _sanitize_connection_transport_setting(config)
         for connection_id, config in dict(
             st.session_state.get("connection_transport_settings", {}) or {}
         ).items()
-        if connection_id in valid_option_ids
+        if connection_id in kept_connection_ids
     }
 
     # Save the whole collection once; downstream generation then processes the
@@ -10008,6 +10693,22 @@ def _add_component_instance_from_worksheet(
     # Force only the existing diagram generation gate to see this Worksheet
     # component change even when the compact manual selection itself is unchanged.
     st.session_state.pop("processed_hash", None)
+    # Keep already-placed cards where they are when a secondary component is added.
+    _lock_visible_component_positions(active_worksheet_id)
+    try:
+        active_sheet = get_active_worksheet()
+        _commit_identity_result(
+            int(active_worksheet_id),
+            active_sheet,
+            stable_identity_module.sync_worksheet_identities(
+                active_sheet,
+                list(st.session_state.get("selected_components") or []),
+                list(st.session_state.get("selected_connections") or []),
+            ),
+        )
+        _apply_saved_pg_positions_for_live_components(int(active_worksheet_id))
+    except Exception as exc:
+        log_app_error("Apply saved positions after worksheet component add", exc)
     persist_active_worksheet_state()
     return True
 
@@ -10042,6 +10743,9 @@ def _worksheet_undo_snapshot(worksheet_id: int) -> dict:
         "deleted_connection_ids": list(
             st.session_state.get(_deleted_connection_ids_key(worksheet_id), []) or []
         ),
+        "deleted_connection_pairs": list(
+            st.session_state.get(_deleted_connection_pairs_key(worksheet_id), []) or []
+        ),
         "route_overrides": dict(
             st.session_state.get(_manual_connection_overrides_key(worksheet_id), {})
             or {}
@@ -10060,6 +10764,12 @@ def _worksheet_undo_snapshot(worksheet_id: int) -> dict:
             st.session_state.get(f"_manual_draw_pairs_{worksheet_id}", {}) or {}
         ),
         "canvas_components": dict(sheet),
+        "component_instances": list(
+            get_active_worksheet().get("component_instances") or []
+        ),
+        "connection_identities": list(
+            get_active_worksheet().get("connection_identities") or []
+        ),
     }
     return json.loads(json.dumps(payload))
 
@@ -10158,6 +10868,9 @@ def _undo_last_worksheet_deletion(worksheet_id: int) -> None:
     st.session_state[_deleted_connection_ids_key(worksheet_id)] = list(
         snapshot.get("deleted_connection_ids") or []
     )
+    st.session_state[_deleted_connection_pairs_key(worksheet_id)] = list(
+        snapshot.get("deleted_connection_pairs") or []
+    )
     st.session_state[_manual_connection_overrides_key(worksheet_id)] = dict(
         snapshot.get("route_overrides") or {}
     )
@@ -10173,6 +10886,18 @@ def _undo_last_worksheet_deletion(worksheet_id: int) -> None:
     st.session_state[f"_manual_draw_pairs_{worksheet_id}"] = dict(
         snapshot.get("manual_draw_pairs") or {}
     )
+
+    active_sheet = get_active_worksheet()
+    if int(active_sheet.get("id") or 0) == worksheet_id:
+        if "component_instances" in snapshot:
+            active_sheet["component_instances"] = list(
+                snapshot.get("component_instances") or []
+            )
+        if "connection_identities" in snapshot:
+            active_sheet["connection_identities"] = list(
+                snapshot.get("connection_identities") or []
+            )
+        stable_identity_module.ensure_worksheet_identity(active_sheet)
 
     registry = _canvas_component_registry()
     sheet = dict(snapshot.get("canvas_components") or {})
@@ -10217,22 +10942,22 @@ def _delete_component_instance_from_worksheet(
 
     _push_worksheet_undo_snapshot(active_worksheet_id)
 
-    # The compact left panel intentionally rebuilds selected_components from
-    # Sump/Bore/OHT plus explicit requirements. On a later rerun an automatic
-    # visible component can therefore be present in the diagram but absent from
-    # selected_components. Rehydrate only the current rendered component names
-    # for this delete operation so the existing exact-instance delete function
-    # can perform its normal connection/settings cleanup.
+    # The compact left panel can omit an automatic component that is still
+    # drawn. Add only the clicked type so one occurrence can be removed.
+    # The rest of the component list stays as it is.
     selected_now = list(st.session_state.get("selected_components", []) or [])
     if component_name not in selected_now:
-        diagram_selected = []
-        for node in (getattr(diagram, "nodes", []) or []):
-            resolved_name = _component_name_from_diagram_node(node)
-            if resolved_name:
-                diagram_selected.append(resolved_name)
-
-        if component_name in diagram_selected:
-            st.session_state["selected_components"] = diagram_selected
+        # The clicked component can be on the canvas without a matching entry
+        # in the compact list. Add only that type so the exact-instance delete
+        # can remove one occurrence. Do not replace the rest of the list.
+        diagram_count = sum(
+            1
+            for node in (getattr(diagram, "nodes", []) or [])
+            if _component_name_from_diagram_node(node) == component_name
+        )
+        if diagram_count:
+            selected_now.extend([component_name] * diagram_count)
+            st.session_state["selected_components"] = selected_now
 
     before_requirements = set(
         _sanitize_requirement_components(
@@ -10301,18 +11026,16 @@ def _duplicate_component_instance(active_worksheet_id: int, component_name: str)
     st.session_state["selected_components"] = selected
     st.session_state["_manual_component_selection_changed"] = True
 
-    new_options = allowed_connection_options(selected)
-    new_option_ids = {option.id for option in new_options}
-    st.session_state["selected_connections"] = [
-        connection_id
-        for connection_id in old_required_ids
-        if connection_id in new_option_ids
-    ]
+    retained_connection_ids = _retain_live_connections(old_required_ids, selected)
+    retained_connection_id_set = set(retained_connection_ids)
+    st.session_state["selected_connections"] = retained_connection_ids
     st.session_state["connection_transport_settings"] = {
         connection_id: _sanitize_connection_transport_setting(config)
         for connection_id, config in old_transport.items()
-        if connection_id in new_option_ids
+        if connection_id in retained_connection_id_set
+        or _connection_id_endpoints(str(connection_id)) is None
     }
+    _lock_visible_component_positions(active_worksheet_id)
 
     # st.data_editor retains prior widget state. Rotate only the component editor
     # key so Qty immediately reflects the extra instance while every other widget
@@ -10327,6 +11050,21 @@ def _duplicate_component_instance(active_worksheet_id: int, component_name: str)
     st.session_state[
         f"_fast_worksheet_component_change_{int(active_worksheet_id)}"
     ] = True
+
+    try:
+        active_sheet = get_active_worksheet()
+        _commit_identity_result(
+            int(active_worksheet_id),
+            active_sheet,
+            stable_identity_module.sync_worksheet_identities(
+                active_sheet,
+                list(selected),
+                list(st.session_state.get("selected_connections") or []),
+            ),
+        )
+        _apply_saved_pg_positions_for_live_components(int(active_worksheet_id))
+    except Exception as exc:
+        log_app_error("Apply saved positions after component duplicate", exc)
 
     persist_active_worksheet_state()
     return True
@@ -10352,6 +11090,170 @@ def _add_direct_component_instance(
     ) + 1
 
 
+def _connection_endpoint_ids(value: str) -> tuple[str, str] | None:
+    """Return exact source/target component instance ids for a connection key."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    body = text.removeprefix("edge__")
+    parsed = stable_identity_module.parse_legacy_connection_id(body)
+    if isinstance(parsed, dict):
+        source = str(parsed.get("source") or "").strip()
+        target = str(parsed.get("target") or "").strip()
+        if source and target:
+            return source, target
+    ends = _connection_id_endpoints(body)
+    if ends is not None:
+        source, target = str(ends[0] or "").strip(), str(ends[1] or "").strip()
+        # rule_N__source__to__target can be mis-parsed as ("N__source", target).
+        if source and target and "__" in source and source.split("__", 1)[0].isdigit():
+            source = source.split("__", 1)[1]
+        if source and target:
+            return source, target
+    if "|" in body:
+        left, right = body.split("|", 1)
+        source, target = left.strip(), right.strip()
+        if source and target and source != target:
+            return source, target
+    return None
+
+
+def _connection_mentions_component(value: str, component_id: str) -> bool:
+    """True only when this exact component instance id is a connection endpoint.
+
+    Never match generic type names (``LLS``) or sibling indices (``lls_1`` when
+    deleting ``lls_2``). Substring / type-based matching is rejected.
+    """
+    component_id = str(component_id or "").strip()
+    text = str(value or "").strip()
+    if not component_id or not text:
+        return False
+    if text in {component_id, f"edge__{component_id}"}:
+        return True
+    ends = _connection_endpoint_ids(text)
+    if ends is not None and component_id in ends:
+        return True
+    # Last resort: structured rule_/pair_ parser only (no substring heuristics).
+    return bool(stable_identity_module.connection_uses_node(text, {component_id}))
+
+
+def _component_instance_node_ids(component_names, component_name: str) -> list[str]:
+    """Node ids of one component type, in instance order, before it is removed."""
+    wanted = str(component_name or "").strip()
+    node_ids: list[str] = []
+    for instance in component_catalog_module._selected_instances(list(component_names or [])):
+        if str(getattr(getattr(instance, "definition", None), "name", "") or "") != wanted:
+            continue
+        node_id = str(getattr(instance, "node_id", "") or "").strip()
+        if node_id:
+            node_ids.append(node_id)
+    return node_ids
+
+
+def _drop_links_for_component_ids(worksheet_id: int, component_ids) -> None:
+    """Remove links whose exact source/target instance id was deleted.
+
+    Filtering is immutable (new lists/dicts). Unrelated pairs — including other
+    instances of the same type — stay untouched.
+    """
+    worksheet_id = int(worksheet_id)
+    banned = {
+        str(component_id).strip()
+        for component_id in list(component_ids or [])
+        if str(component_id or "").strip()
+    }
+    if not banned:
+        return
+
+    def attaches_to_banned(value) -> bool:
+        ends = _connection_endpoint_ids(str(value or ""))
+        if ends is not None:
+            return ends[0] in banned or ends[1] in banned
+        return any(
+            _connection_mentions_component(str(value or ""), component_id)
+            for component_id in banned
+        )
+
+    current_ids = list(st.session_state.get("selected_connections", []) or [])
+    st.session_state["selected_connections"] = [
+        connection_id
+        for connection_id in current_ids
+        if not attaches_to_banned(connection_id)
+    ]
+
+    master = _connection_master(worksheet_id)
+    st.session_state[_connection_master_key(worksheet_id)] = {
+        connection_id: dict(record)
+        for connection_id, record in master.items()
+        if not attaches_to_banned(connection_id)
+    }
+
+    transport = dict(st.session_state.get("connection_transport_settings", {}) or {})
+    st.session_state["connection_transport_settings"] = {
+        connection_id: dict(config) if isinstance(config, dict) else config
+        for connection_id, config in transport.items()
+        if not attaches_to_banned(connection_id)
+    }
+
+    explicit_key = _explicit_user_connection_ids_key(worksheet_id)
+    st.session_state[explicit_key] = [
+        connection_id
+        for connection_id in list(st.session_state.get(explicit_key, []) or [])
+        if not attaches_to_banned(connection_id)
+    ]
+
+    canvas_registry = _canvas_component_registry()
+    canvas_sheet = dict(_canvas_component_sheet(worksheet_id, publish=False) or {})
+    visible_components = canvas_registry.get("components")
+    next_sheet = {
+        component_id: dict(record) if isinstance(record, dict) else record
+        for component_id, record in canvas_sheet.items()
+        if str(component_id) not in banned
+    }
+    registry = _canvas_component_registry()
+    registry["by_worksheet"][str(worksheet_id)] = next_sheet
+    if isinstance(visible_components, dict) and int(
+        registry.get("active_worksheet_id") or -1
+    ) == worksheet_id:
+        registry["components"] = next_sheet
+    st.session_state["canvas_components"] = registry
+
+    override_key = _manual_component_overrides_key(worksheet_id)
+    component_overrides = dict(st.session_state.get(override_key, {}) or {})
+    st.session_state[override_key] = {
+        component_id: dict(record) if isinstance(record, dict) else record
+        for component_id, record in component_overrides.items()
+        if str(component_id) not in banned
+    }
+
+    route_key = _manual_connection_overrides_key(worksheet_id)
+    route_overrides = dict(st.session_state.get(route_key, {}) or {})
+    next_routes = {}
+    for route_id, route in route_overrides.items():
+        source = target = ""
+        if isinstance(route, dict):
+            source = str(route.get("source") or "").strip()
+            target = str(route.get("target") or "").strip()
+        # Exact endpoint match only — never drop by route_id substring/type.
+        if source in banned or target in banned:
+            continue
+        if not source and not target and attaches_to_banned(route_id):
+            continue
+        next_routes[route_id] = dict(route) if isinstance(route, dict) else route
+    st.session_state[route_key] = next_routes
+
+    embed_key = f"oht_sensor_embeds_{worksheet_id}"
+    st.session_state[embed_key] = [
+        dict(item)
+        for item in list(st.session_state.get(embed_key) or [])
+        if isinstance(item, dict)
+        and str(item.get("tank_id") or "") not in banned
+        and str(item.get("sensor_id") or "") not in banned
+    ]
+    st.session_state[f"_preserve_component_layout_{worksheet_id}"] = True
+    st.session_state["_skip_connection_identity_sync"] = True
+
+
 def _decrement_direct_component_instance(
     active_worksheet_id: int,
     component_name: str,
@@ -10367,24 +11269,14 @@ def _decrement_direct_component_instance(
         _discard_latest_undo_snapshot(active_worksheet_id)
         return
 
+    removed_node_ids = _component_instance_node_ids(selected, component_name)
+    removed_node_id = removed_node_ids[-1] if removed_node_ids else ""
     selected.pop(matching_positions[-1])
     st.session_state["selected_components"] = selected
     st.session_state["_manual_component_selection_changed"] = True
-
-    valid_options = allowed_connection_options(selected)
-    valid_connection_ids = {option.id for option in valid_options}
-    st.session_state["selected_connections"] = [
-        connection_id
-        for connection_id in list(st.session_state.get("selected_connections", []) or [])
-        if connection_id in valid_connection_ids
-    ]
-    st.session_state["connection_transport_settings"] = {
-        connection_id: _sanitize_connection_transport_setting(config)
-        for connection_id, config in dict(
-            st.session_state.get("connection_transport_settings", {}) or {}
-        ).items()
-        if connection_id in valid_connection_ids
-    }
+    if removed_node_id:
+        st.session_state["_pending_removed_legacy_ids"] = [removed_node_id]
+    _drop_links_for_component_ids(active_worksheet_id, [removed_node_id])
 
     flow_data = inline_flow_meter_placement_options(selected)
     valid_meter_ids = {
@@ -10427,6 +11319,7 @@ def _remove_compact_selected_connection(
     if updated_connections == selected_connections:
         return
     st.session_state["selected_connections"] = updated_connections
+    _mark_saved_diagram_user_edit(int(active_worksheet_id))
     generation_key = f"connection_picker_generation_{active_worksheet_id}"
     st.session_state[generation_key] = int(
         st.session_state.get(generation_key, 0) or 0
@@ -10452,9 +11345,16 @@ def _remove_direct_component_type(
         return
 
     _push_worksheet_undo_snapshot(active_worksheet_id)
+    removed_node_ids = _component_instance_node_ids(selected, component_name)
     selected = [name for name in selected if name != component_name]
     st.session_state["selected_components"] = selected
     st.session_state["_manual_component_selection_changed"] = True
+    st.session_state["_pending_removed_legacy_ids"] = [
+        str(node_id).strip()
+        for node_id in removed_node_ids
+        if str(node_id or "").strip()
+    ]
+    _drop_links_for_component_ids(active_worksheet_id, removed_node_ids)
 
     # Keep the existing requirement list consistent if a component type is ever
     # shared with the requirement selector in a future catalog revision.
@@ -10465,26 +11365,6 @@ def _remove_direct_component_type(
         st.session_state["selected_requirement_components"] = [
             name for name in requirement_components if name != component_name
         ]
-
-    # Preserve every still-valid connection and transport choice exactly as the
-    # existing component-delete path does.
-    valid_options = allowed_connection_options(selected)
-    valid_connection_ids = {option.id for option in valid_options}
-
-    st.session_state["selected_connections"] = [
-        connection_id
-        for connection_id in list(
-            st.session_state.get("selected_connections", []) or []
-        )
-        if connection_id in valid_connection_ids
-    ]
-    st.session_state["connection_transport_settings"] = {
-        connection_id: _sanitize_connection_transport_setting(config)
-        for connection_id, config in dict(
-            st.session_state.get("connection_transport_settings", {}) or {}
-        ).items()
-        if connection_id in valid_connection_ids
-    }
 
     flow_data = inline_flow_meter_placement_options(selected)
     valid_meter_ids = {
@@ -10569,6 +11449,14 @@ def _delete_component_instance(
 
     selected.pop(selected_positions[occurrence_index])
     st.session_state["selected_components"] = selected
+    # Keep the post-delete selection through the compact palette rebuild. Without
+    # this flag the palette collapses to base+requirements only and identity sync
+    # then treats auto-added SMC/LLS/etc. as removed — wiping unrelated links.
+    st.session_state["_manual_component_selection_changed"] = True
+    # Exact instance id only (lls_2), never an occurrence index that can drop lls_1.
+    st.session_state["_pending_removed_legacy_ids"] = [instance_id]
+    st.session_state.pop("_pending_removed_occurrence", None)
+    _drop_links_for_component_ids(active_worksheet_id, [instance_id])
 
     # If this component came from the default 2A requirement/control list, remove
     # that requirement only when its final instance is deleted.  This prevents a
@@ -10582,28 +11470,6 @@ def _delete_component_instance(
             name for name in requirement_components if name != component_name
         ]
         st.session_state["selected_requirement_components"] = requirement_components
-
-    # Keep only connection intents that are still valid after the exact component
-    # instance is removed. This prevents orphaned lines while leaving unrelated
-    # component connections untouched.
-    valid_options = allowed_connection_options(selected)
-    valid_connection_ids = {option.id for option in valid_options}
-
-    st.session_state["selected_connections"] = [
-        connection_id
-        for connection_id in list(
-            st.session_state.get("selected_connections", []) or []
-        )
-        if connection_id in valid_connection_ids
-    ]
-
-    st.session_state["connection_transport_settings"] = {
-        connection_id: _sanitize_connection_transport_setting(config)
-        for connection_id, config in dict(
-            st.session_state.get("connection_transport_settings", {}) or {}
-        ).items()
-        if connection_id in valid_connection_ids
-    }
 
     # Remove only stale inline-flow-meter settings if the deleted instance changes
     # the available meter instances.
@@ -10654,60 +11520,172 @@ def _delete_component_instance(
     return True
 
 
-def _apply_connection_delete_state(worksheet_id: int, edge_id: str, diagram) -> bool:
-    """Remove one connection before any same-rerun diagram generation occurs."""
+def _deleted_connection_pairs_key(worksheet_id: int) -> str:
+    return f"deleted_connection_pairs_{int(worksheet_id)}"
+
+
+def _sorted_connection_pair(source_id: str, target_id: str) -> str:
+    ends = tuple(sorted((str(source_id or "").strip(), str(target_id or "").strip())))
+    if not ends[0] or not ends[1] or ends[0] == ends[1]:
+        return ""
+    return f"{ends[0]}|{ends[1]}"
+
+
+def _deleted_connection_pair_set(worksheet_id: int) -> set[str]:
+    return {
+        str(value)
+        for value in st.session_state.get(_deleted_connection_pairs_key(worksheet_id), [])
+        or []
+        if str(value or "").strip()
+    }
+
+
+def _remember_deleted_connection_pair(worksheet_id: int, source_id: str, target_id: str) -> None:
+    pair = _sorted_connection_pair(source_id, target_id)
+    if not pair:
+        return
+    pairs = _deleted_connection_pair_set(worksheet_id)
+    pairs.add(pair)
+    st.session_state[_deleted_connection_pairs_key(worksheet_id)] = sorted(pairs)
+
+
+def _connection_pair_is_deleted(worksheet_id: int, source_id: str, target_id: str) -> bool:
+    pair = _sorted_connection_pair(source_id, target_id)
+    return bool(pair) and pair in _deleted_connection_pair_set(worksheet_id)
+
+
+def _forget_deleted_connection_pair(worksheet_id: int, source_id: str, target_id: str) -> None:
+    pair = _sorted_connection_pair(source_id, target_id)
+    if not pair:
+        return
+    pairs = _deleted_connection_pair_set(worksheet_id)
+    if pair not in pairs:
+        return
+    pairs.discard(pair)
+    st.session_state[_deleted_connection_pairs_key(worksheet_id)] = sorted(pairs)
+
+
+def _apply_connection_delete_state(
+    worksheet_id: int,
+    edge_id: str,
+    diagram,
+    source_id: str = "",
+    target_id: str = "",
+) -> bool:
+    """Remove one connection from the worksheet and from PostgreSQL."""
+    worksheet_id = int(worksheet_id)
     edge_id = str(edge_id or "").strip()
-    if not edge_id or diagram is None or not hasattr(diagram, "edges"):
+    if not edge_id:
         return False
 
-    valid_edge_ids = {
-        str(getattr(edge, "id", "") or "")
-        for edge in (getattr(diagram, "edges", []) or [])
-    }
-    if edge_id not in valid_edge_ids:
-        return False
+    option_id = edge_id[6:] if edge_id.startswith("edge__") else edge_id
+    removed_edge = None
+    if diagram is not None and hasattr(diagram, "edges"):
+        removed_edge = next(
+            (
+                edge
+                for edge in list(getattr(diagram, "edges", []) or [])
+                if str(getattr(edge, "id", "") or "") in {edge_id, option_id, f"edge__{option_id}"}
+            ),
+            None,
+        )
+    overrides_key = _manual_connection_overrides_key(worksheet_id)
+    route_overrides = dict(st.session_state.get(overrides_key, {}) or {})
+    stored = route_overrides.get(edge_id) or route_overrides.get(option_id) or route_overrides.get(
+        f"edge__{option_id}"
+    )
+    if not isinstance(stored, dict):
+        stored = {}
+    source_id = str(
+        source_id
+        or stored.get("source")
+        or (getattr(removed_edge, "source", "") if removed_edge is not None else "")
+        or ""
+    ).strip()
+    target_id = str(
+        target_id
+        or stored.get("target")
+        or (getattr(removed_edge, "target", "") if removed_edge is not None else "")
+        or ""
+    ).strip()
+    if edge_id.startswith("internal_sensor_tx__"):
+        sensor_id, _, transmitter_id = edge_id[len("internal_sensor_tx__"):].partition("__")
+        source_id = source_id or sensor_id
+        target_id = target_id or transmitter_id
+    elif edge_id.startswith("sketch_loop__"):
+        body = edge_id[len("sketch_loop__"):]
+        left, separator, right = body.partition("__")
+        if separator:
+            source_id = source_id or left
+            target_id = target_id or right
 
     _snapshot_before_connection_delete(worksheet_id, edge_id, diagram)
 
-    diagram.edges = [
-        edge
-        for edge in list(getattr(diagram, "edges", []) or [])
-        if str(getattr(edge, "id", "") or "") != edge_id
-    ]
+    # Strict id scoping: remove only the exact target edge id (plus its
+    # edge__/bare alias for the same logical key). Never cascade by type/pair.
+    target_edge_ids = {edge_id}
+    if option_id and option_id != edge_id:
+        target_edge_ids.add(option_id)
+        target_edge_ids.add(f"edge__{option_id}")
+    if diagram is not None and hasattr(diagram, "edges"):
+        diagram.edges = [
+            edge
+            for edge in list(getattr(diagram, "edges", []) or [])
+            if str(getattr(edge, "id", "") or "") not in target_edge_ids
+        ]
 
-    option_id = edge_id.removeprefix("edge__")
+    removed_ids = set(target_edge_ids)
+    _forget_connection_records(worksheet_id, *removed_ids)
     st.session_state["selected_connections"] = [
         connection_id
-        for connection_id in list(
-            st.session_state.get("selected_connections", []) or []
-        )
-        if str(connection_id) not in {edge_id, option_id}
+        for connection_id in list(st.session_state.get("selected_connections", []) or [])
+        if str(connection_id) not in removed_ids
     ]
-
+    _mark_saved_diagram_user_edit(int(worksheet_id))
     deleted_ids = {
         str(value)
-        for value in st.session_state.get(
-            _deleted_connection_ids_key(worksheet_id), []
-        )
+        for value in st.session_state.get(_deleted_connection_ids_key(worksheet_id), [])
         or []
     }
-    deleted_ids.update({edge_id, option_id})
-    st.session_state[_deleted_connection_ids_key(worksheet_id)] = sorted(
-        deleted_ids
-    )
+    deleted_ids.update(removed_ids)
+    st.session_state[_deleted_connection_ids_key(worksheet_id)] = sorted(deleted_ids)
+    _remember_deleted_connection_pair(worksheet_id, source_id, target_id)
 
-    transport_settings = dict(
-        st.session_state.get("connection_transport_settings", {}) or {}
-    )
-    transport_settings.pop(option_id, None)
-    transport_settings.pop(edge_id, None)
+    transport_settings = dict(st.session_state.get("connection_transport_settings", {}) or {})
+    for removed_id in removed_ids:
+        transport_settings.pop(removed_id, None)
     st.session_state["connection_transport_settings"] = transport_settings
 
-    overrides_key = _manual_connection_overrides_key(worksheet_id)
-    route_overrides = dict(st.session_state.get(overrides_key, {}) or {})
-    route_overrides.pop(edge_id, None)
+    for removed_id in list(removed_ids):
+        route_overrides.pop(removed_id, None)
     st.session_state[overrides_key] = route_overrides
+    pair_key = f"_manual_draw_pairs_{worksheet_id}"
+    pairs = dict(st.session_state.get(pair_key, {}) or {})
+    if source_id and target_id:
+        pairs.pop(f"{source_id}|{target_id}", None)
+        pairs.pop(f"{target_id}|{source_id}", None)
+        st.session_state[pair_key] = pairs
+    _forget_explicit_user_connection(worksheet_id, *removed_ids)
+    _release_deleted_oht_sensor_embed(worksheet_id, source_id, target_id, edge_id)
+
+    sheet = get_active_worksheet()
+    if int(sheet.get("id") or 0) == worksheet_id:
+        sheet["connection_identities"] = [
+            item
+            for item in list(sheet.get("connection_identities") or [])
+            if str((item or {}).get("legacy_id") or "") not in removed_ids
+        ]
+        sheet["selected_connections"] = list(st.session_state.get("selected_connections") or [])
+        try:
+            project_store_module.delete_connection_geometry(
+                worksheet_stable_id=str(sheet.get("stable_id") or ""),
+                legacy_edge_id=edge_id,
+            )
+        except Exception as exc:
+            log_app_error("Connection delete", exc)
+
     st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
+    st.session_state.pop(f"_worksheet_render_bundle_cache_{worksheet_id}", None)
     persist_active_worksheet_state()
     _mark_worksheet_render_sync_pending(worksheet_id)
     _mark_ppt_sync_pending(worksheet_id)
@@ -10769,6 +11747,120 @@ def _canvas_component_signature(worksheet_id: int) -> str:
     return "|".join(rows)
 
 
+def _worksheet_component_display_mode_key(worksheet_id: int) -> str:
+    return f"component_display_mode_{int(worksheet_id)}"
+
+
+def _apply_worksheet_component_display_mode(worksheet_id: int, mode: object) -> None:
+    """Apply the toolbar Icons/Acronyms choice to every component on the sheet.
+
+    Does not write the toolbar widget key itself. That key is owned by
+    ``st.segmented_control`` and must not be mutated after the widget renders.
+    """
+    worksheet_id = int(worksheet_id)
+    display_mode = normalize_component_display_mode(mode)
+    sheet = _canvas_component_sheet(worksheet_id, publish=False)
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+    node_ids = set(str(node_id) for node_id in sheet) | set(
+        str(node_id) for node_id in overrides
+    )
+    for node_id in node_ids:
+        if not node_id:
+            continue
+        existing = dict(overrides.get(node_id) or {})
+        previous = dict(sheet.get(node_id) or {})
+        component_name = existing.get("component") or previous.get("component") or ""
+        # Never push acronym mode onto Sump / Bore Well / OHT Tank.
+        existing["display_mode"] = resolve_component_display_mode(
+            display_mode,
+            component_name=component_name,
+        )
+        overrides[node_id] = existing
+        live = dict(sheet.get(node_id) or {})
+        live["id"] = node_id
+        live["display_mode"] = display_mode
+        sheet[node_id] = live
+    st.session_state[_manual_component_overrides_key(worksheet_id)] = overrides
+    _canvas_component_sheet(worksheet_id, publish=True)
+    _mark_worksheet_render_sync_pending(worksheet_id)
+    _mark_ppt_sync_pending(worksheet_id)
+
+
+def _on_toolbar_component_display_mode_change(worksheet_id: int) -> None:
+    """Streamlit on_change handler for the Icons/Acronyms toolbar control."""
+    worksheet_id = int(worksheet_id)
+    mode = normalize_component_display_mode(
+        st.session_state.get(_worksheet_component_display_mode_key(worksheet_id))
+    )
+    _apply_worksheet_component_display_mode(worksheet_id, mode)
+
+
+def _record_component_display_mode(worksheet_id: int, event: dict) -> bool:
+    """Persist one component's icon/acronym display choice with its placement."""
+    worksheet_id = int(worksheet_id)
+    instance_id = str(event.get("instance_id", "") or "").strip()
+    if not instance_id:
+        return False
+    sheet = _canvas_component_sheet(worksheet_id, publish=False)
+    component_overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+    previous = dict(sheet.get(instance_id) or {})
+    existing = dict(component_overrides.get(instance_id) or {})
+    component_name = (
+        event.get("component")
+        or existing.get("component")
+        or previous.get("component")
+        or ""
+    )
+    # Sump / Bore Well / OHT Tank never persist as acronym boxes.
+    display_mode = resolve_component_display_mode(
+        event.get("display_mode"),
+        component_name=component_name,
+    )
+    existing["display_mode"] = display_mode
+    if previous.get("box") is not None and "box" not in existing:
+        box = _valid_canvas_box(previous.get("box"))
+        if box is not None:
+            existing["box"] = list(box)
+            existing["x"] = box[0] + (box[2] / 2.0)
+            existing["y"] = box[1] + (box[3] / 2.0)
+    if previous.get("component") and "component" not in existing:
+        existing["component"] = previous.get("component")
+    component_overrides[instance_id] = existing
+    previous["id"] = instance_id
+    previous["display_mode"] = display_mode
+    if existing.get("box") is not None:
+        previous["box"] = list(existing["box"])
+        previous["x"] = existing.get("x", previous.get("x"))
+        previous["y"] = existing.get("y", previous.get("y"))
+    sheet[instance_id] = previous
+    _canvas_component_sheet(worksheet_id, publish=True)
+    st.session_state[_manual_component_overrides_key(worksheet_id)] = component_overrides
+    st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
+    st.session_state["_skip_connection_identity_sync"] = True
+    st.session_state["_persist_geometry_only"] = True
+    try:
+        persist_active_worksheet_state()
+    finally:
+        st.session_state.pop("_skip_connection_identity_sync", None)
+        st.session_state.pop("_persist_geometry_only", None)
+    active_sheet = get_active_worksheet()
+    if int(active_sheet.get("id") or 0) == worksheet_id:
+        try:
+            project_store_module.save_component_placements(
+                worksheet_stable_id=str(active_sheet.get("stable_id") or ""),
+                placements={instance_id: dict(existing)},
+            )
+        except Exception as exc:
+            log_app_error("Component display mode save", exc)
+    _mark_worksheet_render_sync_pending(worksheet_id)
+    _mark_ppt_sync_pending(worksheet_id)
+    return True
+
+
 def _record_canvas_component_moves(worksheet_id: int, event: dict, diagram=None) -> bool:
     """Store the dropped box of every moved component in the shared registry."""
     worksheet_id = int(worksheet_id)
@@ -10794,6 +11886,7 @@ def _record_canvas_component_moves(worksheet_id: int, event: dict, diagram=None)
     component_overrides = dict(
         st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
     )
+    moved_ids: set[str] = set()
     changed = False
     for raw_move in raw_moves:
         if not isinstance(raw_move, dict):
@@ -10802,7 +11895,25 @@ def _record_canvas_component_moves(worksheet_id: int, event: dict, diagram=None)
         box = _valid_canvas_box(raw_move.get("box"))
         if not instance_id or box is None:
             continue
+        moved_ids.add(instance_id)
+        if instance_id in {
+            sensor_id for _tank_id, sensor_id in _embedded_oht_sensor_pairs(worksheet_id)
+        }:
+            continue
         previous = dict(sheet.get(instance_id) or {})
+        existing = dict(component_overrides.get(instance_id) or {})
+        component_name = (
+            raw_move.get("component")
+            or existing.get("component")
+            or previous.get("component")
+            or ""
+        )
+        display_mode = resolve_component_display_mode(
+            existing.get("display_mode"),
+            previous.get("display_mode"),
+            raw_move.get("display_mode"),
+            component_name=component_name,
+        )
         record = {
             "id": instance_id,
             "type": (
@@ -10814,15 +11925,98 @@ def _record_canvas_component_moves(worksheet_id: int, event: dict, diagram=None)
             "y": box[1] + (box[3] / 2.0),
             "box": box,
             "moved": True,
+            "display_mode": display_mode,
         }
         sheet[instance_id] = record
-        existing = dict(component_overrides.get(instance_id) or {})
         existing["box"] = list(box)
         existing["x"] = record["x"]
         existing["y"] = record["y"]
+        existing["display_mode"] = display_mode
         existing.pop("hidden", None)
         component_overrides[instance_id] = existing
         changed = True
+
+    moved_routes = event.get("moved_routes")
+    updated_routes: dict[str, dict] = {}
+    if isinstance(moved_routes, list) and moved_ids:
+        diagram_edges = {
+            str(getattr(edge, "id", "") or ""): edge
+            for edge in (getattr(diagram, "edges", []) or [])
+        }
+        route_overrides = dict(
+            st.session_state.get(
+                _manual_connection_overrides_key(worksheet_id), {}
+            )
+            or {}
+        )
+        for raw_route in moved_routes:
+            if not isinstance(raw_route, dict):
+                continue
+            edge_id = str(raw_route.get("edge_id", "") or "").strip()
+            source_id = str(raw_route.get("source", "") or "").strip()
+            target_id = str(raw_route.get("target", "") or "").strip()
+            raw_points = raw_route.get("points")
+            if (
+                not edge_id
+                or not source_id
+                or not target_id
+                or not ({source_id, target_id} & moved_ids)
+                or not isinstance(raw_points, (list, tuple))
+                or len(raw_points) < 2
+            ):
+                continue
+            matched_edge = diagram_edges.get(edge_id)
+            if matched_edge is None:
+                bare_id = edge_id[6:] if edge_id.startswith("edge__") else edge_id
+                matched_edge = diagram_edges.get(bare_id) or diagram_edges.get(
+                    f"edge__{bare_id}"
+                )
+            if matched_edge is not None:
+                edge_source = str(getattr(matched_edge, "source", "") or "")
+                edge_target = str(getattr(matched_edge, "target", "") or "")
+                if {source_id, target_id} != {edge_source, edge_target}:
+                    continue
+                source_id, target_id = edge_source, edge_target
+            elif edge_id not in route_overrides and not edge_id.startswith(
+                "internal_sensor_tx__"
+            ):
+                continue
+            try:
+                points = [
+                    [float(point[0]), float(point[1])]
+                    for point in raw_points
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ]
+            except (TypeError, ValueError):
+                continue
+            if len(points) < 2 or any(
+                not math.isfinite(value) for point in points for value in point
+            ):
+                continue
+            existing_route = dict(
+                route_overrides.get(edge_id)
+                or route_overrides.get(
+                    f"edge__{edge_id}"
+                    if not edge_id.startswith("edge__")
+                    else edge_id[6:]
+                )
+                or {}
+            )
+            existing_route.update(
+                {
+                    "source": source_id,
+                    "target": target_id,
+                    "points": points,
+                    "mode": "manual_drag",
+                }
+            )
+            route_overrides[edge_id] = existing_route
+            updated_routes[edge_id] = existing_route
+        if updated_routes:
+            st.session_state[
+                _manual_connection_overrides_key(worksheet_id)
+            ] = route_overrides
+            changed = True
 
     if not changed:
         return False
@@ -10830,14 +12024,41 @@ def _record_canvas_component_moves(worksheet_id: int, event: dict, diagram=None)
     _canvas_component_sheet(worksheet_id, publish=True)
     st.session_state[_manual_component_overrides_key(worksheet_id)] = component_overrides
     st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
-    persist_active_worksheet_state()
+    # Persist boxes and only the attached route geometry reported for this drag.
+    # Never filter, reset, or rebuild the global connection/edge collections.
+    st.session_state["_skip_connection_identity_sync"] = True
+    st.session_state["_persist_geometry_only"] = True
+    try:
+        persist_active_worksheet_state()
+    finally:
+        st.session_state.pop("_skip_connection_identity_sync", None)
+        st.session_state.pop("_persist_geometry_only", None)
+    # Persist moved boxes to PostgreSQL when the worksheet already exists there.
+    sheet = get_active_worksheet()
+    if int(sheet.get("id") or 0) == int(worksheet_id):
+        placements = {
+            node_id: dict(raw)
+            for node_id, raw in component_overrides.items()
+            if isinstance(raw, dict) and isinstance(raw.get("box"), (list, tuple))
+        }
+        if placements:
+            try:
+                project_store_module.save_component_placements(
+                    worksheet_stable_id=str(sheet.get("stable_id") or ""),
+                    placements=placements,
+                )
+                _clear_persisted_component_placement_cache(worksheet_id)
+            except Exception as exc:
+                log_app_error("Component placement save", exc)
+    for edge_id, route in updated_routes.items():
+        _persist_manual_route_geometry(worksheet_id, edge_id, route)
     _mark_worksheet_render_sync_pending(worksheet_id)
     _mark_ppt_sync_pending(worksheet_id)
     return True
 
 
 def _merge_moved_canvas_boxes(diagram, worksheet_id: int, component_overrides: dict) -> dict:
-    """Route from the live registry position of every component the user has moved."""
+    """Route from the live registry position of every saved or moved component."""
     sheet = _canvas_component_sheet(int(worksheet_id), publish=False)
     result = dict(component_overrides or {})
     valid_ids = {
@@ -10845,8 +12066,17 @@ def _merge_moved_canvas_boxes(diagram, worksheet_id: int, component_overrides: d
         for node in (getattr(diagram, "nodes", []) or [])
         if str(getattr(node, "node_type", "") or "") != "junction"
     }
+    embedded_sensor_ids = {
+        sensor_id for _tank_id, sensor_id in _embedded_oht_sensor_pairs(int(worksheet_id))
+    }
     for node_id, record in list(sheet.items()):
-        if node_id not in valid_ids or not isinstance(record, dict) or not record.get("moved"):
+        if node_id in embedded_sensor_ids:
+            continue
+        if node_id not in valid_ids or not isinstance(record, dict):
+            continue
+        # Saved / restored placements are authoritative even when the user never
+        # dragged after reopen (moved may still be true from freeze-on-save).
+        if not bool(record.get("moved") or record.get("restored")):
             continue
         box = _valid_canvas_box(record.get("box"))
         if box is None:
@@ -10855,15 +12085,26 @@ def _merge_moved_canvas_boxes(diagram, worksheet_id: int, component_overrides: d
         existing["box"] = list(box)
         existing["x"] = float(record.get("x") or (box[0] + box[2] / 2.0))
         existing["y"] = float(record.get("y") or (box[1] + box[3] / 2.0))
+        existing["moved"] = True
+        if record.get("restored") or existing.get("restored"):
+            existing["restored"] = True
+        # Keep Acronym Box / Icon mode when merging live registry boxes.
+        if existing.get("display_mode") is None and record.get("display_mode") is not None:
+            existing["display_mode"] = normalize_component_display_mode(
+                record.get("display_mode")
+            )
         existing.pop("hidden", None)
         result[node_id] = existing
     return result
 
 
 def _sync_canvas_components(diagram, worksheet_id: int, box_map: dict) -> dict:
-    """Register every visible component, keeping a dragged position authoritative."""
+    """Register every visible component, keeping a saved/dragged position authoritative."""
     worksheet_id = int(worksheet_id)
     sheet = _canvas_component_sheet(worksheet_id, publish=False)
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
     live_ids = set()
     for node in getattr(diagram, "nodes", []) or []:
         node_id = str(getattr(node, "id", "") or "")
@@ -10872,12 +12113,26 @@ def _sync_canvas_components(diagram, worksheet_id: int, box_map: dict) -> dict:
             continue
         live_ids.add(node_id)
         previous = dict(sheet.get(node_id) or {})
+        override = dict(overrides.get(node_id) or {})
         try:
             component_name = str(_component_name_from_diagram_node(node) or "")
         except Exception:
             component_name = str(previous.get("component") or "")
-        live_box = _valid_canvas_box(previous.get("box")) if previous.get("moved") else None
+        keep_saved = bool(
+            previous.get("moved")
+            or previous.get("restored")
+            or override.get("moved")
+            or override.get("restored")
+        )
+        live_box = _valid_canvas_box(previous.get("box")) if keep_saved else None
+        if live_box is None and keep_saved:
+            live_box = _valid_canvas_box(override.get("box"))
         layout_box = _valid_canvas_box(box_map.get(node_id))
+        display_mode = resolve_component_display_mode(
+            override.get("display_mode"),
+            previous.get("display_mode"),
+            component_name=component_name,
+        )
         if live_box is not None:
             previous["id"] = node_id
             previous["type"] = node_type or str(previous.get("type") or "")
@@ -10886,6 +12141,9 @@ def _sync_canvas_components(diagram, worksheet_id: int, box_map: dict) -> dict:
             previous["y"] = live_box[1] + (live_box[3] / 2.0)
             previous["box"] = live_box
             previous["moved"] = True
+            previous["display_mode"] = display_mode
+            if previous.get("restored") or override.get("restored"):
+                previous["restored"] = True
             sheet[node_id] = previous
             box_map[node_id] = list(live_box)
             continue
@@ -10899,6 +12157,7 @@ def _sync_canvas_components(diagram, worksheet_id: int, box_map: dict) -> dict:
             "y": layout_box[1] + (layout_box[3] / 2.0),
             "box": list(layout_box),
             "moved": False,
+            "display_mode": display_mode,
         }
     for stale_id in list(sheet):
         if stale_id not in live_ids:
@@ -10930,6 +12189,219 @@ def _embedded_oht_sensor_pairs(worksheet_id: int) -> list[tuple[str, str]]:
         if tank_id and sensor_id:
             pairs.append((tank_id, sensor_id))
     return pairs
+
+
+def _lock_visible_component_positions(worksheet_id: int) -> None:
+    """Freeze the current worksheet layout before a control selection reruns.
+
+    Dragged and already-placed boxes live in ``canvas_components`` and
+    ``manual_component_overrides_{worksheet_id}``. Manual polylines stay in
+    ``manual_connection_overrides_{worksheet_id}``. Nested OHT sensors are
+    left to the tank pin so that connection still draws the sensor inside
+    the tank.
+    """
+    _freeze_worksheet_layout_for_persistence(worksheet_id, mark_restored=False)
+
+
+def _freeze_worksheet_layout_for_persistence(
+    worksheet_id: int,
+    *,
+    mark_restored: bool = True,
+) -> None:
+    """Write every visible canvas box into overrides so Save/reopen keeps it.
+
+    Undragged auto-layout boxes are included. Without this, Save only persisted
+    overrides that already existed (usually from a drag), and reopen fell back
+    to catalog presets.
+    """
+    worksheet_id = int(worksheet_id)
+    sheet = _canvas_component_sheet(worksheet_id, publish=False)
+    embedded_sensor_ids = {
+        sensor_id for _tank_id, sensor_id in _embedded_oht_sensor_pairs(worksheet_id)
+    }
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+
+    def _apply_box(node_id: str, box, *, component: str = "", node_type: str = "") -> None:
+        existing = dict(overrides.get(node_id) or {})
+        live = dict(sheet.get(node_id) or {})
+        display_mode = resolve_component_display_mode(
+            existing.get("display_mode"),
+            live.get("display_mode"),
+            component_name=component
+            or existing.get("component")
+            or live.get("component")
+            or "",
+        )
+        existing["box"] = list(box)
+        existing["x"] = float(box[0] + box[2] / 2.0)
+        existing["y"] = float(box[1] + box[3] / 2.0)
+        existing["moved"] = True
+        existing["display_mode"] = display_mode
+        if mark_restored:
+            existing["restored"] = True
+        if component:
+            existing["component"] = component
+        if node_type:
+            existing["type"] = node_type
+        existing.pop("hidden", None)
+        overrides[node_id] = existing
+        live["id"] = node_id
+        live["box"] = list(box)
+        live["x"] = existing["x"]
+        live["y"] = existing["y"]
+        live["moved"] = True
+        live["display_mode"] = display_mode
+        if mark_restored:
+            live["restored"] = True
+        if component:
+            live["component"] = component
+        if node_type:
+            live["type"] = node_type
+        sheet[node_id] = live
+
+    for node_id, record in list(sheet.items()):
+        if not isinstance(record, dict) or str(node_id) in embedded_sensor_ids:
+            continue
+        box = _valid_canvas_box(record.get("box"))
+        if box is None:
+            continue
+        _apply_box(
+            str(node_id),
+            box,
+            component=str(record.get("component") or ""),
+            node_type=str(record.get("type") or ""),
+        )
+
+    # Keep override boxes that are not yet mirrored on the canvas sheet.
+    for node_id, raw in list(overrides.items()):
+        if str(node_id) in embedded_sensor_ids or not isinstance(raw, dict):
+            continue
+        box = _valid_canvas_box(raw.get("box"))
+        if box is None:
+            continue
+        if not bool(raw.get("moved")) or (mark_restored and not bool(raw.get("restored"))):
+            _apply_box(
+                str(node_id),
+                box,
+                component=str(raw.get("component") or ""),
+                node_type=str(raw.get("type") or ""),
+            )
+
+    # Active worksheet: also freeze boxes from the last rendered geometry so a
+    # never-dragged layout still survives Save when the canvas sheet was thin.
+    if int(st.session_state.get("active_worksheet_id", -1)) == worksheet_id:
+        geometry = st.session_state.get(f"_last_worksheet_geometry_{worksheet_id}")
+        box_map = dict((geometry or {}).get("boxes") or {}) if isinstance(geometry, dict) else {}
+        for node_id, raw_box in box_map.items():
+            if str(node_id) in embedded_sensor_ids:
+                continue
+            if str(node_id) in overrides and _valid_canvas_box(
+                (overrides.get(node_id) or {}).get("box")
+            ):
+                continue
+            box = _valid_canvas_box(raw_box)
+            if box is None:
+                continue
+            _apply_box(str(node_id), box)
+
+    st.session_state[_manual_component_overrides_key(worksheet_id)] = overrides
+    _canvas_component_sheet(worksheet_id, publish=True)
+    st.session_state[f"_preserve_component_layout_{worksheet_id}"] = True
+    # Remember the current node set so the next paint does not wipe these boxes.
+    diagram = st.session_state.get("diagram")
+    if diagram is not None and int(st.session_state.get("active_worksheet_id", -1)) == worksheet_id:
+        layout_signature = tuple(
+            sorted(
+                str(getattr(node, "id", "") or "")
+                for node in (getattr(diagram, "nodes", []) or [])
+                if str(getattr(node, "node_type", "") or "") != "junction"
+            )
+        )
+        st.session_state[f"_auto_layout_component_ids_{worksheet_id}"] = layout_signature
+        st.session_state[f"_auto_layout_rule_{worksheet_id}"] = "sumps-left-oht-top-v2"
+
+
+def _on_connection_control_option_change(worksheet_id: int) -> None:
+    """Apply a control-option dropdown change on the interaction that made it.
+
+    Streamlit writes the widget value before this callback. The rest of this
+    same script then rebuilds the worksheet, so the component is drawn without
+    a second click.
+    """
+    worksheet_id = int(worksheet_id)
+    widget_key = _connection_control_widget_key(worksheet_id)
+    option_id = st.session_state.get(widget_key)
+    consumed_key = f"_connection_control_consumed_{worksheet_id}"
+    if option_id == st.session_state.get(consumed_key):
+        return
+    st.session_state[consumed_key] = option_id
+    if _apply_connection_control_selection(option_id, worksheet_id):
+        st.session_state[f"_clear_connection_config_target_{worksheet_id}"] = True
+        st.session_state[f"_connection_control_applied_value_{worksheet_id}"] = option_id
+
+
+def _consume_pending_connection_control_selection(worksheet_id: int) -> None:
+    """Read a selection already stored on the dropdown key before the widget builds.
+
+    ``index=None`` can leave the first choice sitting in session state without
+    the widget return value changing. A stable key plus this read applies that
+    choice on the same run. A later run restores the prompt only when the user
+    has not already chosen a different option.
+    """
+    worksheet_id = int(worksheet_id)
+    widget_key = _connection_control_widget_key(worksheet_id)
+    consumed_key = f"_connection_control_consumed_{worksheet_id}"
+    clear_key = f"_clear_connection_config_target_{worksheet_id}"
+    applied_key = f"_connection_control_applied_value_{worksheet_id}"
+    if st.session_state.pop(clear_key, False):
+        if st.session_state.get(widget_key) == st.session_state.get(applied_key):
+            st.session_state[widget_key] = CONNECTION_CONTROL_PLACEHOLDER
+            st.session_state[consumed_key] = CONNECTION_CONTROL_PLACEHOLDER
+    legacy_prefix = f"{widget_key}_"
+    for state_key in list(st.session_state.keys()):
+        if not str(state_key).startswith(legacy_prefix):
+            continue
+        legacy_value = st.session_state.pop(state_key, None)
+        if _apply_connection_control_selection(legacy_value, worksheet_id):
+            st.session_state[clear_key] = True
+            st.session_state[applied_key] = legacy_value
+            st.session_state[consumed_key] = legacy_value
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = CONNECTION_CONTROL_PLACEHOLDER
+    current = st.session_state.get(widget_key)
+    if current == st.session_state.get(consumed_key):
+        return
+    st.session_state[consumed_key] = current
+    if _apply_connection_control_selection(current, worksheet_id):
+        st.session_state[clear_key] = True
+        st.session_state[applied_key] = current
+
+
+def _apply_connection_control_selection(option_id, worksheet_id: int) -> bool:
+    """Add one control-option component on the run that first records it."""
+    component_name = _requirement_component_from_option_id(option_id)
+    if not component_name:
+        return False
+    requirements = _sanitize_requirement_components(
+        st.session_state.get("selected_requirement_components", []) or []
+    )
+    if component_name in requirements:
+        return False
+    requirements.append(component_name)
+    requirements = _sanitize_requirement_components(requirements)
+    st.session_state["selected_requirement_components"] = list(requirements)
+    selected = list(st.session_state.get("selected_components", []) or [])
+    if component_name not in selected:
+        selected.append(component_name)
+    st.session_state["selected_components"] = selected
+    st.session_state["_manual_component_selection_changed"] = True
+    st.session_state.pop("processed_hash", None)
+    st.session_state[f"_fast_worksheet_component_change_{int(worksheet_id)}"] = True
+    _lock_visible_component_positions(int(worksheet_id))
+    persist_active_worksheet_state()
+    return True
 
 
 def _boxes_nearly_equal(left, right, tolerance: float = 0.01) -> bool:
@@ -10966,6 +12438,157 @@ def _remember_internal_sensor(
     component_overrides[sensor_id] = existing
 
 
+def _pair_oht_and_lls(source_id: str, target_id: str) -> tuple[str, str] | None:
+    ends = [str(source_id or "").strip(), str(target_id or "").strip()]
+    tanks = [item for item in ends if item.startswith("oht_")]
+    sensors = [item for item in ends if item.startswith("lls_")]
+    if len(tanks) == 1 and len(sensors) == 1:
+        return tanks[0], sensors[0]
+    return None
+
+
+def _ensure_oht_sensor_embeds(worksheet_id: int, diagram=None) -> list[dict]:
+    """Keep an OHT/LLS nest, and recover one a route update dropped.
+
+    An existing embed stays. A Sensor-to-Transmitter line on a worksheet with
+    one OHT also keeps that sensor inside the tank.
+    """
+    worksheet_id = int(worksheet_id)
+    key = f"oht_sensor_embeds_{worksheet_id}"
+    embeds = [
+        dict(item)
+        for item in list(st.session_state.get(key) or [])
+        if isinstance(item, dict)
+        and str(item.get("tank_id") or "").strip()
+        and str(item.get("sensor_id") or "").strip()
+    ]
+    seen = {
+        (str(item.get("tank_id") or ""), str(item.get("sensor_id") or ""))
+        for item in embeds
+    }
+
+    def add(tank_id: str, sensor_id: str) -> None:
+        tank_id = str(tank_id or "").strip()
+        sensor_id = str(sensor_id or "").strip()
+        if not tank_id.startswith("oht_") or not sensor_id.startswith("lls_"):
+            return
+        pair = (tank_id, sensor_id)
+        if pair in seen:
+            return
+        seen.add(pair)
+        embeds.append({"tank_id": tank_id, "sensor_id": sensor_id})
+
+    transmitter_sensors: list[str] = []
+    connection_ids = []
+    connection_ids.extend(list(st.session_state.get("selected_connections") or []))
+    connection_ids.extend(list(_connection_master(worksheet_id)))
+    connection_ids.extend(
+        list(st.session_state.get(_explicit_user_connection_ids_key(worksheet_id)) or [])
+    )
+    for raw_id in connection_ids:
+        text = str(raw_id or "").strip()
+        if not text:
+            continue
+        internal = _internal_sensor_transmitter_endpoints(text)
+        if internal is not None:
+            transmitter_sensors.append(internal[0])
+            continue
+        endpoints = _connection_id_endpoints(text)
+        if endpoints is None:
+            continue
+        nested = _pair_oht_and_lls(endpoints[0], endpoints[1])
+        if nested is not None:
+            add(nested[0], nested[1])
+        elif _node_pair_is_transmitter_lls(endpoints[0], endpoints[1]):
+            transmitter_sensors.append(
+                endpoints[0] if endpoints[0].startswith("lls_") else endpoints[1]
+            )
+
+    route_overrides = dict(
+        st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}
+    )
+    for edge_id, raw in route_overrides.items():
+        internal = _internal_sensor_transmitter_endpoints(str(edge_id))
+        if internal is not None:
+            transmitter_sensors.append(internal[0])
+        source = target = ""
+        if isinstance(raw, dict):
+            source = str(raw.get("source") or "")
+            target = str(raw.get("target") or "")
+        nested = _pair_oht_and_lls(source, target)
+        if nested is not None:
+            add(nested[0], nested[1])
+        elif _node_pair_is_transmitter_lls(source, target):
+            transmitter_sensors.append(source if source.startswith("lls_") else target)
+
+    oht_ids: list[str] = []
+    lls_ids: list[str] = []
+    transmitter_ids: list[str] = []
+    if diagram is not None:
+        for edge in list(getattr(diagram, "edges", []) or []):
+            source = str(getattr(edge, "source", "") or "")
+            target = str(getattr(edge, "target", "") or "")
+            nested = _pair_oht_and_lls(source, target)
+            if nested is not None:
+                add(nested[0], nested[1])
+            elif _node_pair_is_transmitter_lls(source, target):
+                transmitter_sensors.append(source if source.startswith("lls_") else target)
+        for node in list(getattr(diagram, "nodes", []) or []):
+            node_id = str(getattr(node, "id", "") or "")
+            node_type = str(getattr(node, "node_type", "") or "")
+            if not node_id:
+                continue
+            if (node_id.startswith("oht_") or node_type == "oht") and node_id not in oht_ids:
+                oht_ids.append(node_id)
+            if node_id.startswith("lls_") and node_id not in lls_ids:
+                lls_ids.append(node_id)
+            if node_id.startswith("tx_") and node_id not in transmitter_ids:
+                transmitter_ids.append(node_id)
+    if len(oht_ids) == 1:
+        for sensor_id in transmitter_sensors:
+            add(oht_ids[0], sensor_id)
+
+    st.session_state[key] = embeds
+    return embeds
+
+
+def _force_nested_sensor_boxes(worksheet_id: int, box_map: dict, components: list) -> None:
+    """Write the locked nest into the boxes the canvas actually draws."""
+    worksheet_id = int(worksheet_id)
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+    sheet = _canvas_component_sheet(worksheet_id, publish=False)
+    changed = False
+    for tank_id, sensor_id in _embedded_oht_sensor_pairs(worksheet_id):
+        tank_box = _valid_canvas_box(box_map.get(tank_id))
+        if tank_box is None:
+            tank_box = _valid_canvas_box((overrides.get(tank_id) or {}).get("box"))
+        sensor_box = _oht_internal_sensor_box(tank_box)
+        if sensor_box is None:
+            continue
+        box_map[sensor_id] = list(sensor_box)
+        for item in list(components or []):
+            if isinstance(item, dict) and str(item.get("instance_id") or "") == sensor_id:
+                item["box"] = list(sensor_box)
+                item["hidden"] = False
+        _remember_internal_sensor(
+            worksheet_id,
+            sensor_id,
+            tank_id,
+            sensor_box,
+            overrides,
+        )
+        record = dict(sheet.get(sensor_id) or {})
+        record["moved"] = False
+        record["embedded_in"] = tank_id
+        sheet[sensor_id] = record
+        changed = True
+    if changed:
+        st.session_state[_manual_component_overrides_key(worksheet_id)] = overrides
+        _canvas_component_sheet(worksheet_id, publish=True)
+
+
 def _pin_embedded_sensor_overrides(
     worksheet_id: int,
     component_overrides: dict,
@@ -10976,20 +12599,23 @@ def _pin_embedded_sensor_overrides(
     Sensors with no OHT connection keep their own canvas spot. The tank box
     already includes a drag, so the sensor follows the tank the user moved.
     """
+    worksheet_id = int(worksheet_id)
     result = dict(component_overrides or {})
-    sheet = _canvas_component_sheet(int(worksheet_id), publish=False)
+    sheet = _canvas_component_sheet(worksheet_id, publish=False)
     layout_boxes = dict(layout_boxes or {})
     changed = False
     for tank_id, sensor_id in _embedded_oht_sensor_pairs(worksheet_id):
-        tank_box = _valid_canvas_box(layout_boxes.get(tank_id))
-        if tank_box is None:
-            tank_box = _valid_canvas_box((result.get(tank_id) or {}).get("box"))
+        tank_box = _valid_canvas_box((result.get(tank_id) or {}).get("box"))
         if tank_box is None:
             tank_box = _valid_canvas_box((sheet.get(tank_id) or {}).get("box"))
+        if tank_box is None:
+            tank_box = _valid_canvas_box(layout_boxes.get(tank_id))
         sensor_box = _oht_internal_sensor_box(tank_box)
         if sensor_box is None:
             continue
         current = _valid_canvas_box((result.get(sensor_id) or {}).get("box"))
+        if _boxes_nearly_equal(current, sensor_box):
+            continue
         _remember_internal_sensor(
             worksheet_id,
             sensor_id,
@@ -11181,7 +12807,7 @@ def _consume_pending_canvas_component_moves(worksheet_id: int) -> None:
     """Apply a drop before this run builds connection geometry."""
     worksheet_id = int(worksheet_id)
     for view_key in ("inline", "expanded"):
-        surface_key = f"diagram_normal_surface_{worksheet_id}_{view_key}"
+        surface_key = _diagram_normal_surface_key(worksheet_id, view_key)
         event = st.session_state.get(surface_key)
         if not isinstance(event, dict) or str(event.get("type", "") or "") != "component_move":
             continue
@@ -11229,6 +12855,956 @@ def _locked_manual_endpoint_pairs(worksheet_id: int) -> tuple[tuple[str, str], .
     return tuple(sorted(set(pairs)))
 
 
+def _node_pair_is_transmitter_lls(source: str, target: str) -> bool:
+    """True only for a Transmitter node id paired with a Linear Level Sensor node id."""
+    ends = {str(source or "").strip(), str(target or "").strip()}
+    ends.discard("")
+    if len(ends) != 2:
+        return False
+    return any(item.startswith("tx_") for item in ends) and any(
+        item.startswith("lls_") for item in ends
+    )
+
+
+def _internal_sensor_transmitter_endpoints(edge_id: str) -> tuple[str, str] | None:
+    """Return sensor and transmitter ids stored in a client-only sensor line id."""
+    prefix = "internal_sensor_tx__"
+    text = str(edge_id or "").strip()
+    if not text.startswith(prefix):
+        return None
+    sensor_id, separator, transmitter_id = text[len(prefix):].partition("__")
+    if not separator or not sensor_id or not transmitter_id:
+        return None
+    if not _node_pair_is_transmitter_lls(sensor_id, transmitter_id):
+        return None
+    return sensor_id, transmitter_id
+
+
+def _manual_transmitter_lls_override(edge_id: str, raw: object) -> bool:
+    """True when this override is a dropped Transmitter → LLS polyline."""
+    if not isinstance(raw, dict) or str(raw.get("mode") or "") != "manual_drag":
+        return False
+    source = str(raw.get("source") or "")
+    target = str(raw.get("target") or "")
+    if _node_pair_is_transmitter_lls(source, target):
+        return True
+    internal = _internal_sensor_transmitter_endpoints(edge_id)
+    return internal is not None
+
+
+def _diagram_edge_for_endpoints(diagram, first_id: str, second_id: str):
+    """Return the diagram edge that joins these two nodes in either direction."""
+    wanted = {str(first_id or "").strip(), str(second_id or "").strip()}
+    wanted.discard("")
+    if len(wanted) != 2:
+        return None
+    for edge in (getattr(diagram, "edges", []) or []):
+        ends = {
+            str(getattr(edge, "source", "") or ""),
+            str(getattr(edge, "target", "") or ""),
+        }
+        if ends == wanted:
+            return edge
+    return None
+
+
+def _append_unmatched_manual_transmitter_lls_routes(
+    normal_routes: list,
+    route_overrides: dict,
+) -> None:
+    """Draw a dropped Transmitter → LLS line that the regenerated diagram omitted."""
+    covered_ids = {
+        str(item.get("edge_id") or "")
+        for item in normal_routes
+        if isinstance(item, dict)
+    }
+    covered_pairs: set[tuple[str, str]] = set()
+    for item in normal_routes:
+        if not isinstance(item, dict) or item.get("hidden"):
+            continue
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        if source and target:
+            covered_pairs.add((source, target))
+            covered_pairs.add((target, source))
+    for edge_id, raw in dict(route_overrides or {}).items():
+        if not _manual_transmitter_lls_override(str(edge_id), raw):
+            continue
+        if str(edge_id) in covered_ids:
+            continue
+        source = str(raw.get("source") or "")
+        target = str(raw.get("target") or "")
+        if (source, target) in covered_pairs:
+            continue
+        if not bool(raw.get("manual_drag") or raw.get("stored_geometry") or raw.get("custom")):
+            continue
+        points = []
+        for value in list(raw.get("points") or []):
+            try:
+                points.append([float(value[0]), float(value[1])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        if len(points) < 2 or not source or not target:
+            continue
+        normal_routes.append({
+            "edge_id": str(edge_id),
+            "points": points,
+            "original_points": [list(point) for point in points],
+            "color": "#000000",
+            "dotted": True,
+            "direction": "source_to_target",
+            "original_direction": "source_to_target",
+            "source": source,
+            "target": target,
+            "hidden": False,
+            "manual_drag": True,
+            "arrow_control": raw.get("arrow_control"),
+        })
+
+
+def _sensor_anchor_point(box) -> list[float] | None:
+    valid = _valid_canvas_box(box)
+    if valid is None:
+        return None
+    x, y, width, height = valid
+    return [x + width * 0.5, y + height * 0.5]
+
+
+def _sensor_transmitter_elbow(sensor_box, transmitter_box) -> list[list[float]] | None:
+    """Orthogonal black-dotted path from the LLS pin to the Transmitter face."""
+    start = _sensor_anchor_point(sensor_box)
+    transmitter = _valid_canvas_box(transmitter_box)
+    if start is None or transmitter is None:
+        return None
+    x, y, width, height = transmitter
+    center = [x + width * 0.5, y + height * 0.5]
+    if abs(start[0] - center[0]) >= abs(start[1] - center[1]):
+        end = [x + width if start[0] >= center[0] else x, center[1]]
+    else:
+        end = [center[0], y + height if start[1] >= center[1] else y]
+    if abs(end[0] - start[0]) >= abs(end[1] - start[1]):
+        bend = (start[0] + end[0]) * 0.5
+        return [start, [bend, start[1]], [bend, end[1]], end]
+    bend = (start[1] + end[1]) * 0.5
+    return [start, [start[0], bend], [end[0], bend], end]
+
+
+def _explicit_sensor_transmitter_pairs(worksheet_id: int, diagram) -> list[tuple[str, str]]:
+    """Return only LLS↔Transmitter pairs the user explicitly selected."""
+    del diagram
+    worksheet_id = int(worksheet_id)
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(source_id: str, target_id: str) -> None:
+        source_id = str(source_id or "").strip()
+        target_id = str(target_id or "").strip()
+        if not _node_pair_is_transmitter_lls(source_id, target_id):
+            return
+        if _connection_pair_is_deleted(worksheet_id, source_id, target_id):
+            return
+        sensor_id = source_id if source_id.startswith("lls_") else target_id
+        transmitter_id = target_id if source_id.startswith("lls_") else source_id
+        key = tuple(sorted((sensor_id, transmitter_id)))
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append((sensor_id, transmitter_id))
+
+    connection_ids = []
+    connection_ids.extend(list(st.session_state.get("selected_connections") or []))
+    connection_ids.extend(
+        list(st.session_state.get(_explicit_user_connection_ids_key(worksheet_id)) or [])
+    )
+    for raw_id in connection_ids:
+        ends = _connection_id_endpoints(str(raw_id or ""))
+        if ends is not None:
+            add(ends[0], ends[1])
+        internal = _internal_sensor_transmitter_endpoints(str(raw_id or ""))
+        if internal is not None:
+            add(internal[0], internal[1])
+    return pairs
+
+
+def _ensure_explicit_sensor_transmitter_routes(
+    worksheet_id: int,
+    diagram,
+    box_map: dict,
+    normal_routes: list,
+) -> None:
+    """Bind only explicitly selected LLS↔Transmitter links. Never invent stubs."""
+    worksheet_id = int(worksheet_id)
+    pairs = _explicit_sensor_transmitter_pairs(worksheet_id, diagram)
+    explicit_pair_keys = {tuple(sorted(pair)) for pair in pairs}
+
+    # Hide any dotted sensor/tank↔transmitter stub that was not explicitly selected.
+    for item in list(normal_routes or []):
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        ends = {source, target}
+        is_lls_tx = _node_pair_is_transmitter_lls(source, target)
+        is_oht_tx = (
+            (source.startswith("oht_") and target.startswith("tx_"))
+            or (target.startswith("oht_") and source.startswith("tx_"))
+        )
+        edge_id = str(item.get("edge_id") or "")
+        if edge_id.startswith("internal_sensor_tx__") or is_lls_tx or is_oht_tx:
+            key = tuple(sorted((source, target))) if is_lls_tx else None
+            if is_lls_tx and key in explicit_pair_keys:
+                continue
+            if is_oht_tx:
+                item["hidden"] = True
+                continue
+            if edge_id.startswith("internal_sensor_tx__") or is_lls_tx:
+                item["hidden"] = True
+
+    if not pairs:
+        return
+
+    for sensor_id, transmitter_id in pairs:
+        sensor_box = _valid_canvas_box(box_map.get(sensor_id))
+        if sensor_box is None:
+            for tank_id, nested_sensor in _embedded_oht_sensor_pairs(worksheet_id):
+                if nested_sensor != sensor_id:
+                    continue
+                sensor_box = _oht_internal_sensor_box(box_map.get(tank_id))
+                if sensor_box is not None:
+                    box_map[sensor_id] = list(sensor_box)
+                break
+        transmitter_box = _valid_canvas_box(box_map.get(transmitter_id))
+        points = _sensor_transmitter_elbow(sensor_box, transmitter_box)
+        if points is None:
+            continue
+
+        matched = None
+        for item in list(normal_routes or []):
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or "")
+            target = str(item.get("target") or "")
+            if {source, target} == {sensor_id, transmitter_id}:
+                matched = item
+                break
+        if matched is None:
+            edge_id = f"internal_sensor_tx__{sensor_id}__{transmitter_id}"
+            normal_routes.append({
+                "edge_id": edge_id,
+                "points": [list(point) for point in points],
+                "original_points": [list(point) for point in points],
+                "color": "#000000",
+                "dotted": True,
+                "direction": "source_to_target",
+                "original_direction": "source_to_target",
+                "source": sensor_id,
+                "target": transmitter_id,
+                "hidden": False,
+                "stored_geometry": True,
+                "manual_drag": False,
+                "sensor_transmitter": True,
+            })
+            continue
+
+        matched["points"] = [list(point) for point in points]
+        matched["original_points"] = [list(point) for point in points]
+        matched["source"] = sensor_id
+        matched["target"] = transmitter_id
+        matched["color"] = "#000000"
+        matched["dotted"] = True
+        matched["hidden"] = False
+        matched["sensor_transmitter"] = True
+        matched["direction"] = "source_to_target"
+        matched["original_direction"] = "source_to_target"
+
+
+def _force_bore_sump_return_routes(
+    worksheet_id: int,
+    diagram,
+    box_map: dict,
+    normal_routes: list,
+    *,
+    canvas_height: float = 7.5,
+) -> None:
+    """Force every selected Borewell↔Sump link to one solid horizontal fluid line."""
+    from src.connection_router import water_loop_polyline
+
+    worksheet_id = int(worksheet_id)
+    pairs: set[tuple[str, str]] = set()
+
+    node_name = {
+        str(getattr(node, "id", "") or ""): (
+            _component_name_from_diagram_node(node) or ""
+        )
+        for node in (getattr(diagram, "nodes", []) or [])
+    }
+
+    def _is_bore(node_id: str) -> bool:
+        node_id = str(node_id or "")
+        return (
+            node_id.startswith(("bore_", "well_"))
+            or node_name.get(node_id) in {"Bore Well", "Well"}
+        )
+
+    def _is_sump(node_id: str) -> bool:
+        node_id = str(node_id or "")
+        return node_id.startswith("sump_") or node_name.get(node_id) == "Sump"
+
+    def remember(source_id: str, target_id: str) -> None:
+        source_id = str(source_id or "").strip()
+        target_id = str(target_id or "").strip()
+        if not (_is_bore(source_id) and _is_sump(target_id)) and not (
+            _is_sump(source_id) and _is_bore(target_id)
+        ):
+            return
+        if _connection_pair_is_deleted(worksheet_id, source_id, target_id):
+            return
+        pairs.add(tuple(sorted((source_id, target_id))))
+
+    for raw_id in list(st.session_state.get("selected_connections") or []):
+        ends = _connection_endpoint_ids(str(raw_id or "")) or _connection_id_endpoints(
+            str(raw_id or "")
+        )
+        if ends is not None:
+            remember(ends[0], ends[1])
+    for edge in list(getattr(diagram, "edges", []) or []):
+        remember(
+            str(getattr(edge, "source", "") or ""),
+            str(getattr(edge, "target", "") or ""),
+        )
+    for item in list(normal_routes or []):
+        if isinstance(item, dict) and not item.get("hidden"):
+            remember(str(item.get("source") or ""), str(item.get("target") or ""))
+
+    if not pairs:
+        return
+
+    # Replace only fluid_bore_sump__ synthetics. User/catalog bore↔sump edges
+    # accumulate and are updated in place — never wiped by a new Sump→OHT draw.
+    kept: list = []
+    keep_by_pair: dict[tuple[str, str], dict] = {}
+    for item in list(normal_routes or []):
+        if not isinstance(item, dict):
+            continue
+        edge_id = str(item.get("edge_id") or "")
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        if edge_id.startswith("fluid_bore_sump__"):
+            continue
+        if (_is_bore(source) and _is_sump(target)) or (
+            _is_sump(source) and _is_bore(target)
+        ):
+            keep_by_pair[tuple(sorted((source, target)))] = item
+            kept.append(item)
+            continue
+        kept.append(item)
+    normal_routes[:] = kept
+
+    for pair in sorted(pairs):
+        left, right = pair
+        bore_id = left if _is_bore(left) else right
+        sump_id = right if _is_sump(right) else left
+        bore_box = _valid_canvas_box(box_map.get(bore_id))
+        sump_box = _valid_canvas_box(box_map.get(sump_id))
+        if bore_box is None or sump_box is None:
+            continue
+        path = water_loop_polyline(
+            bore_box,
+            sump_box,
+            "bore",
+            "sump",
+            canvas_height=float(canvas_height or 7.5),
+        )
+        if not path or len(path) < 2:
+            continue
+        points = [[float(point[0]), float(point[1])] for point in path]
+        existing = keep_by_pair.get(tuple(sorted((bore_id, sump_id))))
+        if isinstance(existing, dict):
+            existing.update({
+                "points": points,
+                "original_points": [list(point) for point in points],
+                "color": "#123DBD",
+                "dotted": False,
+                "hidden": False,
+                "sketch_lock": True,
+                "fluid_bore_sump": True,
+                "fluid_header": False,
+            })
+            continue
+        normal_routes.append({
+            "edge_id": f"fluid_bore_sump__{bore_id}__{sump_id}",
+            "points": points,
+            "original_points": [list(point) for point in points],
+            "color": "#123DBD",
+            "dotted": False,
+            "direction": "source_to_target",
+            "original_direction": "source_to_target",
+            "source": bore_id,
+            "target": sump_id,
+            "source_handle": f"{bore_id}:fluid",
+            "target_handle": f"{sump_id}:fluid",
+            "hidden": False,
+            "stored_geometry": True,
+            "manual_drag": False,
+            "sketch_lock": True,
+            "fluid_bore_sump": True,
+            "fluid_header": False,
+            "sensor_transmitter": False,
+        })
+
+
+def _purge_unsolicited_dotted_routes(worksheet_id: int, normal_routes: list) -> None:
+    """Hide dotted stubs that were not explicitly selected or manually drawn."""
+    worksheet_id = int(worksheet_id)
+    explicit_ids = {
+        str(value)
+        for value in list(st.session_state.get("selected_connections") or [])
+        + list(st.session_state.get(_explicit_user_connection_ids_key(worksheet_id)) or [])
+        if str(value or "").strip()
+    }
+    explicit_pairs = set()
+    for connection_id in explicit_ids:
+        ends = _connection_id_endpoints(connection_id)
+        if ends is not None:
+            explicit_pairs.add(tuple(sorted(ends)))
+        internal = _internal_sensor_transmitter_endpoints(connection_id)
+        if internal is not None:
+            explicit_pairs.add(tuple(sorted(internal)))
+
+    kept: list = []
+    for item in list(normal_routes or []):
+        if not isinstance(item, dict):
+            continue
+        edge_id = str(item.get("edge_id") or "")
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        if (
+            bool(item.get("fluid_header"))
+            or bool(item.get("sketch_lock"))
+            or edge_id.startswith("fluid_header_")
+            or edge_id.startswith("fluid_bore_sump__")
+            or (
+                source.startswith(("sump_", "oht_", "bore_", "well_"))
+                and target.startswith(("sump_", "oht_", "bore_", "well_"))
+            )
+        ):
+            item["dotted"] = False
+            item["color"] = "#123DBD"
+            kept.append(item)
+            continue
+        if bool(item.get("manual_drag") or item.get("custom")) or edge_id.startswith("manual__"):
+            kept.append(item)
+            continue
+        pair = tuple(sorted((source, target))) if source and target else ()
+        allowed = (
+            edge_id in explicit_ids
+            or f"edge__{edge_id}" in explicit_ids
+            or edge_id.removeprefix("edge__") in explicit_ids
+            or (pair and pair in explicit_pairs)
+        )
+        if bool(item.get("dotted") or item.get("sensor_transmitter")) and not allowed:
+            continue
+        if not allowed and not bool(item.get("hidden")):
+            # Unselected control/sensor stubs stay off the canvas.
+            if source.startswith(("lls_", "tx_", "oht_")) or target.startswith(
+                ("lls_", "tx_", "smc_", "master_", "rpt_")
+            ):
+                continue
+        kept.append(item)
+    normal_routes[:] = kept
+
+
+def _is_oht_inline_drop_device(node_id: str) -> bool:
+    text = str(node_id or "").strip().lower()
+    return text.startswith(("mv_", "ufm_", "ffm_", "emfm_"))
+
+
+def _oht_inline_device_role(node_id: str, label: str = "") -> str:
+    text = str(node_id or "").strip().lower()
+    name = str(label or "").lower()
+    if text.startswith("mv_") or "motorized" in name or "solenoid" in name:
+        return "mv"
+    if text.startswith(("ufm_", "ffm_", "emfm_")) or "flow meter" in name:
+        return "fm"
+    return ""
+
+
+def _explicit_oht_inline_assignments(
+    worksheet_id: int,
+    diagram=None,
+    routes: list | None = None,
+) -> dict[str, str]:
+    """Map Valve/Flowmeter id → OHT id for user-selected pairs only."""
+    worksheet_id = int(worksheet_id)
+    assignments: dict[str, str] = {}
+
+    def remember(left: str, right: str) -> None:
+        left = str(left or "").strip()
+        right = str(right or "").strip()
+        if not left or not right:
+            return
+        if _connection_pair_is_deleted(worksheet_id, left, right):
+            return
+        if left.startswith("oht_") and _is_oht_inline_drop_device(right):
+            assignments[right] = left
+        elif right.startswith("oht_") and _is_oht_inline_drop_device(left):
+            assignments[left] = right
+
+    for raw_id in list(st.session_state.get("selected_connections") or []):
+        ends = _connection_id_endpoints(str(raw_id or ""))
+        if ends is not None:
+            remember(ends[0], ends[1])
+    for edge in list(getattr(diagram, "edges", []) or []):
+        remember(
+            str(getattr(edge, "source", "") or ""),
+            str(getattr(edge, "target", "") or ""),
+        )
+    for item in list(routes or []):
+        if not isinstance(item, dict) or item.get("hidden"):
+            continue
+        remember(str(item.get("source") or ""), str(item.get("target") or ""))
+    return assignments
+
+
+def _oht_inline_drop_role_rank(role: str) -> int:
+    # Flowmeters sit above valves on the same drop (industrial stack order).
+    if role == "fm":
+        return 0
+    if role == "mv":
+        return 1
+    return 9
+
+
+def _compute_oht_inline_drop_layout(
+    assignments: dict[str, str],
+    diagram,
+    box_map: dict,
+    *,
+    canvas_height: float = 7.5,
+) -> dict:
+    """Evenly space every docked Valve/FM on its tank drop; grow the drop as needed.
+
+    Returns header_y plus per-device boxes. One device (MV or FM) centers on the
+    column; multiple devices share equal vertical segments on the same axis.
+    """
+    from src.connection_router import shared_sump_oht_header_y
+
+    empty = {"header_y": None, "seats": {}, "devices_by_tank": {}}
+    if not assignments:
+        return empty
+
+    oht_ids = sorted(set(assignments.values()))
+    kinds = {oht_id: "oht" for oht_id in oht_ids}
+    for node in list(getattr(diagram, "nodes", []) or []):
+        node_id = str(getattr(node, "id", "") or "")
+        if node_id.startswith("sump_") and _valid_canvas_box(box_map.get(node_id)):
+            kinds[node_id] = "sump"
+    header_y = shared_sump_oht_header_y(
+        box_map,
+        kinds,
+        canvas_height=float(canvas_height or 7.5),
+    )
+    if header_y is None:
+        tops = []
+        for oht_id in oht_ids:
+            box = _valid_canvas_box(box_map.get(oht_id))
+            if box is not None:
+                tops.append(float(box[1]))
+        if not tops:
+            return empty
+        header_y = max(0.18, min(tops) - 0.32)
+
+    label_by_id = {
+        str(getattr(node, "id", "") or ""): str(getattr(node, "label", "") or "")
+        for node in list(getattr(diagram, "nodes", []) or [])
+    }
+    by_tank: dict[str, list[dict]] = {}
+    for device_id, oht_id in assignments.items():
+        device_box = _valid_canvas_box(box_map.get(device_id))
+        tank_box = _valid_canvas_box(box_map.get(oht_id))
+        if device_box is None or tank_box is None:
+            continue
+        role = _oht_inline_device_role(device_id, label_by_id.get(device_id, ""))
+        if role not in {"fm", "mv"}:
+            continue
+        raw_width = max(0.01, float(device_box[2]))
+        raw_height = max(0.01, float(device_box[3]))
+        minimum_scale = max(0.42 / raw_width, 0.32 / raw_height)
+        maximum_scale = min(0.62 / raw_width, 0.46 / raw_height)
+        scale = min(1.0, maximum_scale)
+        if minimum_scale <= maximum_scale:
+            scale = max(minimum_scale, scale)
+        width = raw_width * scale
+        height = raw_height * scale
+        by_tank.setdefault(oht_id, []).append(
+            {
+                "device_id": device_id,
+                "role": role,
+                "width": width,
+                "height": height,
+                "tank_box": tank_box,
+            }
+        )
+
+    if not by_tank:
+        return empty
+
+    # Grow the shared header upward when any tank column needs more drop length
+    # for its docked Valve and/or Flowmeter stack.
+    for oht_id, devices in by_tank.items():
+        tank_box = devices[0]["tank_box"]
+        tank_top = float(tank_box[1])
+        count = len(devices)
+        max_h = max(float(item["height"]) for item in devices)
+        pad = max(0.10, max_h * 0.45)
+        gap = max(0.08, max_h * 0.28)
+        needed = (2.0 * pad) + sum(float(item["height"]) for item in devices)
+        if count > 1:
+            needed += gap * (count - 1)
+        needed = max(needed, 0.34 + 0.22 * count)
+        needed_header = tank_top - needed
+        header_y = min(float(header_y), max(0.12, needed_header))
+
+    seats: dict[str, list[float]] = {}
+    devices_by_tank: dict[str, list[tuple[str, float]]] = {}
+    for oht_id, devices in by_tank.items():
+        devices.sort(
+            key=lambda item: (
+                _oht_inline_drop_role_rank(str(item["role"])),
+                str(item["device_id"]),
+            )
+        )
+        tank_box = devices[0]["tank_box"]
+        tank_x = float(tank_box[0]) + float(tank_box[2]) * 0.5
+        tank_top = float(tank_box[1])
+        max_height = max(float(item["height"]) for item in devices)
+        pad = max(0.10, max_height * 0.45)
+        gap = max(0.08, max_height * 0.28)
+        stack_height = sum(float(item["height"]) for item in devices)
+        if len(devices) > 1:
+            stack_height += gap * (len(devices) - 1)
+        free_pad = max(pad, (tank_top - float(header_y) - stack_height) / 2.0)
+        cursor_y = float(header_y) + free_pad
+        for item in devices:
+            height = float(item["height"])
+            width = float(item["width"])
+            center_y = cursor_y + height / 2.0
+            new_box = [tank_x - width / 2.0, center_y - height / 2.0, width, height]
+            seats[str(item["device_id"])] = list(new_box)
+            devices_by_tank.setdefault(oht_id, []).append(
+                (str(item["device_id"]), center_y)
+            )
+            cursor_y += height + gap
+
+    return {
+        "header_y": float(header_y),
+        "seats": seats,
+        "devices_by_tank": devices_by_tank,
+    }
+
+
+def _force_inline_oht_drop_devices(
+    worksheet_id: int,
+    diagram,
+    box_map: dict,
+    components: list | None = None,
+    *,
+    canvas_height: float = 7.5,
+    normal_routes: list | None = None,
+) -> None:
+    """Seat only user-linked Valve/FM symbols onto their target OHT drop column.
+
+    No automatic tank assignment: a device moves onto the vertical inline drop
+    only after the user connects it to that specific OHT Tank. Valves and
+    flowmeters share the same dynamic drop-length and even-spacing rules.
+    """
+    assignments = _explicit_oht_inline_assignments(
+        worksheet_id,
+        diagram,
+        normal_routes,
+    )
+    if not assignments:
+        return
+
+    layout = _compute_oht_inline_drop_layout(
+        assignments,
+        diagram,
+        box_map,
+        canvas_height=float(canvas_height or 7.5),
+    )
+    seats = dict(layout.get("seats") or {})
+    header_y = layout.get("header_y")
+    if not seats or header_y is None:
+        return
+
+    # Publish the expanded header so the fluid-drop builder uses the same span.
+    st.session_state[f"_oht_inline_drop_header_y_{int(worksheet_id)}"] = float(header_y)
+
+    component_by_id = {}
+    for item in list(components or []):
+        if isinstance(item, dict):
+            component_by_id[str(item.get("instance_id") or "")] = item
+
+    for device_id, new_box in seats.items():
+        box_map[device_id] = list(new_box)
+        component = component_by_id.get(device_id)
+        oht_id = assignments.get(device_id, "")
+        if component is not None:
+            component["box"] = list(new_box)
+            if oht_id:
+                component["oht_drop_tank_id"] = oht_id
+
+    if components:
+        assigned_devices = set(assignments)
+        for item in list(components):
+            if not isinstance(item, dict):
+                continue
+            device_id = str(item.get("instance_id") or "")
+            if device_id in assigned_devices:
+                item["oht_drop_tank_id"] = assignments[device_id]
+                continue
+            if _is_oht_inline_drop_device(device_id):
+                item.pop("oht_drop_tank_id", None)
+
+    # Do not invent standalone vertical docks for tanks outside the shared
+    # fluid header. Those residual stubs are the phantom drops under the trunk.
+    # Valve/FM seating above still applies; only the extra dock polyline is banned.
+    if normal_routes is None:
+        return
+    normal_routes[:] = [
+        item
+        for item in list(normal_routes)
+        if isinstance(item, dict)
+        and not str(item.get("edge_id") or "").startswith("fluid_oht_inline_dock__")
+    ]
+
+
+def _force_unified_fluid_header_routes(
+    worksheet_id: int,
+    diagram,
+    box_map: dict,
+    normal_routes: list,
+    *,
+    canvas_height: float = 7.5,
+) -> None:
+    """Repair active Sump→OHT paths; purge only orphan header synthetics.
+
+    Real edges are updated in place to the continuous rise→header→drop path.
+    User-drawn coordinates and every non-Sump/OHT connection stay immutable.
+    """
+    from src.connection_router import shared_sump_oht_header_y
+
+    worksheet_id = int(worksheet_id)
+    # Always drop phantom header synthetics first, even with no live pairs.
+    if isinstance(normal_routes, list):
+        normal_routes[:] = [
+            item
+            for item in list(normal_routes or [])
+            if isinstance(item, dict)
+            and not str(item.get("edge_id") or "").startswith("fluid_header_")
+            and not str(item.get("edge_id") or "").startswith("fluid_oht_inline_dock__")
+        ]
+    sump_ids = [
+        str(getattr(node, "id", "") or "")
+        for node in (getattr(diagram, "nodes", []) or [])
+        if str(getattr(node, "id", "") or "").startswith("sump_")
+        and _valid_canvas_box(box_map.get(str(getattr(node, "id", "") or "")))
+    ]
+    oht_ids = [
+        str(getattr(node, "id", "") or "")
+        for node in (getattr(diagram, "nodes", []) or [])
+        if str(getattr(node, "id", "") or "").startswith("oht_")
+        and _valid_canvas_box(box_map.get(str(getattr(node, "id", "") or "")))
+    ]
+    if not sump_ids or not oht_ids:
+        return
+
+    live_sump_ids = set(sump_ids)
+    live_oht_ids = set(oht_ids)
+    selected_pairs: set[tuple[str, str]] = set()
+
+    def _remember_sump_oht(left: str, right: str) -> None:
+        left = str(left or "").strip()
+        right = str(right or "").strip()
+        if (
+            (left.startswith("sump_") and right.startswith("oht_"))
+            or (left.startswith("oht_") and right.startswith("sump_"))
+        ):
+            if _connection_pair_is_deleted(worksheet_id, left, right):
+                return
+            sump_id = left if left.startswith("sump_") else right
+            oht_id = right if right.startswith("oht_") else left
+            # Drop only when both endpoints are live on the canvas.
+            if sump_id not in live_sump_ids or oht_id not in live_oht_ids:
+                return
+            selected_pairs.add(tuple(sorted((left, right))))
+
+    for raw_id in list(st.session_state.get("selected_connections") or []):
+        ends = _connection_endpoint_ids(str(raw_id or "")) or _connection_id_endpoints(
+            str(raw_id or "")
+        )
+        if ends is not None:
+            _remember_sump_oht(ends[0], ends[1])
+    for edge in list(getattr(diagram, "edges", []) or []):
+        _remember_sump_oht(
+            str(getattr(edge, "source", "") or ""),
+            str(getattr(edge, "target", "") or ""),
+        )
+    for item in list(normal_routes or []):
+        if not isinstance(item, dict) or item.get("hidden"):
+            continue
+        edge_id = str(item.get("edge_id") or "")
+        # Never seed pairs from synthetic header/dock edges (phantom drops).
+        if (
+            edge_id.startswith("fluid_header_")
+            or edge_id.startswith("fluid_oht_inline_dock__")
+            or edge_id.startswith("fluid_bore_sump__")
+            or item.get("fluid_header")
+        ):
+            continue
+        _remember_sump_oht(
+            str(item.get("source") or ""),
+            str(item.get("target") or ""),
+        )
+
+    # Phantom cleanup ONLY — strip header/dock synthetics. Keep every real edge.
+    normal_routes[:] = [
+        item
+        for item in list(normal_routes or [])
+        if isinstance(item, dict)
+        and not str(item.get("edge_id") or "").startswith("fluid_header_")
+        and not str(item.get("edge_id") or "").startswith("fluid_oht_inline_dock__")
+    ]
+
+    if not selected_pairs:
+        return
+
+    active_sumps = sorted({
+        end
+        for pair in selected_pairs
+        for end in pair
+        if end.startswith("sump_")
+    })
+    active_ohts = sorted({
+        end
+        for pair in selected_pairs
+        for end in pair
+        if end.startswith("oht_")
+    })
+    if not active_sumps or not active_ohts:
+        return
+
+    kinds = {node_id: "sump" for node_id in active_sumps}
+    kinds.update({node_id: "oht" for node_id in active_ohts})
+    header_y = shared_sump_oht_header_y(
+        box_map,
+        kinds,
+        canvas_height=float(canvas_height or 7.5),
+    )
+    if header_y is None:
+        return
+    try:
+        expanded_header = float(
+            st.session_state.get(f"_oht_inline_drop_header_y_{worksheet_id}")
+        )
+    except (TypeError, ValueError):
+        expanded_header = None
+    if expanded_header is not None:
+        header_y = min(float(header_y), max(0.12, expanded_header))
+
+    # Repair each active Sump↔OHT edge in place to the continuous
+    # rise → header → drop path. Do not hide, delete, or fragment it.
+    header_oht_ids: set[str] = set()
+    for pair in sorted(selected_pairs):
+        sump_id = pair[0] if pair[0].startswith("sump_") else pair[1]
+        oht_id = pair[1] if pair[1].startswith("oht_") else pair[0]
+        sump_box = _valid_canvas_box(box_map.get(sump_id))
+        oht_box = _valid_canvas_box(box_map.get(oht_id))
+        if sump_box is None or oht_box is None:
+            continue
+        sump_x = float(sump_box[0]) + float(sump_box[2]) * 0.5
+        sump_top = float(sump_box[1])
+        tank_x = float(oht_box[0]) + float(oht_box[2]) * 0.5
+        tank_top = float(oht_box[1])
+        classic_points = [
+            [sump_x, sump_top],
+            [sump_x, float(header_y)],
+            [tank_x, float(header_y)],
+            [tank_x, tank_top],
+        ]
+        for item in list(normal_routes or []):
+            if not isinstance(item, dict):
+                continue
+            edge_id = str(item.get("edge_id") or "")
+            source = str(item.get("source") or "")
+            target = str(item.get("target") or "")
+            if edge_id.startswith("fluid_header_") or edge_id.startswith(
+                "fluid_bore_sump__"
+            ):
+                continue
+            if {source, target} != {sump_id, oht_id}:
+                continue
+            points = item.get("points")
+            if (
+                not bool(item.get("hidden"))
+                and isinstance(points, list)
+                and len(points) >= 2
+            ):
+                header_oht_ids.add(oht_id)
+            # Preserve user-drawn coordinates; only repair auto geometry.
+            if (
+                bool(item.get("custom"))
+                or bool(item.get("manual_drag"))
+                or str(item.get("mode") or "") == "manual_draw"
+            ):
+                item["hidden"] = False
+                item["dotted"] = False
+                item["color"] = "#123DBD"
+                continue
+            item["points"] = [list(point) for point in classic_points]
+            item["original_points"] = [list(point) for point in classic_points]
+            item["source"] = sump_id
+            item["target"] = oht_id
+            item["hidden"] = False
+            item["dotted"] = False
+            item["color"] = "#123DBD"
+            item["sketch_lock"] = True
+            item.pop("hidden_by_fluid_header", None)
+
+    if not header_oht_ids:
+        return
+
+    inline_assignments = _explicit_oht_inline_assignments(
+        worksheet_id,
+        diagram,
+        normal_routes,
+    )
+    assigned_pairs = {
+        tuple(sorted((device_id, oht_id)))
+        for device_id, oht_id in inline_assignments.items()
+        if oht_id in header_oht_ids
+    }
+    if not assigned_pairs:
+        return
+
+    # The shared hydraulic drop already passes through the aligned Valve/FM
+    # stack, so an additional device-to-tank route would draw the same link twice.
+    for item in normal_routes:
+        if not isinstance(item, dict) or item.get("hidden"):
+            continue
+        source = str(item.get("source") or "")
+        target = str(item.get("target") or "")
+        if tuple(sorted((source, target))) not in assigned_pairs:
+            continue
+        if (
+            bool(item.get("custom"))
+            or bool(item.get("manual_drag"))
+            or str(item.get("mode") or "") in {"manual_draw", "manual_drag"}
+        ):
+            continue
+        item["hidden"] = True
+
+
 def _rebind_locked_route_overrides(diagram, overrides: dict) -> dict:
     """Keep a dropped polyline on the edge that still joins the same components."""
     edges = list(getattr(diagram, "edges", []) or [])
@@ -11252,11 +13828,117 @@ def _rebind_locked_route_overrides(diagram, overrides: dict) -> dict:
                 result[edge_id] = updated
             continue
         new_id = by_pair.get((source, target), "")
+        reversed_transmitter_lls = False
+        if (
+            not new_id
+            and _node_pair_is_transmitter_lls(source, target)
+        ):
+            new_id = by_pair.get((target, source), "")
+            reversed_transmitter_lls = bool(new_id)
         if not new_id or new_id in result:
             continue
-        result[new_id] = dict(raw)
+        moved = dict(raw)
+        if reversed_transmitter_lls:
+            edge = by_id.get(new_id)
+            if edge is not None:
+                moved["source"] = str(getattr(edge, "source", "") or "")
+                moved["target"] = str(getattr(edge, "target", "") or "")
+        result[new_id] = moved
         result.pop(edge_id, None)
     return result
+
+
+def _arm_route_adjust_lock(worksheet_id: int) -> None:
+    """Freeze nesting and every other connection while one route is stored.
+
+    The snapshot is the worksheet as it stands after that single route write.
+    Later generation in the same run must not move the OHT sensor or drop
+    Sensor-to-Transmitter.
+    """
+    worksheet_id = int(worksheet_id)
+    sensor_ids = {
+        sensor_id for _tank_id, sensor_id in _embedded_oht_sensor_pairs(worksheet_id)
+    }
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+    for raw_id in list(st.session_state.get("selected_connections") or []):
+        _remember_connection_record(worksheet_id, str(raw_id))
+    route_overrides = dict(
+        st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}
+    )
+    for edge_id, raw in route_overrides.items():
+        edge_text = str(edge_id)
+        if (
+            _internal_sensor_transmitter_endpoints(edge_text) is None
+            and not _manual_transmitter_lls_override(edge_text, raw)
+        ):
+            continue
+        _remember_connection_record(worksheet_id, edge_text)
+        if edge_text.startswith("edge__"):
+            _remember_connection_record(worksheet_id, edge_text[6:])
+    st.session_state[f"_route_adjust_lock_{worksheet_id}"] = {
+        "sensor_boxes": {
+            sensor_id: dict(overrides.get(sensor_id) or {})
+            for sensor_id in sensor_ids
+        },
+        "embeds": [
+            dict(item)
+            for item in list(st.session_state.get(f"oht_sensor_embeds_{worksheet_id}") or [])
+            if isinstance(item, dict)
+        ],
+        "connections": [
+            str(item)
+            for item in list(st.session_state.get("selected_connections") or [])
+            if str(item or "").strip()
+        ],
+        "master": _connection_master(worksheet_id),
+        "routes": {
+            str(edge_id): dict(raw) if isinstance(raw, dict) else raw
+            for edge_id, raw in route_overrides.items()
+        },
+    }
+    st.session_state["_skip_connection_identity_sync"] = True
+
+
+def _restore_route_adjust_lock(worksheet_id: int) -> bool:
+    """Put nesting and connection ids back after a one-route update."""
+    worksheet_id = int(worksheet_id)
+    lock = st.session_state.get(f"_route_adjust_lock_{worksheet_id}")
+    if not isinstance(lock, dict):
+        return False
+    deleted_ids = {
+        str(value)
+        for value in st.session_state.get(_deleted_connection_ids_key(worksheet_id), [])
+        or []
+    }
+    st.session_state["selected_connections"] = [
+        str(item)
+        for item in list(lock.get("connections") or [])
+        if str(item or "").strip()
+        and str(item) not in deleted_ids
+        and f"edge__{item}" not in deleted_ids
+    ]
+    st.session_state[_connection_master_key(worksheet_id)] = {
+        str(connection_id): record
+        for connection_id, record in dict(lock.get("master") or {}).items()
+        if str(connection_id) not in deleted_ids
+        and f"edge__{connection_id}" not in deleted_ids
+    }
+    st.session_state[_manual_connection_overrides_key(worksheet_id)] = {
+        str(edge_id): dict(raw) if isinstance(raw, dict) else raw
+        for edge_id, raw in dict(lock.get("routes") or {}).items()
+        if str(edge_id) not in deleted_ids
+        and f"edge__{edge_id}" not in deleted_ids
+        and not _connection_pair_is_deleted(
+            worksheet_id,
+            str((raw or {}).get("source") or "") if isinstance(raw, dict) else "",
+            str((raw or {}).get("target") or "") if isinstance(raw, dict) else "",
+        )
+    }
+    st.session_state[f"_route_adjust_locked_render_{worksheet_id}"] = True
+    st.session_state.pop(f"_route_adjust_lock_{worksheet_id}", None)
+    return True
 
 
 def _apply_connection_route_move_state(worksheet_id: int, event: dict, diagram) -> bool:
@@ -11264,10 +13946,21 @@ def _apply_connection_route_move_state(worksheet_id: int, event: dict, diagram) 
     worksheet_id = int(worksheet_id)
     edge_id = str(event.get("edge_id", "") or "").strip()
     raw_points = event.get("points")
+    internal_endpoints = _internal_sensor_transmitter_endpoints(edge_id)
     valid_edge_ids = {
         str(getattr(edge, "id", "") or "")
         for edge in (getattr(diagram, "edges", []) or [])
     }
+    if internal_endpoints and edge_id not in valid_edge_ids:
+        matched_internal_edge = _diagram_edge_for_endpoints(
+            diagram,
+            internal_endpoints[0],
+            internal_endpoints[1],
+        )
+        if matched_internal_edge is not None:
+            edge_id = str(getattr(matched_internal_edge, "id", "") or "")
+        else:
+            valid_edge_ids.add(edge_id)
     if (
         not edge_id
         or edge_id not in valid_edge_ids
@@ -11302,6 +13995,9 @@ def _apply_connection_route_move_state(worksheet_id: int, event: dict, diagram) 
     if matched_edge is not None:
         existing_route["source"] = str(getattr(matched_edge, "source", "") or "")
         existing_route["target"] = str(getattr(matched_edge, "target", "") or "")
+    elif internal_endpoints is not None:
+        existing_route["source"] = internal_endpoints[0]
+        existing_route["target"] = internal_endpoints[1]
     if "arrow_control" in event:
         raw_arrow_control = event.get("arrow_control")
         if (
@@ -11320,10 +14016,64 @@ def _apply_connection_route_move_state(worksheet_id: int, event: dict, diagram) 
     route_overrides[edge_id] = existing_route
     st.session_state[overrides_key] = route_overrides
     st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
-    persist_active_worksheet_state()
+    _arm_route_adjust_lock(worksheet_id)
+    _persist_manual_route_geometry(worksheet_id, edge_id, existing_route)
     _mark_worksheet_render_sync_pending(worksheet_id)
     _mark_ppt_sync_pending(worksheet_id)
     return True
+
+
+def _persist_manual_route_geometry(worksheet_id: int, edge_id: str, route: dict) -> None:
+    """Store one route's points. Component boxes, nests, and other lines stay.
+
+    Identity sync stays off for the rest of this run so a later worksheet save
+    does not rebuild connection ids. The database write updates only this
+    edge in ``route_geometry``.
+    """
+    st.session_state["_skip_connection_identity_sync"] = True
+    _arm_route_adjust_lock(worksheet_id)
+    sheet = get_active_worksheet()
+    if int(sheet.get("id") or 0) != int(worksheet_id):
+        return
+    try:
+        project_store_module.save_manual_route_geometry(
+            worksheet_stable_id=str(sheet.get("stable_id") or ""),
+            legacy_edge_id=str(edge_id or ""),
+            points=list(route.get("points") or []),
+            mode=str(route.get("mode") or ""),
+            hidden=bool(route.get("hidden", False)),
+            arrow_direction=str(route.get("direction") or ""),
+            override=dict(route),
+        )
+    except Exception as exc:
+        log_app_error("Manual route geometry save", exc)
+
+
+def _store_connection_identity(worksheet_id: int, legacy_connection_id: str) -> None:
+    """Upsert one new connection and leave the worksheet's other lines stored."""
+    sheet = get_active_worksheet()
+    if int(sheet.get("id") or 0) != int(worksheet_id):
+        return
+    logical_id = str(legacy_connection_id or "").strip()
+    if logical_id.startswith("edge__"):
+        logical_id = logical_id[6:]
+    record = next(
+        (
+            dict(item)
+            for item in list(sheet.get("connection_identities") or [])
+            if isinstance(item, dict) and str(item.get("legacy_id") or "") == logical_id
+        ),
+        None,
+    )
+    if record is None:
+        return
+    try:
+        project_store_module.upsert_worksheet_connection(
+            worksheet_stable_id=str(sheet.get("stable_id") or ""),
+            connection_record=record,
+        )
+    except Exception as exc:
+        log_app_error("Connection identity upsert", exc)
 
 
 def _consume_pending_connection_route_moves(worksheet_id: int) -> None:
@@ -11331,7 +14081,7 @@ def _consume_pending_connection_route_moves(worksheet_id: int) -> None:
     worksheet_id = int(worksheet_id)
     diagram = st.session_state.get("diagram")
     for view_key in ("inline", "expanded"):
-        surface_key = f"diagram_normal_surface_{worksheet_id}_{view_key}"
+        surface_key = _diagram_normal_surface_key(worksheet_id, view_key)
         event = st.session_state.get(surface_key)
         if (
             not isinstance(event, dict)
@@ -11358,7 +14108,7 @@ def _consume_pending_normal_surface_component_action(worksheet_id: int) -> bool:
     connection, routing, arrow, layout or automatic-requirement rules.
     """
     worksheet_id = int(worksheet_id)
-    surface_key = f"diagram_normal_surface_{worksheet_id}_inline"
+    surface_key = _diagram_normal_surface_key(worksheet_id, "inline")
     event = st.session_state.get(surface_key)
     if not isinstance(event, dict):
         return False
@@ -11368,6 +14118,7 @@ def _consume_pending_normal_surface_component_action(worksheet_id: int) -> bool:
         "component_add",
         "component_delete",
         "connection_delete",
+        "component_display_mode",
     }:
         return False
 
@@ -11388,6 +14139,8 @@ def _consume_pending_normal_surface_component_action(worksheet_id: int) -> bool:
             worksheet_id,
             str(event.get("edge_id", "") or ""),
             st.session_state.get("diagram"),
+            str(event.get("source", "") or ""),
+            str(event.get("target", "") or ""),
         )
 
     if event_type == "component_add":
@@ -11399,6 +14152,9 @@ def _consume_pending_normal_surface_component_action(worksheet_id: int) -> bool:
                 component_name,
             )
         )
+
+    if event_type == "component_display_mode":
+        return _record_component_display_mode(worksheet_id, event)
 
     component_name = str(event.get("component", "") or "").strip()
     instance_id = str(event.get("instance_id", "") or "").strip()
@@ -11635,6 +14391,7 @@ def _lightweight_component_sprites_from_geometry(diagram, geometry: dict) -> lis
         sprites.append({
             "instance_id": node_id,
             "title": str(getattr(node, "label", node_id) or node_id),
+            "component": _component_name_from_diagram_node(node) or "",
             "box": box,
             "image_b64": "",
         })
@@ -11778,6 +14535,59 @@ def _get_cached_worksheet_render_bundle(
     return geometry, base_png, base_b64, component_sprites
 
 
+def _start_new_ppt_surface_suffix() -> str:
+    """Suffix that remounts the canvas after Start New PPT (worksheet id stays 1)."""
+    try:
+        epoch = int(st.session_state.get("_start_new_ppt_surface_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        epoch = 0
+    return f"_e{epoch}" if epoch > 0 else ""
+
+
+def _worksheet_motion_draft_key(
+    worksheet_id: int,
+    view_key: str = "inline",
+    surface_suffix: str = "",
+    *,
+    layout_prefix: str = "worksheet_motion_v46",
+) -> str:
+    """Browser draft key for component/route movement.
+
+    After a Saved-project open, include the geometry epoch so a stale
+    sessionStorage draft from another project/session cannot overwrite the
+    freeze-at-save boxes and polylines.
+    """
+    worksheet_id = int(worksheet_id)
+    view_key = str(view_key or "inline")
+    surface_suffix = str(surface_suffix or "")
+    draft_key = f"{layout_prefix}_{worksheet_id}_{view_key}{surface_suffix}"
+    if st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}"):
+        try:
+            geometry_epoch = int(
+                st.session_state.get("_saved_geometry_epoch", 0) or 0
+            )
+        except (TypeError, ValueError):
+            geometry_epoch = 0
+        if geometry_epoch > 0:
+            draft_key = f"{draft_key}_g{geometry_epoch}"
+        loaded_name = str(
+            st.session_state.get("_saved_project_loaded_filename") or ""
+        ).strip()
+        if loaded_name:
+            draft_key = (
+                f"{draft_key}_p"
+                f"{hashlib.sha256(loaded_name.encode('utf-8')).hexdigest()[:10]}"
+            )
+    return draft_key
+
+
+def _diagram_normal_surface_key(worksheet_id: int, view_key: str = "inline") -> str:
+    return (
+        f"diagram_normal_surface_{int(worksheet_id)}_{view_key}"
+        f"{_start_new_ppt_surface_suffix()}"
+    )
+
+
 def _blank_worksheet_structure_source_diagram():
     """Return a diagram only as a structural renderer source.
 
@@ -11848,10 +14658,13 @@ def _render_blank_worksheet_structure(worksheet_id: int) -> bool:
     canvas_width = float(geometry.get("width", 1.0) or 1.0)
     canvas_height = float(geometry.get("height", 1.0) or 1.0)
 
+    surface_suffix = _start_new_ppt_surface_suffix()
+
     render_revision = hashlib.sha256(
         (
             f"blank-worksheet-structure-v1|"
             f"{worksheet_id}|"
+            f"epoch={surface_suffix}|"
             f"{worksheet_display_name}|"
             f"{canvas_width:.8f}|{canvas_height:.8f}|"
             f"notes={_worksheet_annotations(worksheet_id)}"
@@ -11871,7 +14684,7 @@ def _render_blank_worksheet_structure(worksheet_id: int) -> bool:
         edit_mode=False,
         drag_only=True,
         fit_screen=True,
-        fixed_screen_height=550,
+        fixed_screen_height=700,
         expanded=False,
         initial_selected_edge=None,
         pending_connection_source_id=None,
@@ -11884,15 +14697,111 @@ def _render_blank_worksheet_structure(worksheet_id: int) -> bool:
         annotations=_worksheet_annotations(worksheet_id),
         annotation_format_color=str(st.session_state.get("annot_color_select") or "Black"),
         annotation_format_token=int(st.session_state.get("annotation_format_token") or 0),
-        local_draft_key=(
-            f"worksheet_motion_v46_{worksheet_id}_inline"
+        local_draft_key=_worksheet_motion_draft_key(
+            worksheet_id, "inline", surface_suffix
         ),
-        key=(
-            f"diagram_normal_surface_{worksheet_id}_inline"
-        ),
+        key=_diagram_normal_surface_key(worksheet_id, "inline"),
         default=None,
     )
     return True
+
+
+def _lock_sump_borewell_oht_header(
+    worksheet_id: int,
+    diagram,
+    geometry: dict,
+    route_overrides: dict,
+) -> dict:
+    """Store the top-header branches once so a later save cannot redraw them.
+
+    Hand-dragged lines stay as the user left them. A saved loop row is written
+    again only when its points are not already this path.
+    """
+    worksheet_id = int(worksheet_id)
+    # After an explicit Saved-Project open, freeze-at-save polylines are
+    # authoritative. Regenerating the live header here was the exact point that
+    # overwrote restored X/Y-aligned routes on reopen.
+    if st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}"):
+        return route_overrides
+
+    from src.connection_router import sump_borewell_oht_header_routes
+
+    boxes = dict(geometry.get("boxes") or {})
+    routed = sump_borewell_oht_header_routes(diagram, boxes)
+    if not routed:
+        return route_overrides
+    locked = dict(route_overrides)
+    sheet = get_active_worksheet()
+    worksheet_stable_id = ""
+    if int(sheet.get("id") or 0) == int(worksheet_id):
+        worksheet_stable_id = str(sheet.get("stable_id") or "")
+    changed = False
+    edges = list(getattr(diagram, "edges", []) or [])
+    for index, points in routed.items():
+        if index >= len(edges):
+            continue
+        edge = edges[index]
+        edge_id = str(getattr(edge, "id", "") or "")
+        if _connection_pair_is_deleted(
+            worksheet_id,
+            str(getattr(edge, "source", "") or ""),
+            str(getattr(edge, "target", "") or ""),
+        ):
+            continue
+        current = locked.get(edge_id)
+        if not isinstance(current, dict):
+            current = locked.get(f"edge__{edge_id}") if edge_id else None
+        if not isinstance(current, dict):
+            current = {}
+        mode = str(current.get("mode") or "")
+        if mode in {"manual_draw", "manual_drag"} or bool(current.get("custom")):
+            continue
+        # Any already-stored polyline wins over a freshly computed header.
+        existing = current.get("points")
+        if (
+            bool(current.get("stored_geometry"))
+            and isinstance(existing, list)
+            and len(existing) >= 2
+        ):
+            continue
+        exact = [[float(point[0]), float(point[1])] for point in points]
+        same_points = (
+            isinstance(existing, list)
+            and len(existing) == len(exact)
+            and all(
+                abs(float(left[0]) - right[0]) < 1e-3
+                and abs(float(left[1]) - right[1]) < 1e-3
+                for left, right in zip(existing, exact)
+            )
+        )
+        if mode == "sump_tank_bore_loop" and same_points:
+            continue
+        record = dict(current)
+        record["points"] = exact
+        record["mode"] = "sump_tank_bore_loop"
+        record["stored_geometry"] = True
+        record["source"] = str(getattr(edge, "source", "") or "")
+        record["target"] = str(getattr(edge, "target", "") or "")
+        record["direction"] = str(record.get("direction") or "source_to_target")
+        locked[edge_id] = record
+        changed = True
+        if not worksheet_stable_id:
+            continue
+        try:
+            project_store_module.save_manual_route_geometry(
+                worksheet_stable_id=worksheet_stable_id,
+                legacy_edge_id=edge_id,
+                points=exact,
+                mode="sump_tank_bore_loop",
+                hidden=bool(record.get("hidden", False)),
+                arrow_direction=str(record.get("direction") or ""),
+                override=record,
+            )
+        except Exception as exc:
+            log_app_error("Header route geometry save", exc)
+    if changed:
+        st.session_state[_manual_connection_overrides_key(worksheet_id)] = locked
+    return locked
 
 
 def _orthogonalize_manual_points(points: list) -> list:
@@ -11921,6 +14830,25 @@ def _orthogonalize_manual_points(points: list) -> list:
         if abs(point[0] - corner[0]) > 1e-3 or abs(point[1] - corner[1]) > 1e-3:
             cleaned.append(point)
     return cleaned
+
+
+def _bind_open_canvas_route(points, source_box, target_box):
+    """Attach a non-water line to the components currently on the canvas."""
+    from src.renderers import _bind_open_route_to_boxes, _point_on_box_edge
+
+    if not isinstance(points, list) or len(points) < 2:
+        return points
+    try:
+        current = [[float(point[0]), float(point[1])] for point in points]
+    except (TypeError, ValueError, IndexError):
+        return points
+    if (
+        _point_on_box_edge(current[0], source_box)
+        and _point_on_box_edge(current[-1], target_box)
+    ):
+        return current
+    bound = _bind_open_route_to_boxes(current, source_box, target_box)
+    return [[float(point[0]), float(point[1])] for point in bound]
 
 
 def _drop_worksheet_manual_lines(worksheet_id: int, *, include_dragged: bool) -> bool:
@@ -12016,22 +14944,35 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
     """Normal worksheet view: hovering a component shows +; only + duplicates it."""
     if diagram is None:
         return
-    route_overrides = _rebind_locked_route_overrides(
-        diagram,
-        dict(st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}),
-    )
+    route_adjust_locked = _restore_route_adjust_lock(worksheet_id)
+    _ensure_oht_sensor_embeds(worksheet_id, diagram)
+    if route_adjust_locked:
+        route_overrides = dict(
+            st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}
+        )
+    else:
+        route_overrides = _rebind_locked_route_overrides(
+            diagram,
+            dict(st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}),
+        )
     if route_overrides != dict(
         st.session_state.get(_manual_connection_overrides_key(worksheet_id), {}) or {}
     ):
         st.session_state[_manual_connection_overrides_key(worksheet_id)] = route_overrides
-    bound_route_overrides = _lock_manual_draw_routes(
-        diagram,
-        route_overrides,
-        worksheet_id,
-    )
+    if route_adjust_locked:
+        bound_route_overrides = route_overrides
+    else:
+        bound_route_overrides = _lock_manual_draw_routes(
+            diagram,
+            route_overrides,
+            worksheet_id,
+        )
     if bound_route_overrides != route_overrides:
         st.session_state[_manual_connection_overrides_key(worksheet_id)] = bound_route_overrides
         route_overrides = bound_route_overrides
+    # Manual selection only: if this live node has a PostgreSQL-saved box, use it.
+    # Never restores connections.
+    _apply_saved_pg_positions_for_live_components(worksheet_id, diagram=diagram)
     component_overrides = dict(
         st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
     )
@@ -12043,10 +14984,14 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
     layout_signature_key = f"_auto_layout_component_ids_{worksheet_id}"
     layout_rule_key = f"_auto_layout_rule_{worksheet_id}"
     layout_rule = "sumps-left-oht-top-v2"
-    if (
+    preserve_component_layout = bool(
+        st.session_state.pop(f"_preserve_component_layout_{worksheet_id}", False)
+    )
+    layout_signature_changed = (
         st.session_state.get(layout_signature_key) != layout_signature
         or st.session_state.get(layout_rule_key) != layout_rule
-    ):
+    )
+    if layout_signature_changed and not preserve_component_layout:
         release_ids = [
             str(getattr(node, "id", "") or "")
             for node in (getattr(diagram, "nodes", []) or [])
@@ -12057,6 +15002,15 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                 saved = dict(component_overrides.get(node_id) or {})
                 if "box" not in saved:
                     continue
+                # Never discard calibrated placements: moved, restored, or any
+                # freeze-on-save box must survive component-set changes.
+                if bool(saved.get("moved") or saved.get("restored")):
+                    continue
+                if _valid_canvas_box(saved.get("box")) is not None:
+                    saved["moved"] = True
+                    saved["restored"] = True
+                    component_overrides[node_id] = saved
+                    continue
                 saved.pop("box", None)
                 if saved:
                     component_overrides[node_id] = saved
@@ -12064,6 +15018,11 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                     component_overrides.pop(node_id, None)
             st.session_state[_manual_component_overrides_key(worksheet_id)] = component_overrides
             st.session_state[f"_release_sump_layout_{worksheet_id}"] = True
+        st.session_state[layout_signature_key] = layout_signature
+        st.session_state[layout_rule_key] = layout_rule
+    elif layout_signature_changed:
+        # A control selection already stored the current boxes. Remember the
+        # new component set without sending sumps and tanks back to the start.
         st.session_state[layout_signature_key] = layout_signature
         st.session_state[layout_rule_key] = layout_rule
     merged_component_overrides = _merge_moved_canvas_boxes(
@@ -12085,6 +15044,7 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         component_overrides,
         geometry.get("boxes"),
     )
+    st.session_state.pop(f"_route_adjust_locked_render_{worksheet_id}", None)
     if pinned_sensor_overrides != component_overrides:
         component_overrides = pinned_sensor_overrides
         st.session_state[_manual_component_overrides_key(worksheet_id)] = component_overrides
@@ -12107,8 +15067,42 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
 
     canvas_width = float(geometry.get("width", 1.0) or 1.0)
     canvas_height = float(geometry.get("height", 1.0) or 1.0)
+    # Saved reopen: exact freeze-at-save page size wins over regenerated
+    # ``_dynamic_canvas_spec`` so fit_screen cannot shrink the diagram.
+    canvas_width, canvas_height = _apply_freeze_canvas_size(
+        worksheet_id, canvas_width, canvas_height
+    )
+    if isinstance(geometry, dict):
+        geometry = dict(geometry)
+        geometry["width"] = canvas_width
+        geometry["height"] = canvas_height
     hidden = set(geometry.get("hidden_components", []) or [])
     box_map = dict(geometry.get("boxes", {}) or {})
+    # Snapshot for freeze-on-save so never-dragged positions still persist.
+    # Never replace a Saved-open pinned canvas size with a denser regenerated page.
+    _pinned_canvas = st.session_state.get(_freeze_canvas_size_key(worksheet_id))
+    if (
+        isinstance(_pinned_canvas, (tuple, list))
+        and len(_pinned_canvas) == 2
+        and _valid_saved_canvas_size(_pinned_canvas[0], _pinned_canvas[1])
+    ):
+        canvas_width = float(_pinned_canvas[0])
+        canvas_height = float(_pinned_canvas[1])
+        if isinstance(geometry, dict):
+            geometry["width"] = canvas_width
+            geometry["height"] = canvas_height
+    try:
+        st.session_state[f"_last_worksheet_geometry_{worksheet_id}"] = {
+            "boxes": copy.deepcopy(box_map),
+            "width": canvas_width,
+            "height": canvas_height,
+        }
+    except Exception:
+        st.session_state[f"_last_worksheet_geometry_{worksheet_id}"] = {
+            "boxes": dict(box_map),
+            "width": canvas_width,
+            "height": canvas_height,
+        }
 
     # Worksheet component-image visibility fix only.
     #
@@ -12471,6 +15465,7 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                     _item["box"] = list(box_map[_iid])
 
     _sync_canvas_components(diagram, worksheet_id, box_map)
+    _force_nested_sensor_boxes(worksheet_id, box_map, normal_components)
     _anchor_transmitter_lines_to_internal_sensors(
         diagram,
         worksheet_id,
@@ -12494,15 +15489,104 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             "left": x, "top": y, "width": w, "height": h,
         })
     view_key = "expanded" if expanded else "inline"
+    route_overrides = _lock_sump_borewell_oht_header(
+        worksheet_id,
+        diagram,
+        geometry,
+        route_overrides,
+    )
     # Worksheet drag/drop uses the same renderer geometry and exact component
     # sprites as the existing professional editor, but exposes ONLY component
     # movement in the normal Worksheet. Existing click-to-connect, + duplicate,
     # delete, rendering, export and Edit Mode behavior remain unchanged.
     normal_routes = []
+    _water_component_names = {"Sump", "OHT Tank", "Bore Well", "Well"}
+    _water_id_prefixes = ("sump_", "oht_", "bore_", "well_")
+    _inline_process_names = {
+        "Motorized Valve (MV)",
+        "Pressure Relief Valve (PRV)",
+        "Non-Return Valve (NRV)",
+        "Ultrasonic Flow Meter",
+        "Flush Flow Meter",
+        "Electromagnetic Flow Meter",
+    }
+    _inline_process_prefixes = ("mv_", "prv_", "nrv_", "ufm_", "ffm_", "emfm_")
+    _route_component_names = {
+        str(getattr(_node, "id", "") or ""): (
+            _component_name_from_diagram_node(_node) or ""
+        )
+        for _node in (getattr(diagram, "nodes", []) or [])
+    }
+
+    def _pair_is_water_flow(_source_id, _target_id) -> bool:
+        _source_id = str(_source_id or "")
+        _target_id = str(_target_id or "")
+        _source_name = _route_component_names.get(_source_id, "")
+        _target_name = _route_component_names.get(_target_id, "")
+        if (
+            _source_name in _water_component_names
+            and _target_name in _water_component_names
+        ):
+            return True
+        _source_water = _source_name in _water_component_names or any(
+            _source_id.startswith(prefix) for prefix in _water_id_prefixes
+        )
+        _target_water = _target_name in _water_component_names or any(
+            _target_id.startswith(prefix) for prefix in _water_id_prefixes
+        )
+        _source_inline = _source_name in _inline_process_names or any(
+            _source_id.startswith(prefix) for prefix in _inline_process_prefixes
+        )
+        _target_inline = _target_name in _inline_process_names or any(
+            _target_id.startswith(prefix) for prefix in _inline_process_prefixes
+        )
+        if (_source_water and _target_inline) or (_source_inline and _target_water):
+            return True
+        return (
+            bool(_source_id)
+            and bool(_target_id)
+            and any(_source_id.startswith(prefix) for prefix in _water_id_prefixes)
+            and any(_target_id.startswith(prefix) for prefix in _water_id_prefixes)
+        )
 
     def _route_payload(_edge_id, _route, _points):
-        _route_is_dotted = bool(_route.get("dotted", False))
-        _worksheet_route_color = "#000000" if _route_is_dotted else "#123DBD"
+        _source_id = str(_route.get("source", "") or "")
+        _target_id = str(_route.get("target", "") or "")
+        _route_is_water = (
+            bool(_route.get("sketch_lock"))
+            or bool(_route.get("fluid_header"))
+            or _pair_is_water_flow(_source_id, _target_id)
+            or str(_edge_id).startswith("fluid_header_")
+        )
+        _route_is_sensor_tx = (
+            not _route_is_water
+            and (
+                bool(_route.get("sensor_transmitter"))
+                or _node_pair_is_transmitter_lls(_source_id, _target_id)
+            )
+        )
+        # Fluid pipelines are always continuous solid blue. Dotted is reserved
+        # for sensor/control signal lines only.
+        _route_is_dotted = False if _route_is_water else True
+        _worksheet_route_color = "#123DBD" if _route_is_water else "#000000"
+        _override_cfg = (
+            route_overrides.get(str(_edge_id))
+            or route_overrides.get(f"edge__{_edge_id}")
+            or {}
+        )
+        _override_mode = str((_override_cfg or {}).get("mode") or "")
+        # Freeze-at-save / manual polylines must reach the browser as custom so
+        # client header/bore helpers cannot regenerate over sealed points.
+        _override_points = list((_override_cfg or {}).get("points") or [])
+        _route_is_custom = bool(
+            _route.get("custom")
+            or (_override_cfg or {}).get("custom")
+            or (
+                (_override_cfg or {}).get("stored_geometry")
+                and len(_override_points) >= 2
+            )
+            or _override_mode in {"manual_draw", "manual_drag"}
+        )
         return {
             "edge_id": str(_edge_id),
             "points": _points,
@@ -12517,16 +15601,107 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             "source": str(_route.get("source", "") or ""),
             "target": str(_route.get("target", "") or ""),
             "hidden": bool(_route.get("hidden", False)),
-            "manual_drag": str(
-                (route_overrides.get(str(_edge_id)) or {}).get("mode") or ""
-            )
-            == "manual_drag",
+            "sensor_transmitter": _route_is_sensor_tx,
+            "sketch_lock": bool(_route.get("sketch_lock")) or _route_is_water,
+            "custom": _route_is_custom,
+            "mode": _override_mode or str(_route.get("mode") or ""),
+            "stored_geometry": bool(
+                _route.get("sketch_lock")
+                or _route.get("custom")
+                or _route.get("stored_geometry")
+                or _route_is_custom
+                or _route_is_water
+                or _route_is_sensor_tx
+                or (_override_cfg or {}).get("stored_geometry")
+                or _override_mode in {"manual_draw", "manual_drag"}
+            ),
+            "manual_drag": bool(
+                _route_is_custom
+                or _route.get("custom")
+                or _override_mode in {"manual_draw", "manual_drag"}
+            ),
             "arrow_control": (
-                route_overrides.get(str(_edge_id), {}).get("arrow_control")
+                (_override_cfg or {}).get("arrow_control")
             ),
         }
 
     _special_route_points = {}
+    _sketch_layout_active = False
+    # Saved-project freeze: never regenerate sketch water-loops over sealed routes.
+    _saved_routes_locked = bool(
+        st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}")
+    )
+    if (
+        not _saved_routes_locked
+        and len(_layout_sumps) >= 1
+        and len(_layout_ohts) >= 1
+    ):
+        _sketch_layout_active = True
+
+        def _sketch_box(_node_id):
+            _box = box_map.get(str(_node_id))
+            if not _valid_component_box(_box):
+                return None
+            return [float(_value) for _value in _box]
+
+        from src.connection_router import shared_sump_oht_header_y, water_loop_polyline
+
+        _header_kinds = {}
+        for _sump_node in _layout_sumps:
+            _header_kinds[str(getattr(_sump_node, "id", "") or "")] = "sump"
+        for _oht_node in _layout_ohts:
+            _header_kinds[str(getattr(_oht_node, "id", "") or "")] = "oht"
+        for _bore_node in _layout_borewells:
+            _header_kinds[str(getattr(_bore_node, "id", "") or "")] = "bore"
+        _shared_header_y = shared_sump_oht_header_y(
+            box_map,
+            _header_kinds,
+            canvas_height=canvas_height,
+        )
+
+        for _sump_node in _layout_sumps:
+            for _oht_node in _layout_ohts:
+                _sump_id = str(getattr(_sump_node, "id", "") or "")
+                _oht_id = str(getattr(_oht_node, "id", "") or "")
+                _sump_box = _sketch_box(_sump_id)
+                _oht_box = _sketch_box(_oht_id)
+                if _sump_box is None or _oht_box is None:
+                    continue
+                _path = water_loop_polyline(
+                    _sump_box,
+                    _oht_box,
+                    "sump",
+                    "oht",
+                    canvas_height=canvas_height,
+                    header_y=_shared_header_y,
+                )
+                if not _path or len(_path) < 2:
+                    continue
+                _tank_path = [[float(_point[0]), float(_point[1])] for _point in _path]
+                _special_route_points[(_sump_id, _oht_id)] = _tank_path
+                _special_route_points[(_oht_id, _sump_id)] = _tank_path
+
+        for _bore_node in _layout_borewells:
+            for _sump_node in _layout_sumps:
+                _bore_id = str(getattr(_bore_node, "id", "") or "")
+                _sump_id = str(getattr(_sump_node, "id", "") or "")
+                _bore_box = _sketch_box(_bore_id)
+                _sump_box = _sketch_box(_sump_id)
+                if _bore_box is None or _sump_box is None:
+                    continue
+                _path = water_loop_polyline(
+                    _bore_box,
+                    _sump_box,
+                    "bore",
+                    "sump",
+                    canvas_height=canvas_height,
+                )
+                if not _path or len(_path) < 2:
+                    continue
+                _return_path = [[float(_point[0]), float(_point[1])] for _point in _path]
+                _special_route_points[(_bore_id, _sump_id)] = _return_path
+                _special_route_points[(_sump_id, _bore_id)] = _return_path
+
     if _black_layout_active and _black_layout_ids:
         _sid1 = _black_layout_ids["sump1"]
         _sid2 = _black_layout_ids["sump2"]
@@ -12673,47 +15848,178 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                 if _drawn is not None:
                     _special_route_points[("edge", str(getattr(_edge, "id", "") or ""))] = _drawn
 
+    _embedded_sensor_pairs = set(_embedded_oht_sensor_pairs(worksheet_id))
     for edge_id, route in dict(geometry.get("routes", {}) or {}).items():
         if not isinstance(route, dict):
             continue
 
         _source_id = str(route.get("source", "") or "")
         _target_id = str(route.get("target", "") or "")
-        _points = _special_route_points.get((_source_id, _target_id))
-        if _points is None:
-            _points = _special_route_points.get(("edge", str(edge_id)))
-
-        # If a renderer reports a logically identical route in reverse endpoint
-        # order, reverse the prepared path while preserving its route metadata.
-        if _points is None:
-            _reverse_points = _special_route_points.get((_target_id, _source_id))
-            if _reverse_points is not None:
-                _points = list(reversed(_reverse_points))
-
-        if _points is None:
+        _deleted_edge_ids = {
+            str(value)
+            for value in st.session_state.get(_deleted_connection_ids_key(worksheet_id), [])
+            or []
+        }
+        if (
+            str(edge_id) in _deleted_edge_ids
+            or str(edge_id).removeprefix("edge__") in _deleted_edge_ids
+            or f"edge__{str(edge_id).removeprefix('edge__')}" in _deleted_edge_ids
+            or _connection_pair_is_deleted(worksheet_id, _source_id, _target_id)
+        ):
+            continue
+        _edge_tokens = set(str(edge_id).split("__"))
+        _joins_internal_sensor = (
+            (_source_id, _target_id) in _embedded_sensor_pairs
+            or (_target_id, _source_id) in _embedded_sensor_pairs
+            or any(
+                tank_id in _edge_tokens and sensor_id in _edge_tokens
+                for tank_id, sensor_id in _embedded_sensor_pairs
+            )
+        )
+        if _joins_internal_sensor:
+            _hidden_route = dict(route)
+            _hidden_route["hidden"] = True
             _points = route.get("points", [])
+            normal_routes.append(_route_payload(edge_id, _hidden_route, _points))
+            continue
+        _override = route_overrides.get(str(edge_id)) or route_overrides.get(
+            f"edge__{edge_id}"
+        ) or {}
+        # Exact overwrite point (Saved reopen): regenerated sketch water-loops in
+        # `_special_route_points` were preferred over freeze-at-save polylines for
+        # sump↔oht / bore↔sump pairs, so reopen moved connection alignment even
+        # when component boxes were restored correctly.
+        _saved_points = list((_override or {}).get("points") or [])
+        if len(_saved_points) < 2:
+            _saved_points = list(route.get("points") or [])
+        _prefer_saved_route = len(_saved_points) >= 2 and (
+            bool(
+                st.session_state.get(
+                    f"_saved_project_routes_locked_{worksheet_id}"
+                )
+            )
+            or bool((_override or {}).get("stored_geometry"))
+            or bool((_override or {}).get("custom"))
+            or str((_override or {}).get("mode") or "")
+            in {"manual_draw", "manual_drag", "sump_tank_bore_loop"}
+            or bool(route.get("custom"))
+            or bool(route.get("stored_geometry"))
+        )
+        if _prefer_saved_route:
+            _points = _saved_points
+        else:
+            _points = _special_route_points.get((_source_id, _target_id))
+            if _points is None:
+                _points = _special_route_points.get(("edge", str(edge_id)))
+
+            # The sketch path is stored in both endpoint orders with the arrow at
+            # the last point. Do not reverse it.
+            if _points is None and not _sketch_layout_active:
+                _reverse_points = _special_route_points.get((_target_id, _source_id))
+                if _reverse_points is not None:
+                    _points = list(reversed(_reverse_points))
+            elif _points is None and _sketch_layout_active:
+                _points = _special_route_points.get((_target_id, _source_id))
+
+            if _points is None:
+                _points = route.get("points", [])
 
         # Old automatic geometry stays at the previous component positions.
         # For both targeted layouts, drop every route that is not one of
         # the sketch paths so stale lines cannot remain.
         _any_special_layout = (
-            (_black_layout_active or _moht_layout_active) and _special_route_points
+            (_black_layout_active or _moht_layout_active or _sketch_layout_active)
+            and _special_route_points
         )
+        _manual_route = (
+            bool(route.get("custom"))
+            or str(edge_id).startswith("manual__")
+            or str(edge_id).startswith("sketch_loop__")
+            or str((_override or {}).get("mode") or "") in {"manual_draw", "manual_drag"}
+            or bool((_override or {}).get("custom"))
+            or bool((_override or {}).get("stored_geometry"))
+        )
+        _water_loop_pair = _sketch_layout_active and (
+            (_source_id, _target_id) in _special_route_points
+            or (_target_id, _source_id) in _special_route_points
+        )
+        if _prefer_saved_route:
+            pass
+        elif _manual_route and not _water_loop_pair:
+            _manual_saved_points = list(route.get("points") or [])
+            if len(_manual_saved_points) >= 2:
+                _points = _manual_saved_points
+        elif not _water_loop_pair:
+            _points = _bind_open_canvas_route(
+                _points,
+                box_map.get(_source_id),
+                box_map.get(_target_id),
+            )
+        _matched = False
         if _any_special_layout:
             _matched = (
                 (_source_id, _target_id) in _special_route_points
                 or ("edge", str(edge_id)) in _special_route_points
                 or (_target_id, _source_id) in _special_route_points
             )
-            if not _matched and not bool(route.get("dotted", False)):
+            if (
+                not _sketch_layout_active
+                and not _matched
+                and not _manual_route
+                and not bool(route.get("dotted", False))
+            ):
                 _hidden_route = dict(route)
                 _hidden_route["hidden"] = True
                 normal_routes.append(_route_payload(edge_id, _hidden_route, _points))
                 continue
 
-        normal_routes.append(_route_payload(edge_id, route, _points))
+        _draw_route = route
+        if _sketch_layout_active and _matched:
+            _draw_route = dict(route)
+            _draw_route["sketch_lock"] = True
+            _draw_route["edge_direction"] = "source_to_target"
+            _draw_route["original_edge_direction"] = "source_to_target"
+        normal_routes.append(_route_payload(edge_id, _draw_route, _points))
 
-    if (_black_layout_active or _moht_layout_active) and _special_route_points:
+    # Global guardrail: never invent placeholder connection lines. Geometry may
+    # restyle an already-selected edge, but missing pairs stay unconnected until
+    # Manual Draw or an explicit required-connection selection creates them.
+    if False and _sketch_layout_active and _special_route_points:
+        _drawn_pairs = {
+            tuple(sorted((
+                str(item.get("source", "") or ""),
+                str(item.get("target", "") or ""),
+            )))
+            for item in normal_routes
+            if isinstance(item, dict) and not item.get("hidden")
+        }
+        _added_pairs = set()
+        for (_src, _dst), _pts in list(_special_route_points.items()):
+            if not isinstance(_src, str) or _src == "edge" or not isinstance(_dst, str):
+                continue
+            _pair = tuple(sorted((_src, _dst)))
+            if _pair in _added_pairs or _pair in _drawn_pairs:
+                continue
+            if _connection_pair_is_deleted(worksheet_id, _src, _dst):
+                continue
+            _added_pairs.add(_pair)
+            normal_routes.append({
+                "edge_id": f"sketch_loop__{_src}__{_dst}",
+                "points": _pts,
+                "original_points": _pts,
+                "color": "#123DBD",
+                "dotted": False,
+                "direction": "source_to_target",
+                "original_direction": "source_to_target",
+                "source": _src,
+                "target": _dst,
+                "hidden": False,
+                "stored_geometry": True,
+                "manual_drag": True,
+                "sketch_lock": True,
+            })
+
+    if False and (_black_layout_active or _moht_layout_active) and _special_route_points:
         _drawn_pairs = {
             (str(item.get("source", "") or ""), str(item.get("target", "") or ""))
             for item in normal_routes
@@ -12737,6 +16043,47 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                 "hidden": False,
                 "arrow_control": None,
             })
+
+    _append_unmatched_manual_transmitter_lls_routes(normal_routes, route_overrides)
+    _ensure_explicit_sensor_transmitter_routes(
+        worksheet_id,
+        diagram,
+        box_map,
+        normal_routes,
+    )
+    # Seat first so header drops can thread through docked FM/MV waypoints.
+    _force_inline_oht_drop_devices(
+        worksheet_id,
+        diagram,
+        box_map,
+        normal_components,
+        canvas_height=canvas_height,
+    )
+    _force_unified_fluid_header_routes(
+        worksheet_id,
+        diagram,
+        box_map,
+        normal_routes,
+        canvas_height=canvas_height,
+    )
+    # After the shared header owns covered tanks, add vertical docks only for
+    # user-linked Valve/FM → OHT pairs that are not on a fluid_header_drop.
+    _force_inline_oht_drop_devices(
+        worksheet_id,
+        diagram,
+        box_map,
+        normal_components,
+        canvas_height=canvas_height,
+        normal_routes=normal_routes,
+    )
+    _force_bore_sump_return_routes(
+        worksheet_id,
+        diagram,
+        box_map,
+        normal_routes,
+        canvas_height=canvas_height,
+    )
+    _purge_unsolicited_dotted_routes(worksheet_id, normal_routes)
 
     # Wireless visual marker only. The Wi-Fi symbol follows the user's explicit
     # Wireless mode selection only. Automatic and Wired must never display it,
@@ -12947,6 +16294,62 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         }
 
     normal_components = list(draggable_by_id.values())
+    # Re-stamp user-linked Valve/FM → OHT dock tags after drag payload rebuild.
+    _oht_inline_docks = _explicit_oht_inline_assignments(
+        worksheet_id,
+        diagram,
+        normal_routes,
+    )
+    _canvas_display_sheet = dict(
+        _canvas_component_sheet(worksheet_id, publish=False) or {}
+    )
+    _instance_display_modes = {
+        str(inst.get("legacy_node_id") or ""): inst.get("display_mode")
+        for inst in list(
+            (get_active_worksheet() or {}).get("component_instances") or []
+        )
+        if isinstance(inst, dict) and str(inst.get("legacy_node_id") or "").strip()
+    }
+    for item in normal_components:
+        if not isinstance(item, dict):
+            continue
+        device_id = str(item.get("instance_id") or "")
+        if device_id in _oht_inline_docks:
+            item["oht_drop_tank_id"] = _oht_inline_docks[device_id]
+        elif _is_oht_inline_drop_device(device_id):
+            item.pop("oht_drop_tank_id", None)
+        # Presentation-only acronym plate text for optional letter display mode.
+        _custom_metadata = dict(component_overrides.get(device_id) or {})
+        item["label"] = str(
+            _custom_metadata.get("label")
+            or _custom_metadata.get("title")
+            or item.get("title")
+            or ""
+        )
+        item["acronym"] = str(
+            _custom_metadata.get("acronym")
+            or component_acronym_for_name(
+                _custom_metadata.get("label")
+                or _custom_metadata.get("title")
+                or item.get("component")
+                or item.get("title")
+                or ""
+            )
+        )
+        for _metadata_key in ("configuration", "config"):
+            if isinstance(_custom_metadata.get(_metadata_key), dict):
+                item[_metadata_key] = copy.deepcopy(_custom_metadata[_metadata_key])
+        # Per-component mode first; identity-row mode survives delete/rebuild.
+        _override_mode = dict(component_overrides.get(device_id) or {})
+        _sheet_mode = dict(_canvas_display_sheet.get(device_id) or {})
+        item["display_mode"] = resolve_component_display_mode(
+            _override_mode.get("display_mode"),
+            _sheet_mode.get("display_mode"),
+            _instance_display_modes.get(device_id),
+            item.get("display_mode"),
+            st.session_state.get(_worksheet_component_display_mode_key(worksheet_id)),
+            component_name=item.get("component") or item.get("title") or "",
+        )
 
     # Frontend performance only: tell the existing custom component when its
     # actual visual payload is unchanged.  This lets it preserve the already
@@ -12986,6 +16389,7 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         (
             f"component-visibility-protected-v4|"
             f"{_worksheet_render_bundle_key(diagram, worksheet_id, route_overrides, component_overrides)}|"
+            f"saved_project_refresh={st.session_state.get(f'_saved_project_canvas_refresh_generation_{worksheet_id}', 0)}|"
             f"{view_key}|{pending_source_id or ''}|{int(wireless_active_for_worksheet)}|"
             f"{worksheet_display_name}|{lls_asset_revision}|"
             f"black_layout={int(_black_layout_active)}|"
@@ -12993,7 +16397,10 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             f"{canvas_width:.8f}|{canvas_height:.8f}|{saved_editor_signature}|"
             f"oht_sensor={st.session_state.get(f'oht_sensor_embeds_{worksheet_id}') or []}|"
             f"canvas={_canvas_component_signature(worksheet_id)}|"
-            f"notes={_worksheet_annotations(worksheet_id)}"
+            f"notes={_worksheet_annotations(worksheet_id)}|"
+            f"deleted={st.session_state.get(_deleted_connection_ids_key(worksheet_id)) or []}|"
+            f"deleted_pairs={st.session_state.get(_deleted_connection_pairs_key(worksheet_id)) or []}|"
+            f"display={sorted((str(c.get('instance_id') or ''), str(c.get('display_mode') or 'icons')) for c in normal_components if isinstance(c, dict))}"
         ).encode("utf-8")
     ).hexdigest()
 
@@ -13010,11 +16417,21 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         background_contains_components=False,
         edit_mode=False,
         drag_only=True,
+        # While Saved-locked, every paint uses the freeze-at-save payload as SoT.
+        # (A one-shot flag left force* / session route-merge free to invent lines
+        # on the next remount.)
+        freeze_saved_geometry=bool(
+            st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}")
+            or st.session_state.pop(
+                f"_freeze_saved_geometry_once_{worksheet_id}",
+                False,
+            )
+        ),
         # Keep the existing Zoom In dialog, but also fit the complete diagram
         # inside the enlarged Worksheet viewport so no selected component image
         # is clipped or pushed outside the visible zoomed area.
         fit_screen=True,
-        fixed_screen_height=550 if not bool(expanded) else 620,
+        fixed_screen_height=700,
         # The Streamlit dialog already provides the Zoom In/expanded UI.
         # Keep the editor surface in its normal coordinate mode inside that larger
         # viewport so component images, labels and routes are not shifted/clipped.
@@ -13031,20 +16448,28 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         oht_sensor_embeds=list(
             st.session_state.get(f"oht_sensor_embeds_{worksheet_id}") or []
         ),
+        deleted_connection_pairs=list(
+            st.session_state.get(_deleted_connection_pairs_key(worksheet_id)) or []
+        ),
         annotations=_worksheet_annotations(worksheet_id),
         annotation_format_color=str(st.session_state.get("annot_color_select") or "Black"),
         annotation_format_token=int(st.session_state.get("annotation_format_token") or 0),
         render_revision=normal_render_revision,
-        local_draft_key=(
-            f"worksheet_motion_black_layout_v1_{worksheet_id}_{view_key}"
-            if _black_layout_active
-            else (
-                f"worksheet_motion_moht_layout_v1_{worksheet_id}_{view_key}"
-                if _moht_layout_active
-                else f"worksheet_motion_v46_{worksheet_id}_{view_key}"
-            )
+        local_draft_key=_worksheet_motion_draft_key(
+            worksheet_id,
+            view_key,
+            _start_new_ppt_surface_suffix(),
+            layout_prefix=(
+                "worksheet_motion_black_layout_v1"
+                if _black_layout_active
+                else (
+                    "worksheet_motion_moht_layout_v1"
+                    if _moht_layout_active
+                    else "worksheet_motion_v46"
+                )
+            ),
         ),
-        key=f"diagram_normal_surface_{worksheet_id}_{view_key}",
+        key=_diagram_normal_surface_key(worksheet_id, view_key),
         default=None,
     )
     if not isinstance(event, dict):
@@ -13081,27 +16506,49 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         if len(points) < 2:
             return
         edge_id = str(event.get("edge_id", "") or "").strip() or (
-            f"manual__{source_id or 'canvas'}__{target_id or 'canvas'}"
+            f"manual__{uuid.uuid4()}"
         )
+        source_name = ""
+        target_name = ""
+        for _node in (getattr(diagram, "nodes", []) or []):
+            _node_id = str(getattr(_node, "id", "") or "")
+            _node_name = _component_name_from_diagram_node(_node) or ""
+            if _node_id == source_id:
+                source_name = _node_name
+            elif _node_id == target_id:
+                target_name = _node_name
+        water_names = {"Sump", "OHT Tank", "Bore Well", "Well"}
+        water_line = source_name in water_names and target_name in water_names
         overrides_key = _manual_connection_overrides_key(worksheet_id)
-        drawn_overrides = dict(st.session_state.get(overrides_key, {}) or {})
-        drawn_overrides[edge_id] = {
-            "points": points,
-            "custom": True,
-            "source": source_id,
-            "target": target_id,
-            "direction": "source_to_target",
-            "color": "#123DBD",
-            "mode": "manual_draw",
+        # Immutable append into the overrides map — never replace the collection.
+        drawn_overrides = {
+            **dict(st.session_state.get(overrides_key, {}) or {}),
+            edge_id: {
+                "points": points,
+                "custom": True,
+                "source": source_id,
+                "target": target_id,
+                "source_name": source_name,
+                "target_name": target_name,
+                "source_handle": f"{source_id}:auto" if source_id else "",
+                "target_handle": f"{target_id}:auto" if target_id else "",
+                "direction": "source_to_target",
+                "color": "#123DBD" if water_line else "#000000",
+                "dotted": not water_line,
+                "mode": "manual_draw",
+                "stored_geometry": True,
+            },
         }
         st.session_state[overrides_key] = drawn_overrides
         if source_id and target_id:
             pair_key = f"_manual_draw_pairs_{worksheet_id}"
-            pairs = dict(st.session_state.get(pair_key, {}) or {})
-            pairs[f"{source_id}|{target_id}"] = {
-                "points": points,
-                "source": source_id,
-                "target": target_id,
+            pairs = {
+                **dict(st.session_state.get(pair_key, {}) or {}),
+                f"{source_id}|{target_id}": {
+                    "points": points,
+                    "source": source_id,
+                    "target": target_id,
+                },
             }
             st.session_state[pair_key] = pairs
             selected_names = list(st.session_state.get("selected_components", []) or [])
@@ -13109,125 +16556,16 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                 (
                     option
                     for option in allowed_connection_options(selected_names)
-                    if {str(option.source_id), str(option.target_id)} == {source_id, target_id}
+                    if {str(option.source_id), str(option.target_id)}
+                    == {source_id, target_id}
                 ),
                 None,
             )
-            if matching_option is not None:
-                deleted_ids = {
-                    str(value)
-                    for value in st.session_state.get(
-                        _deleted_connection_ids_key(worksheet_id), []
-                    )
-                    or []
-                }
-                deleted_ids.difference_update(
-                    {str(matching_option.id), f"edge__{matching_option.id}"}
-                )
-                st.session_state[_deleted_connection_ids_key(worksheet_id)] = sorted(
-                    deleted_ids
-                )
-                selected_ids = list(st.session_state.get("selected_connections", []) or [])
-                if matching_option.id not in selected_ids:
-                    selected_ids.append(matching_option.id)
-                    st.session_state["selected_connections"] = selected_ids
-                    transport_settings = dict(
-                        st.session_state.get("connection_transport_settings", {}) or {}
-                    )
-                    transport_settings.setdefault(
-                        matching_option.id,
-                        _default_connection_transport_setting(),
-                    )
-                    st.session_state["connection_transport_settings"] = transport_settings
-                    generation_key = f"connection_picker_generation_{worksheet_id}"
-                    st.session_state[generation_key] = int(
-                        st.session_state.get(generation_key, 0) or 0
-                    ) + 1
-        st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
-        persist_active_worksheet_state()
-        _mark_worksheet_render_sync_pending(worksheet_id)
-        _mark_ppt_sync_pending(worksheet_id)
-        st.rerun()
-        return
-
-    if event_type == "connection_delete":
-        edge_id = str(event.get("edge_id", "") or "").strip()
-        _snapshot_before_connection_delete(worksheet_id, edge_id, diagram)
-        valid_edge_ids = {
-            str(getattr(edge, "id", "") or "")
-            for edge in (getattr(diagram, "edges", []) or [])
-        }
-        if edge_id and edge_id not in valid_edge_ids:
-            overrides_key = _manual_connection_overrides_key(worksheet_id)
-            drawn_overrides = dict(st.session_state.get(overrides_key, {}) or {})
-            removed = drawn_overrides.pop(edge_id, None)
-            if removed is None:
-                _discard_latest_undo_snapshot(worksheet_id)
-                return
-            if removed is not None:
-                st.session_state[overrides_key] = drawn_overrides
-                if isinstance(removed, dict):
-                    pair_key = f"_manual_draw_pairs_{worksheet_id}"
-                    pairs = dict(st.session_state.get(pair_key, {}) or {})
-                    source_id = str(removed.get("source") or "")
-                    target_id = str(removed.get("target") or "")
-                    pairs.pop(f"{source_id}|{target_id}", None)
-                    pairs.pop(f"{target_id}|{source_id}", None)
-                    st.session_state[pair_key] = pairs
-                st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
-                persist_active_worksheet_state()
-                _mark_worksheet_render_sync_pending(worksheet_id)
-                _mark_ppt_sync_pending(worksheet_id)
-            return
-        if edge_id in valid_edge_ids:
-            # Remove the exact edge from the current worksheet diagram first.
-            # The live renderer and delayed rerenders must no longer have this
-            # connection in their source graph; a visual hidden override alone
-            # can be discarded by the normal generation path.
-            removed_edge = next(
-                (
-                    edge
-                    for edge in list(getattr(diagram, "edges", []) or [])
-                    if str(getattr(edge, "id", "") or "") == edge_id
-                ),
-                None,
+            connection_id = (
+                str(getattr(matching_option, "id", "") or "").strip()
+                if matching_option is not None
+                else _explicit_pair_connection_id(source_id, target_id)
             )
-            if diagram is not None and hasattr(diagram, "edges"):
-                diagram.edges = [
-                    edge
-                    for edge in list(getattr(diagram, "edges", []) or [])
-                    if str(getattr(edge, "id", "") or "") != edge_id
-                ]
-            if removed_edge is not None:
-                pair_key = f"_manual_draw_pairs_{worksheet_id}"
-                pairs = dict(st.session_state.get(pair_key, {}) or {})
-                source_id = str(getattr(removed_edge, "source", "") or "")
-                target_id = str(getattr(removed_edge, "target", "") or "")
-                if pairs.pop(f"{source_id}|{target_id}", None) is not None or pairs.pop(
-                    f"{target_id}|{source_id}", None
-                ) is not None:
-                    st.session_state[pair_key] = pairs
-
-            overrides_key = _manual_connection_overrides_key(worksheet_id)
-            route_overrides = dict(
-                st.session_state.get(overrides_key, {}) or {}
-            )
-            route_overrides.pop(edge_id, None)
-            st.session_state[overrides_key] = route_overrides
-
-            # Remove the logical selection as well as hiding the current visual
-            # route. Otherwise the next worksheet render regenerates the same
-            # selected connection from the catalog before the visual override is
-            # reapplied. A future manual click can add this connection again.
-            option_id = edge_id.removeprefix("edge__")
-            selected_connections = list(
-                st.session_state.get("selected_connections", []) or []
-            )
-            st.session_state["selected_connections"] = [
-                connection_id
-                for connection_id in selected_connections
-                if str(connection_id) not in {edge_id, option_id}
-            ]
             deleted_ids = {
                 str(value)
                 for value in st.session_state.get(
@@ -13235,30 +16573,49 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                 )
                 or []
             }
-            deleted_ids.update({edge_id, option_id})
+            deleted_ids.difference_update(
+                {str(connection_id), f"edge__{connection_id}", edge_id}
+            )
             st.session_state[_deleted_connection_ids_key(worksheet_id)] = sorted(
                 deleted_ids
             )
-            _release_deleted_oht_sensor_embed(
+            _forget_deleted_connection_pair(worksheet_id, source_id, target_id)
+            # Pure additive: restore master first, then append only this edge.
+            _restore_connection_master(worksheet_id)
+            if _append_selected_connection(
                 worksheet_id,
-                str(getattr(removed_edge, "source", "") or "") if removed_edge is not None else "",
-                str(getattr(removed_edge, "target", "") or "") if removed_edge is not None else "",
-                edge_id,
-            )
-            transport_settings = dict(
-                st.session_state.get("connection_transport_settings", {}) or {}
-            )
-            transport_settings.pop(option_id, None)
-            transport_settings.pop(edge_id, None)
-            st.session_state["connection_transport_settings"] = transport_settings
-
-            # Performance only: the browser already applied the visual delete.
-            # Persist the same override and defer export-quality raster/PDF/PPT
-            # materialization until an explicit Download/PPT operation requires it.
-            st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
+                connection_id,
+                remember=True,
+            ):
+                generation_key = f"connection_picker_generation_{worksheet_id}"
+                st.session_state[generation_key] = int(
+                    st.session_state.get(generation_key, 0) or 0
+                ) + 1
+            _store_connection_identity(worksheet_id, connection_id)
+        st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
+        _persist_manual_route_geometry(
+            worksheet_id,
+            edge_id,
+            dict(drawn_overrides.get(edge_id) or {}),
+        )
+        st.session_state["_skip_connection_identity_sync"] = True
+        try:
             persist_active_worksheet_state()
-            _mark_worksheet_render_sync_pending(worksheet_id)
-            _mark_ppt_sync_pending(worksheet_id)
+        finally:
+            st.session_state.pop("_skip_connection_identity_sync", None)
+        _mark_worksheet_render_sync_pending(worksheet_id)
+        _mark_ppt_sync_pending(worksheet_id)
+        st.rerun()
+        return
+
+    if event_type == "connection_delete":
+        _apply_connection_delete_state(
+            worksheet_id,
+            str(event.get("edge_id", "") or ""),
+            diagram,
+            str(event.get("source", "") or ""),
+            str(event.get("target", "") or ""),
+        )
         return
 
     if event_type == "connection_route_move":
@@ -13271,14 +16628,26 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         _record_canvas_component_moves(worksheet_id, event, diagram)
         return
 
+    if event_type == "component_display_mode":
+        _record_component_display_mode(worksheet_id, event)
+        return
+
     if event_type == "component_label_edit":
         instance_id = str(event.get("instance_id", "") or "").strip()
         title = str(event.get("title", "") or "").strip()
+        label = str(event.get("label", "") or "").strip()
+        acronym = str(event.get("acronym", "") or "").strip()
         valid_node_ids = {
             str(getattr(node, "id", "") or "")
             for node in (getattr(diagram, "nodes", []) or [])
         }
-        if instance_id in valid_node_ids and title:
+        if instance_id in valid_node_ids and (
+            title
+            or label
+            or acronym
+            or isinstance(event.get("configuration"), dict)
+            or isinstance(event.get("config"), dict)
+        ):
             component_overrides = dict(
                 st.session_state.get(
                     _manual_component_overrides_key(worksheet_id), {}
@@ -13286,7 +16655,16 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
                 or {}
             )
             existing = dict(component_overrides.get(instance_id, {}) or {})
-            existing["title"] = title
+            if title:
+                existing["title"] = title
+            if label:
+                existing["label"] = label
+            if acronym:
+                existing["acronym"] = acronym
+            for metadata_key in ("configuration", "config"):
+                metadata = event.get(metadata_key)
+                if isinstance(metadata, dict):
+                    existing[metadata_key] = copy.deepcopy(metadata)
             component_overrides[instance_id] = existing
             st.session_state[_manual_component_overrides_key(worksheet_id)] = component_overrides
             st.session_state.pop(_manual_edit_png_key(worksheet_id), None)
@@ -13335,6 +16713,13 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             st.session_state[pending_key] = clicked_id
             # The component event itself is already the current Streamlit run.
             # Store the pending selection without starting a second rerun.
+            # Transmitter is drawn after this event is read, so its first click
+            # would otherwise stay invisible until a later unrelated rerun.
+            if (
+                str(event.get("component", "") or "").strip() == "Transmitter"
+                or clicked_id.startswith("tx_")
+            ):
+                st.rerun()
             return
 
         # Clicking the same component again cancels the pending connection.
@@ -13344,6 +16729,12 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             return
 
         selected_names = list(st.session_state.get("selected_components", []) or [])
+        # Domain policy: Valve↔Transmitter/VCT only; Flowmeter↔DWG/VCT/Data
+        # Logger/Master only. Reject disallowed click pairs before catalog match.
+        if not _valve_flowmeter_pair_allowed(first_id, clicked_id):
+            st.session_state[pending_key] = clicked_id
+            return
+
         matching_option = next(
             (
                 option
@@ -13374,6 +16765,7 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         st.session_state[_deleted_connection_ids_key(worksheet_id)] = sorted(
             deleted_ids
         )
+        _forget_deleted_connection_pair(worksheet_id, first_id, clicked_id)
 
         # If this exact automatically-generated relationship was manually deleted,
         # choosing the same two components recreates only that connection.  Remove
@@ -13417,20 +16809,11 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
             st.rerun()
             return
 
-        selected_ids = list(st.session_state.get("selected_connections", []) or [])
-        if matching_option.id not in selected_ids:
-            selected_ids.append(matching_option.id)
-            st.session_state["selected_connections"] = selected_ids
-
-            transport_settings = dict(
-                st.session_state.get("connection_transport_settings", {}) or {}
-            )
-            transport_settings.setdefault(
-                matching_option.id,
-                _default_connection_transport_setting(),
-            )
-            st.session_state["connection_transport_settings"] = transport_settings
-
+        if _append_selected_connection(
+            worksheet_id,
+            str(matching_option.id),
+            remember=True,
+        ):
             # 2A was rendered earlier in this Streamlit run. Rotate only that
             # widget key so the persisted connection becomes its new default.
             generation_key = f"connection_picker_generation_{worksheet_id}"
@@ -13473,8 +16856,21 @@ def _render_clickable_diagram_preview(preview_png: bytes, diagram, worksheet_id:
         source = str(route.get("source", "") or "")
         target = str(route.get("target", "") or "")
         route_is_dotted = bool(route.get("dotted", False))
+        source_handle = str(
+            route.get("source_handle")
+            or route.get("sourceHandle")
+            or (f"{source}:{route.get('source_side')}" if route.get("source_side") else "")
+            or (f"{source}:auto" if source else "")
+        )
+        target_handle = str(
+            route.get("target_handle")
+            or route.get("targetHandle")
+            or (f"{target}:{route.get('target_side')}" if route.get("target_side") else "")
+            or (f"{target}:auto" if target else "")
+        )
         routes.append({
             "edge_id": str(edge_id),
+            "id": str(edge_id),
             "label": labels.get(str(edge_id), str(route.get("label", edge_id) or edge_id)),
             "points": route.get("points", []),
             "original_points": route.get("original_points", route.get("points", [])),
@@ -13485,6 +16881,10 @@ def _render_clickable_diagram_preview(preview_png: bytes, diagram, worksheet_id:
             "hidden": bool(route.get("hidden", False)),
             "source": source,
             "target": target,
+            "sourceHandle": source_handle,
+            "targetHandle": target_handle,
+            "source_handle": source_handle,
+            "target_handle": target_handle,
             "source_box": box_map.get(source),
             "target_box": box_map.get(target),
             "custom": bool(route.get("custom", False)),
@@ -13524,6 +16924,33 @@ def _render_clickable_diagram_preview(preview_png: bytes, diagram, worksheet_id:
                 image_b64
             )
         item.pop("use_embedded_label", None)
+        item_id = str(item.get("instance_id") or "")
+        _custom_metadata = dict(component_overrides.get(item_id) or {})
+        item["label"] = str(
+            _custom_metadata.get("label")
+            or _custom_metadata.get("title")
+            or item.get("title")
+            or ""
+        )
+        item["acronym"] = str(
+            _custom_metadata.get("acronym")
+            or component_acronym_for_name(
+                _custom_metadata.get("label")
+                or _custom_metadata.get("title")
+                or item.get("component")
+                or item.get("title")
+                or ""
+            )
+        )
+        for _metadata_key in ("configuration", "config"):
+            if isinstance(_custom_metadata.get(_metadata_key), dict):
+                item[_metadata_key] = copy.deepcopy(_custom_metadata[_metadata_key])
+        item["display_mode"] = resolve_component_display_mode(
+            dict(component_overrides.get(item_id) or {}).get("display_mode"),
+            item.get("display_mode"),
+            st.session_state.get(_worksheet_component_display_mode_key(worksheet_id)),
+            component_name=item.get("component") or item.get("title") or "",
+        )
 
     event = _direct_connection_editor(
         image_b64=base64.b64encode(editor_base_png).decode("ascii"),
@@ -13572,6 +16999,11 @@ def _render_clickable_diagram_preview(preview_png: bytes, diagram, worksheet_id:
         "components": saved_components,
         "canvas_width": float(event.get("canvas_width", canvas_width) or canvas_width),
         "canvas_height": float(event.get("canvas_height", canvas_height) or canvas_height),
+        "viewport": (
+            copy.deepcopy(event.get("viewport"))
+            if isinstance(event.get("viewport"), dict)
+            else {"zoom": 1.0, "pan_x": 0.0, "pan_y": 0.0}
+        ),
     }
 
     st.session_state["editor_saved_state"] = saved_state
@@ -14474,6 +17906,8 @@ def _clear_saved_project_selection(
     selector_key = f"saved_worksheet_ppt_selector_{int(worksheet_id)}"
     if not force_reset and st.session_state.get(selector_key) not in (None, ""):
         st.session_state.pop("_saved_project_delete_target", None)
+        # Allow the newly chosen Saved entry to load (selector still has a value).
+        st.session_state.pop("_saved_project_loaded_filename", None)
         return
 
     if not reset_loaded_state:
@@ -14494,6 +17928,14 @@ def _clear_saved_project_selection(
             f"_worksheet_render_bundle_cache_{current_id}",
             None,
         )
+        st.session_state.pop(
+            f"_saved_project_routes_locked_{current_id}",
+            None,
+        )
+        st.session_state.pop(
+            _saved_diagram_input_signature_key(current_id),
+            None,
+        )
 
     for state_key in (
         "_pending_saved_project_restore",
@@ -14504,6 +17946,7 @@ def _clear_saved_project_selection(
         "_worksheet_page_flow_navigation_target",
         "_saved_project_selection_cleared_event",
         "_saved_project_delete_target",
+        "_saved_project_loaded_filename",
         "_saved_ppt_load_message",
         "ppt_session_base_bytes",
         "ppt_session_diagrams",
@@ -14531,6 +17974,7 @@ def _clear_saved_project_selection(
     st.session_state["_worksheet_page_flow_last_active_id"] = 1
     st.session_state["_reset_saved_worksheet_ppt_selector"] = True
     st.session_state.pop("_saved_project_delete_target", None)
+    st.session_state.pop("_saved_project_loaded_filename", None)
 
 
 def _saved_worksheet_ppt_files() -> list[Path]:
@@ -14567,8 +18011,25 @@ def _saved_worksheet_ppt_files() -> list[Path]:
     return project_files if project_files else files
 
 
+def _saved_project_site_id(ppt_path: Path) -> str:
+    """Read the site stable id stored with one saved project, if it has one."""
+    state_path = _saved_worksheet_ppt_sidecar_path(ppt_path)
+    if not state_path.is_file():
+        return ""
+    try:
+        with state_path.open("rb") as state_file:
+            payload = pickle.load(state_file)
+    except Exception:
+        return ""
+    project = payload.get("project") if isinstance(payload, dict) else None
+    site = project.get("site_project") if isinstance(project, dict) else None
+    if not isinstance(site, dict):
+        return ""
+    return str(site.get("stable_id") or "").strip()
+
+
 def _delete_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
-    """Delete exactly one saved project PPT and its editable-state sidecar."""
+    """Delete exactly one saved project PPT, its sidecar, and its site row."""
     filename = Path(str(ppt_filename or "")).name
     if not filename or Path(filename).suffix.lower() != ".pptx":
         return False, "No saved project was selected."
@@ -14579,9 +18040,8 @@ def _delete_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
     if not ppt_path.is_file() and not state_path.is_file():
         return False, "The selected saved project is no longer available."
 
+    site_stable_id = _saved_project_site_id(ppt_path)
     try:
-        # A saved-project record consists only of these two app-owned files.
-        # Delete both and leave every other saved-project record untouched.
         ppt_path.unlink(missing_ok=True)
         state_path.unlink(missing_ok=True)
     except Exception as exc:
@@ -14591,7 +18051,252 @@ def _delete_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
     if ppt_path.exists() or state_path.exists():
         return False, "Could not completely delete the selected saved project."
 
+    if site_stable_id:
+        try:
+            project_store_module.delete_site_project(site_stable_id)
+        except Exception as exc:
+            log_app_error("Delete saved project store row", exc)
+
     return True, f"Deleted {filename}"
+
+
+def _on_saved_project_delete(worksheet_id: int) -> None:
+    """Delete the project currently chosen in the Saved dropdown."""
+    worksheet_id = int(worksheet_id)
+    target = Path(
+        str(st.session_state.get("_saved_project_delete_target", "") or "")
+    ).name
+    if not target:
+        selected = st.session_state.get(
+            f"saved_worksheet_ppt_selector_{worksheet_id}"
+        )
+        target = Path(str(selected or "")).name
+    if not target:
+        st.session_state["_saved_project_delete_message"] = (
+            False,
+            "No saved project was selected.",
+        )
+        return
+    deleted, message = _delete_saved_worksheet_ppt(target)
+    st.session_state["_saved_project_delete_message"] = (bool(deleted), str(message))
+    if not deleted:
+        return
+    st.session_state["_saved_project_filenames"] = [
+        str(name)
+        for name in list(st.session_state.get("_saved_project_filenames") or [])
+        if str(name) != target
+    ]
+    st.session_state.pop("_saved_project_delete_target", None)
+    st.session_state.pop("_saved_project_loaded_filename", None)
+    st.session_state.pop("_pending_saved_project_delete_confirm", None)
+    st.session_state.pop(f"saved_worksheet_ppt_selector_{worksheet_id}", None)
+    st.session_state["_reset_saved_worksheet_ppt_selector"] = True
+
+
+def _saved_diagram_selection_fingerprint(
+    selected_components,
+    selected_connection_ids,
+) -> str:
+    """Component/connection selection only.
+
+    Transport defaults and asset mtimes churn on reopen and must not rebuild the
+    freeze-at-save diagram/canvas.
+    """
+    return (
+        f"selection|{'|'.join(str(item) for item in list(selected_components or []))}"
+        f"|connections|"
+        f"{'|'.join(sorted(str(item) for item in list(selected_connection_ids or [])))}"
+    )
+
+
+def _saved_diagram_input_signature_key(worksheet_id: int) -> str:
+    return f"_saved_diagram_input_signature_{int(worksheet_id)}"
+
+
+def _freeze_selected_components_key(worksheet_id: int) -> str:
+    return f"_freeze_selected_components_{int(worksheet_id)}"
+
+
+def _freeze_selected_connections_key(worksheet_id: int) -> str:
+    return f"_freeze_selected_connections_{int(worksheet_id)}"
+
+
+def _saved_diagram_user_edit_key(worksheet_id: int) -> str:
+    return f"_saved_diagram_user_edit_{int(worksheet_id)}"
+
+
+def _mark_saved_diagram_user_edit(worksheet_id: int) -> None:
+    """Allow regenerate only after an explicit user selection/connection edit."""
+    worksheet_id = int(worksheet_id)
+    if st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}"):
+        st.session_state[_saved_diagram_user_edit_key(worksheet_id)] = True
+
+
+def _stash_freeze_selection_snapshot(
+    worksheet_id: int,
+    *,
+    selected_components=None,
+    selected_connections=None,
+) -> None:
+    """Remember the exact Saved-open selection so reopen cannot drift/regenerate."""
+    worksheet_id = int(worksheet_id)
+    st.session_state[_freeze_selected_components_key(worksheet_id)] = list(
+        selected_components
+        if selected_components is not None
+        else (st.session_state.get("selected_components") or [])
+    )
+    st.session_state[_freeze_selected_connections_key(worksheet_id)] = list(
+        selected_connections
+        if selected_connections is not None
+        else (st.session_state.get("selected_connections") or [])
+    )
+
+
+def _freeze_canvas_size_key(worksheet_id: int) -> str:
+    return f"_freeze_canvas_size_{int(worksheet_id)}"
+
+
+def _valid_saved_canvas_size(width, height) -> bool:
+    try:
+        width = float(width)
+        height = float(height)
+    except (TypeError, ValueError):
+        return False
+    return width > 1e-6 and height > 1e-6
+
+
+def _canvas_size_from_last_geometry(worksheet_id: int) -> tuple[float, float] | None:
+    geometry = st.session_state.get(f"_last_worksheet_geometry_{int(worksheet_id)}")
+    if not isinstance(geometry, dict):
+        return None
+    if not _valid_saved_canvas_size(geometry.get("width"), geometry.get("height")):
+        return None
+    return float(geometry["width"]), float(geometry["height"])
+
+
+def _ensure_last_worksheet_geometry_for_save(worksheet_id: int) -> None:
+    """Guarantee ``_last_worksheet_geometry_*`` width/height exist before Save.
+
+    Older saves often omitted this key, so reopen fell back to a denser
+    ``_dynamic_canvas_spec`` and looked smaller. New saves must always persist
+    the exact logical page size the user saw.
+    """
+    worksheet_id = int(worksheet_id)
+    key = f"_last_worksheet_geometry_{worksheet_id}"
+    existing = st.session_state.get(key)
+    if isinstance(existing, dict) and _valid_saved_canvas_size(
+        existing.get("width"), existing.get("height")
+    ):
+        return
+
+    diagram = None
+    try:
+        if int(st.session_state.get("active_worksheet_id", -1)) == worksheet_id:
+            diagram = st.session_state.get("diagram")
+    except (TypeError, ValueError):
+        diagram = None
+    if diagram is None:
+        for sheet in list(st.session_state.get("worksheets", []) or []):
+            if not isinstance(sheet, dict):
+                continue
+            try:
+                if int(sheet.get("id")) == worksheet_id:
+                    diagram = sheet.get("diagram")
+                    break
+            except (TypeError, ValueError):
+                continue
+    if diagram is None:
+        return
+
+    try:
+        spec = renderers_module._dynamic_canvas_spec(diagram)
+        width = float(spec.width)
+        height = float(spec.height)
+    except Exception:
+        return
+    if not _valid_saved_canvas_size(width, height):
+        return
+
+    boxes = {}
+    if isinstance(existing, dict) and isinstance(existing.get("boxes"), dict):
+        try:
+            boxes = copy.deepcopy(existing.get("boxes") or {})
+        except Exception:
+            boxes = dict(existing.get("boxes") or {})
+    st.session_state[key] = {
+        "boxes": boxes,
+        "width": width,
+        "height": height,
+    }
+
+
+def _stash_freeze_canvas_size(
+    worksheet_id: int,
+    diagram=None,
+) -> None:
+    """Pin freeze-at-save logical canvas size for Saved reopen display scale."""
+    worksheet_id = int(worksheet_id)
+    sized = _canvas_size_from_last_geometry(worksheet_id)
+    if sized is None and diagram is not None:
+        # Recover save-time page size from the freeze-at-save diagram when an
+        # older pickle omitted ``_last_worksheet_geometry_*``.
+        try:
+            spec = renderers_module._dynamic_canvas_spec(diagram)
+            width = float(spec.width)
+            height = float(spec.height)
+        except Exception:
+            width = height = 0.0
+        if _valid_saved_canvas_size(width, height):
+            st.session_state[f"_last_worksheet_geometry_{worksheet_id}"] = {
+                "boxes": dict(
+                    (
+                        st.session_state.get(
+                            f"_last_worksheet_geometry_{worksheet_id}"
+                        )
+                        or {}
+                    ).get("boxes")
+                    or {}
+                ),
+                "width": width,
+                "height": height,
+            }
+            sized = (width, height)
+    if sized is None:
+        return
+    st.session_state[_freeze_canvas_size_key(worksheet_id)] = sized
+
+
+def _apply_freeze_canvas_size(
+    worksheet_id: int,
+    canvas_width: float,
+    canvas_height: float,
+) -> tuple[float, float]:
+    """Use freeze-at-save canvas size so fit-to-screen cannot shrink the diagram.
+
+    A regenerated / denser diagram grows ``_dynamic_canvas_spec`` (e.g. 13.42x8.49
+    → 14.15x8.95). With fit_screen, the same absolute boxes map to a smaller
+    fraction of the larger canvas and the whole diagram looks smaller.
+
+    When a Saved-open pin exists, it always wins over regenerated geometry.
+    """
+    worksheet_id = int(worksheet_id)
+    frozen = st.session_state.get(_freeze_canvas_size_key(worksheet_id))
+    if not isinstance(frozen, (tuple, list)) or len(frozen) != 2:
+        # Fall back to restored ``_last_worksheet_geometry_*`` while Saved-locked.
+        if st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}"):
+            sized = _canvas_size_from_last_geometry(worksheet_id)
+            if sized is not None:
+                st.session_state[_freeze_canvas_size_key(worksheet_id)] = sized
+                return sized
+        return float(canvas_width), float(canvas_height)
+    try:
+        width = float(frozen[0])
+        height = float(frozen[1])
+    except (TypeError, ValueError):
+        return float(canvas_width), float(canvas_height)
+    if _valid_saved_canvas_size(width, height):
+        return width, height
+    return float(canvas_width), float(canvas_height)
 
 
 def _saved_project_auxiliary_state_keys(worksheet_id: int) -> tuple[str, ...]:
@@ -14607,6 +18312,7 @@ def _saved_project_auxiliary_state_keys(worksheet_id: int) -> tuple[str, ...]:
         _manual_edit_signature_key(worksheet_id),
         _manual_connection_overrides_key(worksheet_id),
         _deleted_connection_ids_key(worksheet_id),
+        _deleted_connection_pairs_key(worksheet_id),
         _manual_component_overrides_key(worksheet_id),
         _manual_connection_source_key(worksheet_id),
         _active_connection_transport_key(worksheet_id),
@@ -14620,6 +18326,14 @@ def _saved_project_auxiliary_state_keys(worksheet_id: int) -> tuple[str, ...]:
         f"pending_component_connection_source_{worksheet_id}",
         f"image_orientation_{worksheet_id}",
         f"sketch_upload_generation_{worksheet_id}",
+        # Preserve calibrated layout metadata across app close/reopen.
+        f"_auto_layout_component_ids_{worksheet_id}",
+        f"_auto_layout_rule_{worksheet_id}",
+        f"_preserve_component_layout_{worksheet_id}",
+        f"_oht_inline_drop_header_y_{worksheet_id}",
+        f"_canvas_live_components_{worksheet_id}",
+        # Exact canvas size + boxes from the last paint at Save time.
+        f"_last_worksheet_geometry_{worksheet_id}",
     )
 
 
@@ -14671,12 +18385,82 @@ def _worksheet_snapshot_for_saved_ppt(worksheet_id: int) -> tuple[dict, dict]:
         except Exception:
             auxiliary_state[state_key] = st.session_state[state_key]
 
+    # Persist the live canvas registry sheet used by move/merge helpers.
+    live_sheet = _canvas_component_sheet(worksheet_id, publish=False)
+    if live_sheet:
+        try:
+            auxiliary_state[f"_canvas_live_components_{worksheet_id}"] = copy.deepcopy(
+                live_sheet
+            )
+        except Exception:
+            auxiliary_state[f"_canvas_live_components_{worksheet_id}"] = dict(live_sheet)
+
+    # Embed frozen geometry + display_mode into identity rows so the worksheet
+    # snapshot remains complete even without the auxiliary override map.
+    overrides = dict(
+        st.session_state.get(_manual_component_overrides_key(worksheet_id), {}) or {}
+    )
+    if overrides and isinstance(snapshot.get("component_instances"), list):
+        stamped = []
+        for item in list(snapshot.get("component_instances") or []):
+            if not isinstance(item, dict):
+                continue
+            record = dict(item)
+            node_id = str(record.get("legacy_node_id") or "")
+            override = overrides.get(node_id)
+            if isinstance(override, dict):
+                box = override.get("box")
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    try:
+                        record["box"] = [float(value) for value in box]
+                        record["position"] = {
+                            "x": float(box[0]) + float(box[2]) / 2.0,
+                            "y": float(box[1]) + float(box[3]) / 2.0,
+                        }
+                    except (TypeError, ValueError):
+                        pass
+                if override.get("display_mode") is not None:
+                    record["display_mode"] = normalize_component_display_mode(
+                        override.get("display_mode")
+                    )
+                for metadata_key in (
+                    "title",
+                    "label",
+                    "acronym",
+                    "configuration",
+                    "config",
+                ):
+                    if metadata_key in override:
+                        record[metadata_key] = copy.deepcopy(
+                            override[metadata_key]
+                        )
+            stamped.append(record)
+        snapshot["component_instances"] = stamped
+
     return snapshot, auxiliary_state
 
 
 def _project_snapshot_for_saved_ppt(active_worksheet_id: int) -> dict:
     """Capture the complete current project without changing any UI behavior."""
     active_worksheet_id = int(active_worksheet_id)
+
+    # Freeze every worksheet's visible boxes into overrides + canvas registry
+    # before the pickle/DB snapshot so reopen hydrates exact coordinates.
+    for source_sheet in list(st.session_state.get("worksheets", []) or []):
+        try:
+            worksheet_id = int(source_sheet.get("id"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            _freeze_worksheet_layout_for_persistence(worksheet_id, mark_restored=True)
+        except Exception as exc:
+            log_app_error("Freeze worksheet layout for save", exc)
+        try:
+            # Always persist exact logical canvas size with the project so reopen
+            # does not fall back to a denser ``_dynamic_canvas_spec``.
+            _ensure_last_worksheet_geometry_for_save(worksheet_id)
+        except Exception as exc:
+            log_app_error("Ensure worksheet canvas size for save", exc)
 
     if st.session_state.get("worksheets"):
         persist_active_worksheet_state()
@@ -14857,7 +18641,7 @@ def _project_snapshot_for_saved_ppt(active_worksheet_id: int) -> dict:
     except Exception:
         pass
 
-    return {
+    snapshot = {
         "worksheets": worksheet_snapshots,
         # Authoritative worksheet creation/display order.
         "worksheet_order": [
@@ -14876,7 +18660,486 @@ def _project_snapshot_for_saved_ppt(active_worksheet_id: int) -> dict:
         "price_details": price_details,
         "auxiliary_state": all_auxiliary_state,
         "global_state": saved_global_state,
+        "site_project": stable_identity_module.ensure_site_project(
+            st.session_state.get("site_project")
+        ),
     }
+    _seal_saved_diagram_geometry(snapshot)
+    return snapshot
+
+
+def _clear_persisted_component_placement_cache(
+    worksheet_id: int | None = None,
+) -> None:
+    """Drop cached DB placements after a save (worksheet-scoped or all)."""
+    if worksheet_id is not None:
+        st.session_state.pop(
+            f"_persisted_component_placement_index_{int(worksheet_id)}",
+            None,
+        )
+        return
+    st.session_state.pop("_persisted_component_placement_index", None)
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("_persisted_component_placement_index_"):
+            st.session_state.pop(key, None)
+
+
+def _persisted_component_placement_index(worksheet_id: int | None = None) -> dict[str, dict]:
+    """Cached PostgreSQL placements for the CURRENT worksheet only."""
+    try:
+        worksheet_id = int(
+            worksheet_id
+            if worksheet_id is not None
+            else st.session_state.get("active_worksheet_id")
+            or 0
+        )
+    except (TypeError, ValueError):
+        worksheet_id = 0
+    cache_key = f"_persisted_component_placement_index_{worksheet_id}"
+    cached = st.session_state.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
+    worksheet_stable_id = ""
+    site_id = ""
+    for candidate in list(st.session_state.get("worksheets", []) or []):
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            if int(candidate.get("id") or 0) == worksheet_id:
+                worksheet_stable_id = str(candidate.get("stable_id") or "").strip()
+                break
+        except (TypeError, ValueError):
+            continue
+    site = st.session_state.get("site_project")
+    if isinstance(site, dict):
+        site_id = str(site.get("stable_id") or "").strip()
+
+    # Current worksheet only. Never fall back to newest site / other worksheets.
+    if not worksheet_stable_id:
+        st.session_state[cache_key] = {}
+        return {}
+
+    try:
+        loader = getattr(
+            project_store_module,
+            "load_saved_component_placements",
+            None,
+        )
+        if callable(loader):
+            placements = loader(
+                site_stable_id=site_id or None,
+                worksheet_stable_id=worksheet_stable_id,
+            )
+        else:
+            placements = {}
+    except Exception as exc:
+        log_app_error("Load saved component placements", exc)
+        placements = {}
+    if not isinstance(placements, dict):
+        placements = {}
+    st.session_state[cache_key] = placements
+    return placements
+
+
+def _apply_saved_pg_routes_for_live_components(
+    worksheet_id: int,
+    live_ids: set[str],
+) -> None:
+    """Restore saved route geometry only for manually present endpoint pairs."""
+    worksheet_id = int(worksheet_id)
+    # After an explicit Saved-Project open, pickle routes are authoritative.
+    # PostgreSQL may still hold a newer save that belongs to another library entry
+    # with the same worksheet stable id.
+    if st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}"):
+        return
+    if not live_ids:
+        return
+    worksheet_stable_id = ""
+    try:
+        for candidate in list(st.session_state.get("worksheets", []) or []):
+            if not isinstance(candidate, dict):
+                continue
+            if int(candidate.get("id") or 0) == worksheet_id:
+                worksheet_stable_id = str(candidate.get("stable_id") or "").strip()
+                break
+    except (TypeError, ValueError):
+        worksheet_stable_id = ""
+    if not worksheet_stable_id:
+        return
+    loader = getattr(project_store_module, "load_saved_route_geometry", None)
+    if not callable(loader):
+        return
+    try:
+        saved_routes = loader(worksheet_stable_id=worksheet_stable_id)
+    except Exception as exc:
+        log_app_error("Load saved route geometry", exc)
+        return
+    if not isinstance(saved_routes, dict) or not saved_routes:
+        return
+
+    overrides_key = _manual_connection_overrides_key(worksheet_id)
+    route_overrides = dict(st.session_state.get(overrides_key, {}) or {})
+    selected = list(st.session_state.get("selected_connections", []) or [])
+    selected_set = {str(item) for item in selected}
+    changed_routes = False
+    changed_selected = False
+
+    for edge_id, raw in saved_routes.items():
+        if not isinstance(raw, dict):
+            continue
+        source = str(raw.get("source") or raw.get("source_node_id") or "").strip()
+        target = str(raw.get("target") or raw.get("target_node_id") or "").strip()
+        if not source or not target:
+            continue
+        if source not in live_ids or target not in live_ids:
+            continue
+        points = raw.get("points")
+        if not isinstance(points, list) or len(points) < 2:
+            continue
+        key = str(edge_id or "").strip()
+        if not key:
+            key = f"manual__{source}__{target}"
+        existing = dict(route_overrides.get(key) or {})
+        # Keep an in-session manual draw / drag authoritative.
+        if (
+            isinstance(existing.get("points"), list)
+            and len(existing.get("points") or []) >= 2
+            and bool(existing.get("manual_drag") or existing.get("custom"))
+        ):
+            continue
+        record = dict(raw)
+        record["edge_id"] = key
+        record["source"] = source
+        record["target"] = target
+        record["points"] = [list(point) for point in points]
+        record["stored_geometry"] = True
+        route_overrides[key] = record
+        changed_routes = True
+        connection_id = str(
+            raw.get("connection_legacy_id")
+            or raw.get("legacy_edge_id")
+            or key
+        ).strip()
+        if connection_id.startswith("edge__"):
+            connection_id = connection_id[len("edge__") :]
+        if connection_id and connection_id not in selected_set:
+            selected.append(connection_id)
+            selected_set.add(connection_id)
+            changed_selected = True
+
+    if changed_routes:
+        st.session_state[overrides_key] = route_overrides
+    if changed_selected:
+        st.session_state["selected_connections"] = selected
+
+
+def _apply_saved_pg_positions_for_live_components(
+    worksheet_id: int,
+    *,
+    diagram=None,
+) -> None:
+    """Place manually selected components at their PostgreSQL-saved boxes.
+
+    Only live/selected node ids are restored. Never preloads a whole saved
+    diagram onto a blank canvas or another worksheet.
+    """
+    worksheet_id = int(worksheet_id)
+    placements = _persisted_component_placement_index(worksheet_id)
+    if not placements:
+        # Still try route restore only when live endpoints already exist.
+        live_ids = set()
+        if diagram is not None:
+            for node in list(getattr(diagram, "nodes", []) or []):
+                node_id = str(getattr(node, "id", "") or "").strip()
+                node_type = str(getattr(node, "node_type", "") or "")
+                if node_id and node_type != "junction":
+                    live_ids.add(node_id)
+        if not live_ids:
+            live_ids = _live_component_node_ids(
+                st.session_state.get("selected_components") or []
+            )
+        _apply_saved_pg_routes_for_live_components(worksheet_id, live_ids)
+        return
+
+    live_ids: set[str] = set()
+    if diagram is not None:
+        for node in list(getattr(diagram, "nodes", []) or []):
+            node_id = str(getattr(node, "id", "") or "").strip()
+            node_type = str(getattr(node, "node_type", "") or "")
+            if node_id and node_type != "junction":
+                live_ids.add(node_id)
+    # Manual selection only — never invent live ids from stored identity rows
+    # on a blank canvas / different worksheet.
+    if not live_ids:
+        live_ids = _live_component_node_ids(
+            st.session_state.get("selected_components") or []
+        )
+    if not live_ids:
+        return
+
+    sheet = None
+    for candidate in list(st.session_state.get("worksheets", []) or []):
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            if int(candidate.get("id")) == worksheet_id:
+                sheet = candidate
+                break
+        except (TypeError, ValueError):
+            continue
+    if sheet is None:
+        try:
+            sheet = get_active_worksheet()
+        except Exception:
+            sheet = {}
+    instances = list((sheet or {}).get("component_instances") or [])
+    instance_by_id = {
+        str(item.get("legacy_node_id") or ""): item
+        for item in instances
+        if isinstance(item, dict) and str(item.get("legacy_node_id") or "").strip()
+    }
+    override_key = _manual_component_overrides_key(worksheet_id)
+    overrides = dict(st.session_state.get(override_key, {}) or {})
+    changed = False
+
+    for node_id in sorted(live_ids):
+        existing = dict(overrides.get(node_id) or {})
+        # Keep an in-session drag / already-applied restore authoritative.
+        if _valid_canvas_box(existing.get("box")) is not None and bool(
+            existing.get("moved") or existing.get("restored")
+        ):
+            continue
+        item = instance_by_id.get(node_id) or {}
+        catalog = str(item.get("catalog_name") or existing.get("component") or "").strip()
+        try:
+            index = int(item.get("instance_index") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        if index <= 0:
+            # Derive index from stable legacy ids such as sump_1 / oht_2.
+            match = re.search(r"_(\d+)$", node_id)
+            index = int(match.group(1)) if match else 1
+        saved = placements.get(node_id)
+        if not isinstance(saved, dict) and catalog:
+            saved = placements.get(f"{catalog}#{index}")
+        if not isinstance(saved, dict):
+            continue
+        box = _valid_canvas_box(saved.get("box"))
+        if box is None:
+            try:
+                cx = float(saved.get("x"))
+                cy = float(saved.get("y"))
+            except (TypeError, ValueError):
+                continue
+            box = [cx - 0.45, cy - 0.35, 0.9, 0.7]
+        existing["box"] = list(box)
+        existing["x"] = float(saved.get("x") or (box[0] + box[2] / 2.0))
+        existing["y"] = float(saved.get("y") or (box[1] + box[3] / 2.0))
+        existing["moved"] = True
+        existing["restored"] = True
+        if catalog:
+            existing["component"] = catalog
+        elif saved.get("catalog_name"):
+            existing["component"] = str(saved.get("catalog_name") or "")
+        if saved.get("node_type"):
+            existing["type"] = str(saved.get("node_type") or "")
+        # Keep an in-session Acronym Box / Icon choice. Position restore must not
+        # reset it back to the PostgreSQL default (icons) after Save/rerun.
+        if existing.get("display_mode") is None and saved.get("display_mode") is not None:
+            existing["display_mode"] = normalize_component_display_mode(
+                saved.get("display_mode")
+            )
+        existing.pop("hidden", None)
+        overrides[node_id] = existing
+        changed = True
+
+    if changed:
+        st.session_state[override_key] = overrides
+        # Mirror into the canvas registry so drag/sync keep the saved box.
+        live_sheet = dict(_canvas_component_sheet(worksheet_id, publish=False) or {})
+        for node_id, raw in overrides.items():
+            if str(node_id) not in live_ids or not isinstance(raw, dict):
+                continue
+            box = _valid_canvas_box(raw.get("box"))
+            if box is None:
+                continue
+            record = dict(live_sheet.get(str(node_id)) or {})
+            record["id"] = str(node_id)
+            record["box"] = list(box)
+            record["x"] = float(raw.get("x") or (box[0] + box[2] / 2.0))
+            record["y"] = float(raw.get("y") or (box[1] + box[3] / 2.0))
+            record["moved"] = True
+            record["restored"] = True
+            if raw.get("component"):
+                record["component"] = raw.get("component")
+            if raw.get("type"):
+                record["type"] = raw.get("type")
+            if raw.get("display_mode") is not None:
+                record["display_mode"] = normalize_component_display_mode(
+                    raw.get("display_mode")
+                )
+            live_sheet[str(node_id)] = record
+        registry = _canvas_component_registry()
+        registry["by_worksheet"][str(worksheet_id)] = live_sheet
+        _canvas_component_sheet(worksheet_id, publish=True)
+
+    _apply_saved_pg_routes_for_live_components(worksheet_id, live_ids)
+
+
+def _hydrate_manual_component_overrides_from_saved_placements(
+    worksheet_id: int,
+    sheet: dict | None = None,
+) -> None:
+    """Seed ``manual_component_overrides`` from saved boxes before auto-layout.
+
+    Used only for an explicit SAVED-dropdown project open — not cold start.
+    """
+    worksheet_id = int(worksheet_id)
+    if sheet is None or not isinstance(sheet, dict):
+        sheet = {}
+        for candidate in list(st.session_state.get("worksheets", []) or []):
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                if int(candidate.get("id")) == worksheet_id:
+                    sheet = candidate
+                    break
+            except (TypeError, ValueError):
+                continue
+
+    override_key = _manual_component_overrides_key(worksheet_id)
+    overrides = dict(st.session_state.get(override_key, {}) or {})
+    live_key = f"_canvas_live_components_{worksheet_id}"
+    live_sheet = dict(st.session_state.get(live_key) or {})
+    if not live_sheet:
+        try:
+            live_sheet = dict(
+                _canvas_component_sheet(worksheet_id, publish=False) or {}
+            )
+        except Exception:
+            live_sheet = {}
+
+    def _ingest(node_id: str, raw: dict, *, component: str = "", node_type: str = "") -> None:
+        nonlocal overrides
+        node_id = str(node_id or "").strip()
+        if not node_id or not isinstance(raw, dict):
+            return
+        existing = dict(overrides.get(node_id) or {})
+        for metadata_key in (
+            "title",
+            "label",
+            "acronym",
+            "configuration",
+            "config",
+        ):
+            if metadata_key in raw:
+                try:
+                    existing[metadata_key] = copy.deepcopy(raw[metadata_key])
+                except Exception:
+                    existing[metadata_key] = raw[metadata_key]
+        box = _valid_canvas_box(raw.get("box"))
+        if box is None:
+            try:
+                cx = float(raw.get("x"))
+                cy = float(raw.get("y"))
+            except (TypeError, ValueError):
+                if existing:
+                    overrides[node_id] = existing
+                return
+            prior_box = _valid_canvas_box(existing.get("box"))
+            width = float(prior_box[2]) if prior_box is not None else 0.9
+            height = float(prior_box[3]) if prior_box is not None else 0.7
+            box = [cx - width / 2.0, cy - height / 2.0, width, height]
+        # Never replace an already-restored/moved box with a weaker source.
+        if _valid_canvas_box(existing.get("box")) is not None and bool(
+            existing.get("moved") or existing.get("restored")
+        ):
+            if existing.get("display_mode") is None and raw.get("display_mode") is not None:
+                existing["display_mode"] = normalize_component_display_mode(
+                    raw.get("display_mode")
+                )
+            overrides[node_id] = existing
+            return
+        existing["box"] = list(box)
+        existing["x"] = float(raw.get("x") or (box[0] + box[2] / 2.0))
+        existing["y"] = float(raw.get("y") or (box[1] + box[3] / 2.0))
+        existing["moved"] = True
+        existing["restored"] = True
+        if component:
+            existing["component"] = component
+        elif raw.get("component") or raw.get("catalog_name"):
+            existing["component"] = str(
+                raw.get("component") or raw.get("catalog_name") or ""
+            )
+        if node_type:
+            existing["type"] = node_type
+        elif raw.get("type") or raw.get("node_type"):
+            existing["type"] = str(raw.get("type") or raw.get("node_type") or "")
+        if raw.get("display_mode") is not None:
+            existing["display_mode"] = normalize_component_display_mode(
+                raw.get("display_mode")
+            )
+        existing.pop("hidden", None)
+        overrides[node_id] = existing
+
+    for item in list(sheet.get("component_instances") or []):
+        if not isinstance(item, dict):
+            continue
+        _ingest(
+            str(item.get("legacy_node_id") or ""),
+            item,
+            component=str(item.get("catalog_name") or item.get("component") or ""),
+            node_type=str(item.get("node_type") or item.get("type") or ""),
+        )
+
+    for node_id, raw in list(live_sheet.items()):
+        if isinstance(raw, dict):
+            _ingest(str(node_id), raw)
+
+    for node_id, raw in list(overrides.items()):
+        if not isinstance(raw, dict):
+            continue
+        if _valid_canvas_box(raw.get("box")) is None:
+            continue
+        updated = dict(raw)
+        updated["moved"] = True
+        updated["restored"] = True
+        if updated.get("display_mode") is not None:
+            updated["display_mode"] = normalize_component_display_mode(
+                updated.get("display_mode")
+            )
+        overrides[node_id] = updated
+
+    if not overrides:
+        return
+
+    st.session_state[override_key] = overrides
+    st.session_state[f"_preserve_component_layout_{worksheet_id}"] = True
+
+    restored_live = {}
+    for node_id, raw in overrides.items():
+        if not isinstance(raw, dict):
+            continue
+        box = _valid_canvas_box(raw.get("box"))
+        if box is None:
+            continue
+        restored_live[str(node_id)] = {
+            "id": str(node_id),
+            "box": list(box),
+            "x": float(raw.get("x") or (box[0] + box[2] / 2.0)),
+            "y": float(raw.get("y") or (box[1] + box[3] / 2.0)),
+            "moved": True,
+            "restored": True,
+            "component": str(raw.get("component") or ""),
+            "type": str(raw.get("type") or ""),
+            "display_mode": normalize_component_display_mode(raw.get("display_mode")),
+        }
+    if restored_live:
+        registry = _canvas_component_registry()
+        registry["by_worksheet"][str(worksheet_id)] = restored_live
+        st.session_state[live_key] = copy.deepcopy(restored_live)
+        _canvas_component_sheet(worksheet_id, publish=True)
 
 
 def _apply_pending_saved_project_restore_if_needed() -> None:
@@ -14989,6 +19252,18 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
 
     if not isinstance(saved_worksheets, list) or not saved_worksheets:
         return
+
+    # Attach this library entry's DB identities. Prefer pickle freeze-at-save
+    # boxes/routes over any weaker DB rebuild of the same site id.
+    try:
+        saved_worksheets = _overlay_stored_project_onto_snapshot(
+            project_snapshot,
+            list(saved_worksheets),
+        )
+    except Exception as exc:
+        log_app_error("Overlay stored project for Saved open", exc)
+
+    _seal_saved_diagram_geometry(project_snapshot)
 
     try:
         restored_worksheets = copy.deepcopy(saved_worksheets)
@@ -15110,7 +19385,8 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
 
     # Remove only worksheet-scoped state belonging to the current/restored
     # project so stale data from the previously open project cannot leak in.
-    for worksheet_id in set(existing_ids + restored_ids):
+    affected_worksheet_ids = set(existing_ids + restored_ids)
+    for worksheet_id in affected_worksheet_ids:
         for state_key in _saved_project_auxiliary_state_keys(worksheet_id):
             st.session_state.pop(state_key, None)
 
@@ -15118,6 +19394,17 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
             f"_worksheet_render_bundle_cache_{worksheet_id}",
             None,
         )
+        st.session_state.pop(
+            f"_saved_project_routes_locked_{worksheet_id}",
+            None,
+        )
+        st.session_state.pop(
+            _saved_diagram_input_signature_key(worksheet_id),
+            None,
+        )
+        # Prior-session master edges must not union into the freeze selection.
+        st.session_state.pop(_connection_master_key(worksheet_id), None)
+        _clear_persisted_component_placement_cache(worksheet_id)
         st.session_state[
             f"connection_picker_generation_{worksheet_id}"
         ] = int(
@@ -15133,8 +19420,22 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
                 f"required_connection_compact_{worksheet_id}_"
             ) or str(state_key).startswith(
                 f"connection_config_target_{worksheet_id}_"
-            ):
+            ) or str(state_key) == f"connection_config_target_{worksheet_id}":
                 st.session_state.pop(state_key, None)
+
+    # Drop prior canvas registry sheets so hydrate cannot re-ingest another
+    # project's boxes when this pickle has no live-component auxiliary rows.
+    try:
+        registry = _canvas_component_registry()
+        by_worksheet = registry.get("by_worksheet")
+        if isinstance(by_worksheet, dict):
+            for worksheet_id in affected_worksheet_ids:
+                by_worksheet.pop(str(int(worksheet_id)), None)
+            registry["components"] = {}
+            registry["active_worksheet_id"] = None
+            st.session_state["canvas_components"] = registry
+    except Exception:
+        pass
 
     saved_auxiliary_state = project_snapshot.get(
         "auxiliary_state",
@@ -15155,6 +19456,86 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
                 st.session_state[state_key] = copy.deepcopy(state_value)
             except Exception:
                 st.session_state[state_key] = state_value
+
+    # Publish saved boxes into manual_component_overrides + canvas registry
+    # before any later identity sync / auto-layout can invent defaults.
+    for worksheet_id in restored_ids:
+        _hydrate_manual_component_overrides_from_saved_placements(
+            worksheet_id,
+            worksheet_by_id.get(worksheet_id),
+        )
+        # Keep this worksheet's saved routes authoritative after Saved open —
+        # do not re-apply / regenerate over freeze-at-save polylines.
+        st.session_state[f"_saved_project_routes_locked_{worksheet_id}"] = True
+        st.session_state.pop(_saved_diagram_user_edit_key(worksheet_id), None)
+        # Stale +/- callbacks from the previous project must not unlock freeze
+        # and trigger generate_selected_components on this Saved open.
+        st.session_state.pop("_manual_component_selection_changed", None)
+        _sheet_for_freeze = worksheet_by_id.get(worksheet_id) or {}
+        if _sheet_for_freeze.get("diagram") is not None:
+            st.session_state[f"_freeze_diagram_{worksheet_id}"] = (
+                _sheet_for_freeze.get("diagram")
+            )
+        _stash_freeze_selection_snapshot(
+            worksheet_id,
+            selected_components=_sheet_for_freeze.get("selected_components"),
+            selected_connections=_sheet_for_freeze.get("selected_connections"),
+        )
+        # Pin overall diagram scale from freeze-at-save geometry (not a denser
+        # regenerated canvas that makes fit-to-screen look smaller).
+        _stash_freeze_canvas_size(
+            worksheet_id,
+            diagram=_sheet_for_freeze.get("diagram"),
+        )
+        # Invalidate browser-local movement drafts so a prior worksheet session
+        # cannot reposition sealed boxes/routes after Saved open.
+        try:
+            st.session_state["_saved_geometry_epoch"] = int(
+                st.session_state.get("_saved_geometry_epoch", 0) or 0
+            ) + 1
+        except (TypeError, ValueError):
+            st.session_state["_saved_geometry_epoch"] = 1
+        # Client paints sealed payload while routes stay locked (see
+        # freeze_saved_geometry tied to _saved_project_routes_locked_*).
+        st.session_state[f"_freeze_saved_geometry_once_{worksheet_id}"] = True
+        route_key = _manual_connection_overrides_key(worksheet_id)
+        route_overrides = dict(st.session_state.get(route_key, {}) or {})
+        routes_changed = False
+        for edge_id, raw in list(route_overrides.items()):
+            if not isinstance(raw, dict):
+                continue
+            points = raw.get("points")
+            if not isinstance(points, list) or len(points) < 2:
+                continue
+            updated = dict(raw)
+            updated["points"] = [list(point) for point in points]
+            updated["custom"] = True
+            updated["stored_geometry"] = True
+            if not str(updated.get("mode") or "").strip():
+                updated["mode"] = "manual_draw"
+            route_overrides[edge_id] = updated
+            routes_changed = True
+        if routes_changed:
+            st.session_state[route_key] = route_overrides
+
+        # Pin layout signature to the restored component set so the first
+        # render cannot auto-align over the exact saved boxes.
+        override_key = _manual_component_overrides_key(worksheet_id)
+        sealed_overrides = dict(st.session_state.get(override_key, {}) or {})
+        layout_ids = tuple(
+            sorted(
+                str(node_id)
+                for node_id, raw in sealed_overrides.items()
+                if isinstance(raw, dict)
+                and _valid_canvas_box(raw.get("box")) is not None
+            )
+        )
+        if layout_ids:
+            st.session_state[f"_auto_layout_component_ids_{worksheet_id}"] = layout_ids
+            st.session_state[f"_auto_layout_rule_{worksheet_id}"] = (
+                "sumps-left-oht-top-v2"
+            )
+        st.session_state[f"_preserve_component_layout_{worksheet_id}"] = True
 
     # Version 4+ snapshots store every Price Details page explicitly. Restore this
     # after the generic auxiliary state so each worksheet's pricing page is exact.
@@ -15192,6 +19573,10 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
                     )
 
     st.session_state["worksheets"] = restored_worksheets
+    if isinstance(project_snapshot.get("site_project"), dict):
+        st.session_state["site_project"] = stable_identity_module.ensure_site_project(
+            project_snapshot.get("site_project")
+        )
 
     saved_global_state = project_snapshot.get("global_state", {})
     if not isinstance(saved_global_state, dict):
@@ -15296,6 +19681,38 @@ def _apply_pending_saved_project_restore_if_needed() -> None:
         st.session_state["ppt_session_pptx_bytes"] = ppt_bytes
         st.session_state["pptx_bytes"] = ppt_bytes
         _write_current_ppt_session_file(ppt_bytes)
+
+    # Expose restored sheet selections immediately so the following init/render
+    # path does not rebuild from an empty cold-start selection.
+    load_active_worksheet_state()
+    for worksheet_id in restored_ids:
+        _hydrate_manual_component_overrides_from_saved_placements(
+            worksheet_id,
+            worksheet_by_id.get(worksheet_id),
+        )
+        sheet = worksheet_by_id.get(worksheet_id) or {}
+        # Pin freeze-at-save selection so reopen hash churn cannot rebuild canvas.
+        st.session_state[_saved_diagram_input_signature_key(worksheet_id)] = (
+            _saved_diagram_selection_fingerprint(
+                sheet.get("selected_components"),
+                sheet.get("selected_connections"),
+            )
+        )
+
+    # Active worksheet keys may already have been remapped by load_active_*.
+    st.session_state[
+        _saved_diagram_input_signature_key(int(active_worksheet_id))
+    ] = _saved_diagram_selection_fingerprint(
+        st.session_state.get("selected_components"),
+        st.session_state.get("selected_connections"),
+    )
+    _stash_freeze_selection_snapshot(int(active_worksheet_id))
+    _stash_freeze_canvas_size(
+        int(active_worksheet_id),
+        diagram=st.session_state.get("diagram"),
+    )
+    _trigger_saved_project_canvas_refresh(restored_ids)
+
 
 def _materialize_complete_project_ppt_for_save() -> bytes:
     """Build the saved PPT from every current worksheet in worksheet order.
@@ -15444,6 +19861,489 @@ def _materialize_complete_project_ppt_for_save() -> bytes:
     return bytes(combined or b"")
 
 
+def _clone_project_snapshot_for_library_store(snapshot: dict) -> dict:
+    """Copy one project snapshot with fresh site/worksheet/component/connection ids.
+
+    Live session identities stay unchanged. Each Saved-Project library entry must
+    INSERT its own ``site_project`` tree; reusing the live session UUIDs would
+    UPSERT over the previous library save and make Open load the wrong diagram.
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+    try:
+        cloned = copy.deepcopy(snapshot)
+    except Exception:
+        cloned = dict(snapshot)
+
+    worksheets = [
+        sheet
+        for sheet in list(cloned.get("worksheets") or [])
+        if isinstance(sheet, dict)
+    ]
+
+    # Ensure identity rows exist (and keep stamped boxes) before reminting UUIDs.
+    for sheet in worksheets:
+        try:
+            stable_identity_module.sync_worksheet_identities(
+                sheet,
+                list(sheet.get("selected_components") or []),
+                list(sheet.get("selected_connections") or []),
+            )
+        except Exception as exc:
+            log_app_error("Sync identities before library store clone", exc)
+            stable_identity_module.ensure_worksheet_identity(sheet)
+
+        # Re-stamp geometry from auxiliary overrides onto identity rows.
+        try:
+            legacy_id = int(sheet.get("id"))
+        except (TypeError, ValueError):
+            continue
+        overrides = (cloned.get("auxiliary_state") or {}).get(
+            f"manual_component_overrides_{legacy_id}"
+        )
+        if not isinstance(overrides, dict):
+            continue
+        stamped = []
+        for item in list(sheet.get("component_instances") or []):
+            if not isinstance(item, dict):
+                continue
+            record = dict(item)
+            node_id = str(record.get("legacy_node_id") or "")
+            override = overrides.get(node_id)
+            if isinstance(override, dict):
+                box = override.get("box")
+                if isinstance(box, (list, tuple)) and len(box) == 4:
+                    try:
+                        record["box"] = [float(value) for value in box]
+                        record["position"] = {
+                            "x": float(box[0]) + float(box[2]) / 2.0,
+                            "y": float(box[1]) + float(box[3]) / 2.0,
+                        }
+                    except (TypeError, ValueError):
+                        pass
+                if override.get("display_mode") is not None:
+                    record["display_mode"] = normalize_component_display_mode(
+                        override.get("display_mode")
+                    )
+                for metadata_key in (
+                    "title",
+                    "label",
+                    "acronym",
+                    "configuration",
+                    "config",
+                ):
+                    if metadata_key in override:
+                        record[metadata_key] = copy.deepcopy(
+                            override[metadata_key]
+                        )
+            stamped.append(record)
+        sheet["component_instances"] = stamped
+
+    component_id_map: dict[str, str] = {}
+    for sheet in worksheets:
+        sheet["stable_id"] = stable_identity_module.new_stable_id()
+        new_components = []
+        for item in list(sheet.get("component_instances") or []):
+            if not isinstance(item, dict):
+                continue
+            record = dict(item)
+            old_id = str(record.get("stable_id") or "").strip()
+            new_id = stable_identity_module.new_stable_id()
+            if old_id:
+                component_id_map[old_id] = new_id
+            record["stable_id"] = new_id
+            new_components.append(record)
+        sheet["component_instances"] = new_components
+
+        new_connections = []
+        for item in list(sheet.get("connection_identities") or []):
+            if not isinstance(item, dict):
+                continue
+            record = dict(item)
+            record["stable_id"] = stable_identity_module.new_stable_id()
+            source_id = str(record.get("source_stable_id") or "").strip()
+            target_id = str(record.get("target_stable_id") or "").strip()
+            if source_id in component_id_map:
+                record["source_stable_id"] = component_id_map[source_id]
+            if target_id in component_id_map:
+                record["target_stable_id"] = component_id_map[target_id]
+            new_connections.append(record)
+        sheet["connection_identities"] = new_connections
+
+        # Drop annotation UUIDs so store regenerates them under the new worksheet.
+        notes = []
+        for note in list(sheet.get("annotations") or []):
+            if not isinstance(note, dict):
+                continue
+            note_copy = dict(note)
+            note_copy.pop("stable_id", None)
+            notes.append(note_copy)
+        sheet["annotations"] = notes
+
+    site = stable_identity_module.empty_site_project()
+    global_state = cloned.get("global_state")
+    if not isinstance(global_state, dict):
+        global_state = {}
+    site_name = str(
+        global_state.get("welcome_page_display_name")
+        or (cloned.get("site_project") or {}).get("name")
+        or "Site"
+    ).strip() or "Site"
+    site["name"] = site_name
+    site["worksheet_stable_ids"] = [
+        str(sheet.get("stable_id") or "")
+        for sheet in worksheets
+        if str(sheet.get("stable_id") or "").strip()
+    ]
+    cloned["site_project"] = site
+    cloned["worksheets"] = worksheets
+
+    # Keep project_pages worksheet embeds aligned with reminted sheets.
+    by_legacy_id = {}
+    for sheet in worksheets:
+        try:
+            by_legacy_id[int(sheet.get("id"))] = sheet
+        except (TypeError, ValueError):
+            continue
+    pages = cloned.get("project_pages")
+    if isinstance(pages, list):
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            if str(page.get("page_type") or "").strip().lower() != "worksheet":
+                continue
+            try:
+                page_worksheet_id = int(page.get("worksheet_id"))
+            except (TypeError, ValueError):
+                continue
+            source = by_legacy_id.get(page_worksheet_id)
+            if source is None:
+                continue
+            try:
+                page["worksheet"] = copy.deepcopy(source)
+            except Exception:
+                page["worksheet"] = dict(source)
+
+    _seal_saved_diagram_geometry(cloned)
+    return cloned
+
+
+def _component_overrides_have_boxes(overrides: Any) -> bool:
+    if not isinstance(overrides, dict) or not overrides:
+        return False
+    for raw in overrides.values():
+        if isinstance(raw, dict) and _valid_canvas_box(raw.get("box")) is not None:
+            return True
+    return False
+
+
+def _route_overrides_have_points(overrides: Any) -> bool:
+    if not isinstance(overrides, dict) or not overrides:
+        return False
+    for raw in overrides.values():
+        if not isinstance(raw, dict):
+            continue
+        points = raw.get("points")
+        if isinstance(points, list) and len(points) >= 2:
+            return True
+    return False
+
+
+def _sheet_instances_have_boxes(sheet: dict | None) -> bool:
+    if not isinstance(sheet, dict):
+        return False
+    for item in list(sheet.get("component_instances") or []):
+        if isinstance(item, dict) and _valid_canvas_box(item.get("box")) is not None:
+            return True
+    return False
+
+
+def _seal_saved_diagram_geometry(snapshot: dict | None) -> None:
+    """Mark freeze-at-save boxes/routes as authoritative for store + reopen."""
+    if not isinstance(snapshot, dict):
+        return
+    auxiliary = snapshot.get("auxiliary_state")
+    if not isinstance(auxiliary, dict):
+        return
+    for key, value in list(auxiliary.items()):
+        key_text = str(key or "")
+        if key_text.startswith("manual_component_overrides_") and isinstance(value, dict):
+            sealed = {}
+            for node_id, raw in value.items():
+                if not isinstance(raw, dict):
+                    continue
+                record = dict(raw)
+                box = _valid_canvas_box(record.get("box"))
+                if box is not None:
+                    record["box"] = list(box)
+                    record["x"] = float(
+                        record.get("x") or (box[0] + box[2] / 2.0)
+                    )
+                    record["y"] = float(
+                        record.get("y") or (box[1] + box[3] / 2.0)
+                    )
+                    record["moved"] = True
+                    record["restored"] = True
+                sealed[str(node_id)] = record
+            auxiliary[key_text] = sealed
+            continue
+        if key_text.startswith("manual_connection_overrides_") and isinstance(
+            value, dict
+        ):
+            sealed_routes = {}
+            for edge_id, raw in value.items():
+                if not isinstance(raw, dict):
+                    continue
+                record = dict(raw)
+                points = record.get("points")
+                if isinstance(points, list) and len(points) >= 2:
+                    record["points"] = [list(point) for point in points]
+                    record["custom"] = True
+                    record["stored_geometry"] = True
+                    if not str(record.get("mode") or "").strip():
+                        record["mode"] = "manual_draw"
+                sealed_routes[str(edge_id)] = record
+            auxiliary[key_text] = sealed_routes
+
+
+def _overlay_stored_project_onto_snapshot(
+    project_snapshot: dict,
+    worksheets: list[dict],
+) -> list[dict]:
+    """Attach this library entry's DB identities without clobbering exact geometry.
+
+    The pickle snapshot is freeze-at-save (exact boxes/routes). PostgreSQL may
+    omit or reshape some override keys; never replace complete pickle geometry
+    with a weaker DB rebuild.
+    """
+    site = project_snapshot.get("site_project")
+    if not isinstance(site, dict):
+        return worksheets
+    site_id = str(site.get("stable_id") or "").strip()
+    if not site_id:
+        return worksheets
+    try:
+        stored = project_store_module.load_project(site_id)
+    except Exception as exc:
+        log_app_error("Load saved project from store", exc)
+        return worksheets
+    if not isinstance(stored, dict):
+        return worksheets
+
+    stored_sheets = {
+        int(sheet.get("id")): sheet
+        for sheet in list(stored.get("worksheets") or [])
+        if isinstance(sheet, dict)
+        and str(sheet.get("stable_id") or "").strip()
+    }
+    if not stored_sheets:
+        return worksheets
+
+    if isinstance(stored.get("site_project"), dict):
+        project_snapshot["site_project"] = stored["site_project"]
+
+    stored_aux = stored.get("auxiliary_state")
+    if isinstance(stored_aux, dict):
+        snap_aux = project_snapshot.get("auxiliary_state")
+        if not isinstance(snap_aux, dict):
+            snap_aux = {}
+            project_snapshot["auxiliary_state"] = snap_aux
+        for key, value in stored_aux.items():
+            key_text = str(key or "")
+            if key_text.startswith("manual_component_overrides_"):
+                current = snap_aux.get(key_text)
+                if not isinstance(current, dict):
+                    current = {}
+                merged = copy.deepcopy(current)
+                if isinstance(value, dict):
+                    for component_id, stored_record in value.items():
+                        if not isinstance(stored_record, dict):
+                            continue
+                        current_record = merged.get(str(component_id))
+                        if not isinstance(current_record, dict):
+                            merged[str(component_id)] = copy.deepcopy(stored_record)
+                            continue
+                        for metadata_key in (
+                            "title",
+                            "label",
+                            "acronym",
+                            "configuration",
+                            "config",
+                        ):
+                            if metadata_key not in current_record and metadata_key in stored_record:
+                                current_record[metadata_key] = copy.deepcopy(
+                                    stored_record[metadata_key]
+                                )
+                if _component_overrides_have_boxes(merged):
+                    snap_aux[key_text] = merged
+                    continue
+                snap_aux[key_text] = merged
+                continue
+            if key_text.startswith("manual_connection_overrides_"):
+                if _route_overrides_have_points(snap_aux.get(key_text)):
+                    continue
+                try:
+                    snap_aux[key_text] = copy.deepcopy(value)
+                except Exception:
+                    snap_aux[key_text] = value
+                continue
+            if key_text.startswith("_last_worksheet_geometry_"):
+                current_geometry = snap_aux.get(key_text)
+                if isinstance(current_geometry, dict) and _valid_saved_canvas_size(
+                    current_geometry.get("width"),
+                    current_geometry.get("height"),
+                ):
+                    continue
+                snap_aux[key_text] = copy.deepcopy(value)
+                continue
+            if key_text.startswith("_freeze_canvas_size_"):
+                current_size = snap_aux.get(key_text)
+                if (
+                    isinstance(current_size, (list, tuple))
+                    and len(current_size) == 2
+                    and _valid_saved_canvas_size(*current_size)
+                ):
+                    continue
+                snap_aux[key_text] = copy.deepcopy(value)
+                continue
+            if key_text.startswith(
+                (
+                    "deleted_connection_ids_",
+                    "deleted_connection_pairs_",
+                    "_canvas_live_components_",
+                    "_manual_draw_pairs_",
+                    "oht_sensor_embeds_",
+                    "_worksheet_viewport_",
+                    "worksheet_viewport_",
+                    "worksheet_canvas_view_",
+                )
+            ):
+                if key_text not in snap_aux:
+                    snap_aux[key_text] = copy.deepcopy(value)
+
+    overlaid: list[dict] = []
+    for sheet in worksheets:
+        if not isinstance(sheet, dict):
+            continue
+        try:
+            legacy_id = int(sheet.get("id"))
+        except (TypeError, ValueError):
+            overlaid.append(sheet)
+            continue
+        db_sheet = stored_sheets.get(legacy_id)
+        if not isinstance(db_sheet, dict):
+            overlaid.append(sheet)
+            continue
+        merged = dict(sheet)
+        merged["stable_id"] = db_sheet.get("stable_id")
+        # Keep freeze-at-save selection/geometry from the pickle when present.
+        if not list(merged.get("selected_components") or []) and db_sheet.get(
+            "selected_components"
+        ) is not None:
+            merged["selected_components"] = list(
+                db_sheet.get("selected_components") or []
+            )
+        if not list(merged.get("selected_connections") or []) and db_sheet.get(
+            "selected_connections"
+        ) is not None:
+            merged["selected_connections"] = list(
+                db_sheet.get("selected_connections") or []
+            )
+        if (
+            not _sheet_instances_have_boxes(merged)
+            and isinstance(db_sheet.get("component_instances"), list)
+        ):
+            try:
+                merged["component_instances"] = copy.deepcopy(
+                    db_sheet.get("component_instances") or []
+                )
+            except Exception:
+                merged["component_instances"] = list(
+                    db_sheet.get("component_instances") or []
+                )
+        if (
+            not list(merged.get("connection_identities") or [])
+            and isinstance(db_sheet.get("connection_identities"), list)
+        ):
+            try:
+                merged["connection_identities"] = copy.deepcopy(
+                    db_sheet.get("connection_identities") or []
+                )
+            except Exception:
+                merged["connection_identities"] = list(
+                    db_sheet.get("connection_identities") or []
+                )
+        stored_editor_state = db_sheet.get("editor_saved_state")
+        if isinstance(stored_editor_state, dict):
+            current_editor_state = merged.get("editor_saved_state")
+            if not isinstance(current_editor_state, dict):
+                merged["editor_saved_state"] = copy.deepcopy(stored_editor_state)
+            else:
+                merged_editor_state = copy.deepcopy(current_editor_state)
+                for state_key, state_value in stored_editor_state.items():
+                    if state_key not in merged_editor_state:
+                        merged_editor_state[state_key] = copy.deepcopy(state_value)
+                if not isinstance(merged_editor_state.get("viewport"), dict) and isinstance(
+                    stored_editor_state.get("viewport"), dict
+                ):
+                    merged_editor_state["viewport"] = copy.deepcopy(
+                        stored_editor_state["viewport"]
+                    )
+                merged["editor_saved_state"] = merged_editor_state
+        if isinstance(merged.get("component_instances"), list) and isinstance(
+            db_sheet.get("component_instances"), list
+        ):
+            stored_components = {
+                str(item.get("legacy_node_id") or ""): item
+                for item in db_sheet.get("component_instances") or []
+                if isinstance(item, dict)
+                and str(item.get("legacy_node_id") or "")
+            }
+            restored_components = []
+            for item in merged["component_instances"]:
+                if not isinstance(item, dict):
+                    continue
+                component = dict(item)
+                stored_component = stored_components.get(
+                    str(component.get("legacy_node_id") or "")
+                )
+                if isinstance(stored_component, dict):
+                    for metadata_key in (
+                        "title",
+                        "label",
+                        "acronym",
+                        "configuration",
+                        "config",
+                    ):
+                        if metadata_key not in component and metadata_key in stored_component:
+                            component[metadata_key] = copy.deepcopy(
+                                stored_component[metadata_key]
+                            )
+                restored_components.append(component)
+            merged["component_instances"] = restored_components
+        overlaid.append(merged)
+    return overlaid
+
+
+def _record_project_in_store(project_snapshot: dict | None) -> None:
+    """Write the project hierarchy to PostgreSQL after the PPT sidecar is in place.
+
+    A store failure is logged and does not change the PPT file or the pickle.
+    """
+    if not isinstance(project_snapshot, dict):
+        return
+    try:
+        site_id = project_store_module.save_project(project_snapshot)
+        _clear_persisted_component_placement_cache()
+        if not site_id:
+            log_app_error(
+                "Project store save",
+                RuntimeError("save_project returned empty site id"),
+            )
+    except Exception as exc:
+        log_app_error("Project store save", exc)
+
+
 def _save_current_worksheet_ppt_to_library(
     worksheet_id: int,
     pptx_bytes: bytes | bytearray | None,
@@ -15557,6 +20457,7 @@ def _save_current_worksheet_ppt_to_library(
         ppt_tmp = None
         os.replace(str(state_tmp), str(state_path))
         state_tmp = None
+        _record_project_in_store(project_snapshot)
         return ppt_path
     except Exception as exc:
         log_app_error("Save worksheet PPT library entry", exc)
@@ -15601,8 +20502,11 @@ def _save_complete_project_ppt_to_library(
     )
 
     # Capture the project once, after all worksheet state has been persisted.
-    project_snapshot = _project_snapshot_for_saved_ppt(
-        actual_active_worksheet_id
+    # Clone identities for the library/DB row only — do not mutate the live
+    # session site/worksheet UUIDs, but do give this Saved entry its own tree
+    # so a later Save cannot overwrite it in PostgreSQL.
+    project_snapshot = _clone_project_snapshot_for_library_store(
+        _project_snapshot_for_saved_ppt(actual_active_worksheet_id)
     )
 
     saved_worksheets = list(
@@ -15731,6 +20635,7 @@ def _save_complete_project_ppt_to_library(
         ppt_tmp = None
         os.replace(str(state_tmp), str(state_path))
         state_tmp = None
+        _record_project_in_store(project_snapshot)
         return ppt_path
     except Exception as exc:
         log_app_error("Save complete project PPT library entry", exc)
@@ -15754,20 +20659,8 @@ def _restore_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
     ppt_path = SAVED_WORKSHEET_PPT_DIR / filename
     state_path = _saved_worksheet_ppt_sidecar_path(ppt_path)
 
-    # If a stale selector event still points to an older worksheet-only record
-    # after a complete-project save was created, always reopen the authoritative
-    # complete-project record instead.  The visible selector is also filtered by
-    # _saved_worksheet_ppt_files(), so this path mainly protects the rerun in
-    # which an old widget value is still present.
-    if not _saved_ppt_is_complete_project(ppt_path):
-        complete_project_files = [
-            candidate
-            for candidate in _saved_worksheet_ppt_files()
-            if _saved_ppt_is_complete_project(candidate)
-        ]
-        if complete_project_files:
-            ppt_path = complete_project_files[0]
-            state_path = _saved_worksheet_ppt_sidecar_path(ppt_path)
+    # Always open the selected file only. Never rewrite to another (newer)
+    # complete-project record — that loads the wrong diagram.
 
     if not ppt_path.is_file() or not state_path.is_file():
         return False, "The selected saved PPT is no longer available."
@@ -15859,6 +20752,13 @@ def _restore_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
             worksheets[index] = worksheet_snapshot
             replaced = True
             break
+    stable_identity_module.ensure_worksheet_identity(worksheet_snapshot)
+    stable_identity_module.sync_worksheet_identities(
+        worksheet_snapshot,
+        list(worksheet_snapshot.get("selected_components") or []),
+        list(worksheet_snapshot.get("selected_connections") or []),
+    )
+
     if not replaced:
         worksheets.append(worksheet_snapshot)
 
@@ -15877,6 +20777,8 @@ def _restore_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
         _manual_edit_png_key(worksheet_id),
         _manual_edit_signature_key(worksheet_id),
         _manual_connection_overrides_key(worksheet_id),
+        _deleted_connection_ids_key(worksheet_id),
+        _deleted_connection_pairs_key(worksheet_id),
         _manual_component_overrides_key(worksheet_id),
         _manual_connection_source_key(worksheet_id),
         _active_connection_transport_key(worksheet_id),
@@ -15909,7 +20811,7 @@ def _restore_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
             f"required_connection_compact_{worksheet_id}_"
         ) or str(state_key).startswith(
             f"connection_config_target_{worksheet_id}_"
-        ):
+        ) or str(state_key) == f"connection_config_target_{worksheet_id}":
             st.session_state.pop(state_key, None)
 
     saved_auxiliary_state = payload.get("auxiliary_state", {})
@@ -15941,6 +20843,7 @@ def _restore_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
 
     load_active_worksheet_state()
     _write_current_ppt_session_file(ppt_bytes)
+    _trigger_saved_project_canvas_refresh([worksheet_id])
     return True, f"Loaded {ppt_path.name}"
 
 
@@ -16304,25 +21207,132 @@ def ensure_current_ppt_export() -> None:
     ensure_ppt_session_state()
 
 
+def _on_start_new_ppt_click() -> None:
+    """Button callback: run before the script body so an earlier st.rerun cannot drop the click."""
+    start_new_ppt_session()
+    st.session_state["_start_new_ppt_do_rerun"] = True
+
+
 def start_new_ppt_session() -> None:
     """Save the current project, then open a separate blank PPT workspace."""
     active_worksheet_id = int(st.session_state.get("active_worksheet_id", 1))
-    persist_active_worksheet_state()
-    _sync_pending_worksheet_render_if_needed(active_worksheet_id)
-    _sync_pending_ppt_if_needed(active_worksheet_id)
-    ensure_current_ppt_export()
-    complete_project_ppt = _materialize_complete_project_ppt_for_save()
-    _save_complete_project_ppt_to_library(
-        complete_project_ppt
-        or st.session_state.get("pptx_bytes")
-        or st.session_state.get("ppt_session_pptx_bytes"),
-        active_worksheet_id,
-    )
+    # Always clear the active session even if archive/materialize fails so the
+    # button never appears to do nothing.
+    try:
+        persist_active_worksheet_state()
+        _sync_pending_worksheet_render_if_needed(active_worksheet_id)
+        _sync_pending_ppt_if_needed(active_worksheet_id)
+        ensure_current_ppt_export()
+        complete_project_ppt = _materialize_complete_project_ppt_for_save()
+        # Archive only — never delete library/DB records.
+        _save_complete_project_ppt_to_library(
+            complete_project_ppt
+            or st.session_state.get("pptx_bytes")
+            or st.session_state.get("ppt_session_pptx_bytes"),
+            active_worksheet_id,
+        )
+    except Exception as exc:
+        log_app_error("Start New PPT archive current project", exc)
+
     _clear_saved_project_selection(
         active_worksheet_id,
         reset_loaded_state=True,
         force_reset=True,
     )
+
+    # Suppress SAVED restore for the next script run only (no rerun loop).
+    st.session_state["_block_saved_ppt_restore_once"] = True
+    st.session_state.pop("_block_saved_ppt_restore_until_clear", None)
+
+    for state_key in list(st.session_state.keys()):
+        key_text = str(state_key)
+        if key_text.startswith("saved_worksheet_ppt_selector_"):
+            st.session_state.pop(state_key, None)
+            continue
+        if key_text.startswith(
+            (
+                "component_selection_editor_",
+                "sketch_uploader_",
+                "connection_intent_editor_",
+                "flow_meter_placement_editor_",
+                "worksheet_name_editor_",
+                "required_connection_",
+                "connection_config_target_",
+                "price_details_",
+                "oht_sensor_embeds_",
+                "_persisted_component_placement_index_",
+                "_canvas_live_components_",
+                "_saved_project_routes_locked_",
+                "_last_worksheet_geometry_",
+                "_auto_layout_component_ids_",
+                "_auto_layout_rule_",
+                "_preserve_component_layout_",
+                "_worksheet_render_bundle_cache_",
+                "manual_component_overrides_",
+                "manual_connection_overrides_",
+                "deleted_connection_ids_",
+                "deleted_connection_pairs_",
+                "manual_diagram_ppt_png_",
+                "manual_diagram_source_hash_",
+                # Surviving connection/diagram state that reappears on a blank PPT
+                # when worksheet id resets to 1 (same key namespace as before).
+                "connection_master_",
+                "explicit_user_connection_ids_",
+                "_manual_draw_pairs_",
+                "_route_adjust_lock_",
+                "worksheet_undo_history_",
+                "diagram_normal_surface_",
+                "professional_diagram_editor_",
+                "connection_picker_generation_",
+                "manual_connection_history_",
+                "manual_editor_history_",
+                "_saved_diagram_input_signature_",
+            )
+        ):
+            st.session_state.pop(state_key, None)
+
+    st.session_state.pop("_pending_saved_project_restore", None)
+    st.session_state.pop("_saved_ppt_load_message", None)
+    st.session_state.pop("_saved_project_delete_target", None)
+    st.session_state.pop("_saved_project_loaded_filename", None)
+    st.session_state.pop("ppt_session_file_mtime_ns", None)
+    st.session_state["annotations"] = []
+    for output_key in WORKSHEET_OUTPUT_KEYS:
+        st.session_state.pop(output_key, None)
+
+    # Fresh identities so PostgreSQL placements for the previous site cannot
+    # rehydrate onto the blank canvas.
+    st.session_state["site_project"] = stable_identity_module.empty_site_project()
+    st.session_state["worksheets"] = [_new_worksheet(1, 1)]
+    st.session_state["active_worksheet_id"] = 1
+    st.session_state["next_worksheet_id"] = 2
+    st.session_state["worksheet_selector"] = 1
+    st.session_state["selected_components"] = []
+    st.session_state["selected_requirement_components"] = []
+    st.session_state["selected_connections"] = []
+    st.session_state["connection_transport_settings"] = {}
+    st.session_state["inline_flow_meter_settings"] = {}
+    st.session_state["canvas_components"] = {
+        "active_worksheet_id": None,
+        "components": {},
+        "by_worksheet": {},
+    }
+    _clear_persisted_component_placement_cache()
+    # Force a new blank canvas iframe + browser draft namespace. The editor keeps
+    # prior in-memory edges across remounts when the Streamlit key is unchanged
+    # (worksheet id stays 1), which left old connection lines on Start New PPT.
+    try:
+        st.session_state["_start_new_ppt_surface_epoch"] = int(
+            st.session_state.get("_start_new_ppt_surface_epoch", 0) or 0
+        ) + 1
+    except (TypeError, ValueError):
+        st.session_state["_start_new_ppt_surface_epoch"] = 1
+    st.session_state["_reset_saved_worksheet_ppt_selector"] = True
+    st.session_state["_pending_welcome_page_display_name_reset"] = True
+    st.session_state[_WORKSHEET_PAGE_FLOW_KEY] = _worksheet_page_flow_token(
+        "worksheet", 1
+    )
+    st.session_state["_worksheet_page_flow_last_active_id"] = 1
 
 
 def open_current_ppt_for_editing() -> tuple[bool, str]:
@@ -16511,9 +21521,10 @@ def render_outputs(diagram, *, defer_exports: bool = False) -> None:
     fast_change_key = f"_fast_worksheet_component_change_{worksheet_id}"
     fast_component_action = bool(st.session_state.pop(fast_change_key, False))
 
-    # A newly generated topology starts with the router's untouched output.
-    # Manual line edits belong only to the previous rendered version.
-    st.session_state.pop(_manual_connection_overrides_key(worksheet_id), None)
+    # Manual polylines stay in manual_connection_overrides_{worksheet_id}.
+    # The next preview rebinds a saved line onto the edge that still joins
+    # the same components, including a dropped Transmitter → LLS route.
+    # A brand-new sketch clears those overrides before it calls this function.
     st.session_state.pop(_connection_history_key(worksheet_id), None)
     st.session_state.pop(_connection_history_index_key(worksheet_id), None)
     st.session_state.pop("editor_saved_state", None)
@@ -16639,6 +21650,11 @@ def generate_professional_diagram(uploaded_bytes: bytes, orientation: str) -> No
         final_diagram = build_sketch_using_existing_connection_logic(reviewed)
 
         st.write("5/5  Rendering premium PNG, editable PowerPoint and PDF")
+        _sketch_worksheet = get_active_worksheet()
+        st.session_state.pop(
+            _manual_connection_overrides_key(int(_sketch_worksheet["id"])),
+            None,
+        )
         render_outputs(final_diagram)
         status.update(label="Diagram created successfully", state="complete", expanded=False)
 
@@ -16742,6 +21758,182 @@ def _option_label_base(value: object) -> str:
     return re.sub(r"\s+\d+$", "", label).strip()
 
 
+_VALVE_CONNECTION_SOURCES = {
+    "Motorized Valve (MV)",
+    "Solenoid Valve",
+}
+_VALVE_CONNECTION_TARGETS = {
+    "Transmitter",
+    "Valve Controller (VCT)",
+    "OHT Tank",
+}
+_FLOWMETER_CONNECTION_SOURCES = {
+    "Ultrasonic Flow Meter",
+    "Flush Flow Meter",
+    "Electromagnetic Flow Meter",
+}
+_FLOWMETER_CONNECTION_TARGETS = {
+    "Display with GSM (DWG)",
+    "Valve Controller (VCT)",
+    "Data Logger",
+    "Master",
+    "OHT Tank",
+}
+
+
+def _component_family_name(node_id: str, label_map: dict | None = None) -> str:
+    """Resolve a canvas node id to its catalog family name."""
+    text = str(node_id or "").strip()
+    labels = dict(label_map or {})
+    if text in labels:
+        return _option_label_base(labels.get(text))
+    if text.startswith("mv_"):
+        return "Motorized Valve (MV)"
+    if text.startswith(("ufm_", "ffm_", "emfm_")):
+        code = text.split("_", 1)[0]
+        return {
+            "ufm": "Ultrasonic Flow Meter",
+            "ffm": "Flush Flow Meter",
+            "emfm": "Electromagnetic Flow Meter",
+        }.get(code, "")
+    if text.startswith("tx_"):
+        return "Transmitter"
+    if text.startswith("vct_"):
+        return "Valve Controller (VCT)"
+    if text.startswith("dwg_"):
+        return "Display with GSM (DWG)"
+    if text.startswith("logger_") or text.startswith("data_logger_"):
+        return "Data Logger"
+    if text.startswith("master_"):
+        return "Master"
+    if text.startswith("oht_"):
+        return "OHT Tank"
+    return _option_label_base(text)
+
+
+def _valve_or_flowmeter_family(name: str) -> str:
+    base = _option_label_base(name)
+    lowered = base.lower()
+    if base in _VALVE_CONNECTION_SOURCES or "solenoid" in lowered:
+        return "valve"
+    if base in _FLOWMETER_CONNECTION_SOURCES or "flow meter" in lowered:
+        return "flowmeter"
+    return ""
+
+
+def _permitted_connection_targets_for_source(
+    source_id: str,
+    candidate_ids: list[str],
+    label_map: dict,
+) -> list[str]:
+    """Filter Connect-to choices by Valve/Flowmeter domain rules."""
+    source_name = _component_family_name(source_id, label_map)
+    family = _valve_or_flowmeter_family(source_name)
+    if not family:
+        return [
+            node_id
+            for node_id in candidate_ids
+            if str(node_id) != str(source_id)
+        ]
+    allowed = (
+        _VALVE_CONNECTION_TARGETS
+        if family == "valve"
+        else _FLOWMETER_CONNECTION_TARGETS
+    )
+    return [
+        node_id
+        for node_id in candidate_ids
+        if str(node_id) != str(source_id)
+        and _component_family_name(node_id, label_map) in allowed
+    ]
+
+
+def _valve_flowmeter_pair_allowed(
+    source_id: str,
+    target_id: str,
+    label_map: dict | None = None,
+) -> bool:
+    """True when a Valve/Flowmeter pair matches the strict mapping table."""
+    labels = dict(label_map or {})
+    source_name = _component_family_name(source_id, labels)
+    target_name = _component_family_name(target_id, labels)
+    source_family = _valve_or_flowmeter_family(source_name)
+    target_family = _valve_or_flowmeter_family(target_name)
+
+    def _ok(device_name: str, other_name: str, allowed: set[str]) -> bool:
+        return other_name in allowed
+
+    if source_family == "valve":
+        return _ok(source_name, target_name, _VALVE_CONNECTION_TARGETS)
+    if target_family == "valve":
+        return _ok(target_name, source_name, _VALVE_CONNECTION_TARGETS)
+    if source_family == "flowmeter":
+        return _ok(source_name, target_name, _FLOWMETER_CONNECTION_TARGETS)
+    if target_family == "flowmeter":
+        return _ok(target_name, source_name, _FLOWMETER_CONNECTION_TARGETS)
+    return True
+
+
+def _explicit_user_connection_ids_key(worksheet_id: int) -> str:
+    return f"explicit_user_connection_ids_{int(worksheet_id)}"
+
+
+def _remember_explicit_user_connection(worksheet_id: int, connection_id: str) -> None:
+    """Remember a pair the user chose in Required Connections."""
+    connection_id = str(connection_id or "").strip()
+    if not connection_id:
+        return
+    _remember_connection_record(worksheet_id, connection_id)
+    key = _explicit_user_connection_ids_key(worksheet_id)
+    stored = [
+        str(item)
+        for item in list(st.session_state.get(key) or [])
+        if str(item or "").strip()
+    ]
+    if connection_id in stored:
+        return
+    stored.append(connection_id)
+    st.session_state[key] = stored
+
+
+def _forget_explicit_user_connection(worksheet_id: int, *connection_ids: str) -> None:
+    banned = {str(item or "").strip() for item in connection_ids if str(item or "").strip()}
+    if not banned:
+        return
+    key = _explicit_user_connection_ids_key(worksheet_id)
+    stored = [
+        str(item)
+        for item in list(st.session_state.get(key) or [])
+        if str(item or "").strip() and str(item) not in banned
+    ]
+    st.session_state[key] = stored
+
+
+def _is_unsolicited_transmitter_pair(source_label: object, target_label: object) -> bool:
+    """True for Transmitter links that must wait for an explicit second pick."""
+    ends = (
+        _option_label_base(source_label),
+        _option_label_base(target_label),
+    )
+    if "Transmitter" not in ends:
+        return False
+    other = ends[0] if ends[1] == "Transmitter" else ends[1]
+    return other == "Linear Level Sensor (LLS)" or other.startswith("OHT Tank")
+
+
+def _unsolicited_transmitter_connection_ids(component_names) -> set[str]:
+    blocked: set[str] = set()
+    for option in allowed_connection_options(component_names):
+        if _is_unsolicited_transmitter_pair(
+            getattr(option, "source_label", ""),
+            getattr(option, "target_label", ""),
+        ):
+            option_id = str(getattr(option, "id", "") or "").strip()
+            if option_id:
+                blocked.add(option_id)
+    return blocked
+
+
 def _explicit_pair_connection_id(source_id: str, target_id: str) -> str:
     """Stable id for a pair the user selected in Required Connections."""
     return f"pair__{str(source_id).strip()}__to__{str(target_id).strip()}"
@@ -16760,6 +21952,52 @@ def _explicit_pair_endpoints(connection_id: str) -> tuple[str, str] | None:
     if not source_id or not target_id or source_id == target_id:
         return None
     return source_id, target_id
+
+
+def _live_component_node_ids(component_names) -> set[str]:
+    """Node ids for the components currently selected on the worksheet."""
+    try:
+        instances = component_catalog_module._selected_instances(list(component_names or []))
+    except Exception:
+        instances = []
+    return {
+        str(getattr(instance, "node_id", "") or "")
+        for instance in instances
+        if str(getattr(instance, "node_id", "") or "")
+    }
+
+
+def _merge_session_dict(key: str, updates: dict) -> dict:
+    """Update one session dictionary in place and keep every other key."""
+    merged = dict(st.session_state.get(key) or {})
+    for item_key, item_value in dict(updates or {}).items():
+        if isinstance(item_value, dict) and isinstance(merged.get(item_key), dict):
+            nested = dict(merged[item_key])
+            nested.update(item_value)
+            merged[item_key] = nested
+        else:
+            merged[item_key] = item_value
+    st.session_state[key] = merged
+    return merged
+
+
+def _retain_live_connections(connection_ids, component_names) -> list[str]:
+    """Keep the connection list that is already stored.
+
+    Adding or deleting a component must not rebuild this list from the catalog.
+    A delete removes only the links whose endpoint is the deleted component id
+    before this function runs.
+    """
+    del component_names
+    retained: list[str] = []
+    seen: set[str] = set()
+    for raw_id in list(connection_ids or []):
+        connection_id = str(raw_id or "").strip()
+        if not connection_id or connection_id in seen:
+            continue
+        seen.add(connection_id)
+        retained.append(connection_id)
+    return retained
 
 
 def _connection_id_endpoints(connection_id: str) -> tuple[str, str] | None:
@@ -16784,8 +22022,9 @@ def _ensure_selected_connection_edges(diagram, connection_ids):
     """Give every selected pair a direct edge when the diagram has none.
 
     Catalog rules and user pair ids both flow through here. A pair is skipped
-    only when an edge already joins those two components. This never invents a
-    pair the user did not select.
+    only when an edge already joins those two components. Topology-generated
+    branches may retain the pair's logical id without directly joining its
+    endpoints. This never invents a pair the user did not select.
     """
     from src.models import DiagramEdge
 
@@ -16800,12 +22039,7 @@ def _ensure_selected_connection_edges(diagram, connection_ids):
         edge_token = f"edge__{connection_id}"
         for edge in edges:
             edge_id = str(getattr(edge, "id", "") or "")
-            logical_parts = str(getattr(edge, "logical_edge_id", "") or "").split("|")
-            if (
-                connection_id in logical_parts
-                or edge_token in logical_parts
-                or edge_id in {connection_id, edge_token}
-            ):
+            if edge_id in {connection_id, edge_token}:
                 return True
             linked = (str(getattr(edge, "source", "") or ""), str(getattr(edge, "target", "") or ""))
             if linked == ends or linked == (ends[1], ends[0]):
@@ -16822,23 +22056,71 @@ def _ensure_selected_connection_edges(diagram, connection_ids):
             continue
         source_type = node_types.get(ends[0], "")
         target_type = node_types.get(ends[1], "")
-        channel = "sensor" if "sensor" in {source_type, target_type} else "control"
+        water_types = {"sump", "oht", "bore"}
+        water_prefixes = ("sump_", "oht_", "bore_", "well_")
+        inline_process_prefixes = ("mv_", "prv_", "nrv_", "ufm_", "ffm_", "emfm_")
+        source_id = str(ends[0])
+        target_id = str(ends[1])
+        # Never materialize disallowed Valve/Flowmeter edges (incl. auto tank links).
+        if not _valve_flowmeter_pair_allowed(source_id, target_id):
+            continue
+
+        def _is_water_endpoint(node_id: str, node_type: str) -> bool:
+            return node_type in water_types or any(
+                node_id.startswith(prefix) for prefix in water_prefixes
+            )
+
+        def _is_inline_process_endpoint(node_id: str, node_type: str) -> bool:
+            # Flow meters are catalogued as sensors but belong on the process line.
+            return node_type == "valve" or any(
+                node_id.startswith(prefix) for prefix in inline_process_prefixes
+            )
+
+        if (
+            source_type in water_types and target_type in water_types
+        ) or (
+            any(source_id.startswith(prefix) for prefix in water_prefixes)
+            and any(target_id.startswith(prefix) for prefix in water_prefixes)
+        ):
+            channel = "process"
+            label = "Water Flow"
+        elif (
+            _is_water_endpoint(source_id, source_type)
+            and _is_inline_process_endpoint(target_id, target_type)
+        ) or (
+            _is_inline_process_endpoint(source_id, source_type)
+            and _is_water_endpoint(target_id, target_type)
+        ):
+            channel = "process"
+            label = "Process Flow"
+        elif "sensor" in {source_type, target_type} and not (
+            _is_inline_process_endpoint(source_id, source_type)
+            or _is_inline_process_endpoint(target_id, target_type)
+        ):
+            channel = "sensor"
+            label = "Tank Sensor Link"
+        else:
+            channel = "control"
+            label = "Connection"
+        edge_uuid = str(uuid.uuid4())
         edges.append(
             DiagramEdge(
                 id=f"edge__{connection_id}",
                 source=ends[0],
                 target=ends[1],
-                label="Tank Sensor Link" if channel == "sensor" else "Connection",
+                label=label,
                 pipe_size="",
                 direction="source_to_target",
                 source_side="right",
                 target_side="left",
+                source_handle=f"{ends[0]}:right",
+                target_handle=f"{ends[1]}:left",
                 waypoints=[],
                 locked_route=True,
                 route_hint="direct",
                 topology_channel=channel,
                 topology_role="logical",
-                logical_edge_id=f"edge__{connection_id}",
+                logical_edge_id=f"edge__{connection_id}|{edge_uuid}",
                 confidence=1.0,
             )
         )
@@ -16852,12 +22134,20 @@ def _validate_required_connection_ids(
     expanded_components: list[str],
     candidate_connection_ids: list[str] | tuple[str, ...] | None,
 ) -> list[str]:
-    """Keep unique catalog connections and pairs the user explicitly selected.
+    """Keep unique catalog connections and already-chosen live endpoint pairs.
 
-    This never creates a pair from component presence. A pair id is kept only
-    when it was already chosen in Required Connections.
+    This never creates a pair from component presence. Existing user links whose
+    exact source/target instance ids are still on the worksheet are retained
+    even when the catalog option set for this run is temporarily incomplete.
     """
     valid_ids = _allowed_connection_id_set(expanded_components)
+    live_ids = {
+        str(getattr(instance, "node_id", "") or "").strip()
+        for instance in component_catalog_module._selected_instances(
+            list(expanded_components or [])
+        )
+        if str(getattr(instance, "node_id", "") or "").strip()
+    }
 
     validated: list[str] = []
     seen: set[str] = set()
@@ -16865,7 +22155,21 @@ def _validate_required_connection_ids(
         connection_id = str(raw_id or "").strip()
         if not connection_id or connection_id in seen:
             continue
-        if connection_id in valid_ids or _explicit_pair_endpoints(connection_id):
+        ends = _connection_endpoint_ids(connection_id) or _explicit_pair_endpoints(
+            connection_id
+        ) or _connection_id_endpoints(connection_id)
+        if ends is not None and not _valve_flowmeter_pair_allowed(ends[0], ends[1]):
+            continue
+        live_pair = (
+            ends is not None
+            and str(ends[0]) in live_ids
+            and str(ends[1]) in live_ids
+        )
+        if (
+            connection_id in valid_ids
+            or _explicit_pair_endpoints(connection_id)
+            or live_pair
+        ):
             seen.add(connection_id)
             validated.append(connection_id)
     return validated
@@ -16891,7 +22195,6 @@ _LOCAL_AUTOMATIC_REQUIREMENT_PROFILES = {
         "pairs": [
             ("Sump", "Master"),
             ("Sump", "OHT Tank"),
-            ("OHT Tank", "Transmitter"),
         ],
     },
     (0, 1, 1): {
@@ -16920,7 +22223,6 @@ _LOCAL_AUTOMATIC_REQUIREMENT_PROFILES = {
             ("Bore Well", "Sump"),
             ("Sump", "Master"),
             ("Sump", "OHT Tank"),
-            ("OHT Tank", "Transmitter"),
         ],
     },
     (0, 1, 2): {
@@ -17123,8 +22425,6 @@ def _requested_connection_ids_for_wireless_setup(
     add_first("Sump", "Master")
     add_first("Master", "Linear Level Sensor (LLS)", target_suffix=" 1")
     add_first("Sump", "OHT Tank")
-    add_first("OHT Tank", "Transmitter")
-    add_first("Transmitter", "Linear Level Sensor (LLS)", target_suffix=" 2")
 
     return _validate_required_connection_ids(
         expanded_components,
@@ -17200,6 +22500,14 @@ def generate_selected_components(
 ) -> None:
     """Build the selected diagram, auto-expanding wireless communication components."""
     worksheet_id = int(get_active_worksheet()["id"])
+    # Saved-project freeze: never rebuild topology/canvas/edges over the snapshot.
+    # Regenerating invented trunk/branch lines and grew the page (diagram looked
+    # smaller under fit_screen).
+    if st.session_state.get(f"_saved_project_routes_locked_{worksheet_id}") and not (
+        st.session_state.get(_saved_diagram_user_edit_key(worksheet_id))
+    ):
+        return
+    selected_connection_ids = _restore_connection_master(worksheet_id)
     deleted_connection_ids = {
         str(value)
         for value in st.session_state.get(
@@ -17245,6 +22553,20 @@ def generate_selected_components(
         previous_trained_requirement_components,
     )
 
+    # The auto-component tracker removes the last matching name. An explicit
+    # control-option selection must survive that cleanup on the same run, or
+    # the first click adds the component and this generation deletes it.
+    explicit_requirement_names = [
+        name
+        for name in _sanitize_requirement_components(
+            st.session_state.get("selected_requirement_components", []) or []
+        )
+        if name in list(selected_components or [])
+    ]
+    for component_name in explicit_requirement_names:
+        if component_name not in base_components:
+            base_components.append(component_name)
+
     # Restore the existing project-trained automatic requirement resolver.
     # It selects only exact approved profiles and never invents a relationship.
     trained_requirement_components = _automatic_requirement_components_compat(
@@ -17275,11 +22597,23 @@ def generate_selected_components(
     # Catalog ids and every pair the user picked in Required Connections.
     # Dropping a non-catalog id here is what made OHT Tank → sensor disappear
     # after the dropdown had already accepted it.
+    explicit_user_connection_ids = {
+        str(item)
+        for item in list(
+            st.session_state.get(_explicit_user_connection_ids_key(worksheet_id)) or []
+        )
+        if str(item or "").strip()
+    }
+    unsolicited_transmitter_ids = _unsolicited_transmitter_connection_ids(
+        base_components
+    )
     base_selected_connection_ids = [
         connection_id
         for connection_id in list(selected_connection_ids or [])
-        if connection_id in valid_base_connection_ids
-        or _explicit_pair_endpoints(connection_id)
+        if (
+            connection_id not in unsolicited_transmitter_ids
+            or connection_id in explicit_user_connection_ids
+        )
     ]
     base_transport_settings = {
         connection_id: _sanitize_connection_transport_setting(config)
@@ -17401,47 +22735,44 @@ def generate_selected_components(
         trained_requirement_pairs,
     )
 
-    # Restore the previously existing automatic connection-line generation.
-    # Keep every explicitly selected connection and every existing automatic
-    # wireless/unit relationship, then add only the trained water/process/tank
-    # relationships when the current Type/Distance/Interference setup activates
-    # the same automatic behavior used previously. No new relationship rule is
-    # introduced here; all IDs still come from allowed_connection_options().
-    automatic_water_labels = {
-        "water flow",
-        "process flow",
-        "tank inter-connection",
-    }
+    # Global guardrail: never invent connection lines. Only user-selected
+    # required connections and retained explicit/manual links may appear.
+    auto_connection_ids = []
+    requested_connection_ids = []
+    trained_requirement_connection_ids = []
+    auto_water_connection_ids = []
 
-    distance_explicitly_mentioned = any(
-        float(config.get("distance_km", 0.0) or 0.0) > 0.0
-        for config in base_transport_settings.values()
+    expanded_unsolicited_transmitter_ids = _unsolicited_transmitter_connection_ids(
+        expanded_components
     )
-
-    should_auto_generate_water = bool(
-        wireless_active or distance_explicitly_mentioned
-    )
-
-    auto_water_connection_ids = (
-        [
-            option.id
-            for option in _conservative_allowed_connection_options(expanded_components)
-            if str(
-                getattr(option, "connection_label", "") or ""
-            ).strip().lower()
-            in automatic_water_labels
-        ]
-        if should_auto_generate_water
-        else []
-    )
-
+    master_connection_ids = set(_connection_master(worksheet_id))
+    base_selected_connection_ids = [
+        connection_id
+        for connection_id in base_selected_connection_ids
+        if (
+            str(connection_id) in master_connection_ids
+            or str(connection_id) not in expanded_unsolicited_transmitter_ids
+            or str(connection_id) in explicit_user_connection_ids
+        )
+    ]
+    stored_connection_ids = [
+        str(connection_id)
+        for connection_id in list(st.session_state.get("selected_connections") or [])
+    ]
+    cleaned_connection_ids = [
+        connection_id
+        for connection_id in stored_connection_ids
+        if (
+            connection_id in master_connection_ids
+            or connection_id not in expanded_unsolicited_transmitter_ids
+            or connection_id in explicit_user_connection_ids
+        )
+    ]
+    if cleaned_connection_ids != stored_connection_ids:
+        st.session_state["selected_connections"] = cleaned_connection_ids
     merged_connection_ids = _validate_required_connection_ids(
         expanded_components,
-        list(base_selected_connection_ids)
-        + list(auto_connection_ids or [])
-        + list(requested_connection_ids or [])
-        + list(trained_requirement_connection_ids or [])
-        + list(auto_water_connection_ids or []),
+        list(base_selected_connection_ids),
     )
     merged_connection_ids = [
         connection_id
@@ -17449,6 +22780,26 @@ def generate_selected_components(
         if str(connection_id) not in deleted_connection_ids
         and f"edge__{connection_id}" not in deleted_connection_ids
     ]
+    retained_existing_connections = [
+        connection_id
+        for connection_id in _retain_live_connections(
+            list(st.session_state.get("selected_connections") or []),
+            expanded_components,
+        )
+        if connection_id not in deleted_connection_ids
+        and f"edge__{connection_id}" not in deleted_connection_ids
+    ]
+    seen_merged_connections = set(merged_connection_ids)
+    for connection_id in retained_existing_connections:
+        if connection_id in seen_merged_connections:
+            continue
+        if (
+            connection_id in expanded_unsolicited_transmitter_ids
+            and connection_id not in explicit_user_connection_ids
+        ):
+            continue
+        merged_connection_ids.append(connection_id)
+        seen_merged_connections.add(connection_id)
 
     # Persist communication expansion only when the strict condition succeeds.
     # Also persist cleanup when a previously auto-generated chain is no longer
@@ -17463,10 +22814,32 @@ def generate_selected_components(
         or bool(component_count_adjustments)
     ):
         st.session_state["selected_components"] = list(expanded_components)
-        st.session_state["selected_connections"] = merged_connection_ids
-        st.session_state["connection_transport_settings"] = dict(
-            expanded_transport_settings
+        # Union-only write: never shrink the live connection list on generate.
+        existing_live = [
+            str(item).strip()
+            for item in list(st.session_state.get("selected_connections") or [])
+            if str(item or "").strip()
+        ]
+        union_ids: list[str] = []
+        seen_union: set[str] = set()
+        for connection_id in list(merged_connection_ids) + existing_live:
+            token = str(connection_id or "").strip()
+            if (
+                not token
+                or token in seen_union
+                or token in deleted_connection_ids
+                or f"edge__{token}" in deleted_connection_ids
+            ):
+                continue
+            union_ids.append(token)
+            seen_union.add(token)
+        merged_connection_ids = union_ids
+        st.session_state["selected_connections"] = list(union_ids)
+        stored_transport_settings = dict(
+            st.session_state.get("connection_transport_settings", {}) or {}
         )
+        stored_transport_settings.update(dict(expanded_transport_settings or {}))
+        st.session_state["connection_transport_settings"] = stored_transport_settings
         if (
             (previous_auto_components and not wireless_active)
             or (
@@ -17523,6 +22896,10 @@ def generate_selected_components(
         ),
     )
     diagram = _ensure_selected_connection_edges(diagram, merged_connection_ids)
+    diagram = stable_identity_module.assign_diagram_stable_ids(
+        diagram,
+        get_active_worksheet(),
+    )
     render_outputs(diagram, defer_exports=True)
 
 
@@ -18033,6 +23410,11 @@ st.markdown(
 [class*="st-key-connection_interference_"] [data-baseweb="checkbox"] svg {
     color: #ffffff !important;
     fill: #ffffff !important;
+}
+
+/* Remove only the default block gap above the generated worksheet. */
+[class*="st-key-worksheet_canvas_"] {
+    margin-top: -1rem !important;
 }
 </style>
     """,
@@ -18590,6 +23972,7 @@ with left_col:
 
     _saved_ppt_paths = _saved_worksheet_ppt_files()
     _saved_ppt_names = [path.name for path in _saved_ppt_paths]
+    st.session_state["_saved_project_filenames"] = list(_saved_ppt_names)
 
     _saved_project_delete_target = Path(
         str(st.session_state.get("_saved_project_delete_target", "") or "")
@@ -18597,6 +23980,7 @@ with left_col:
     if _saved_project_delete_target not in _saved_ppt_names:
         _saved_project_delete_target = ""
         st.session_state.pop("_saved_project_delete_target", None)
+        st.session_state.pop("_saved_project_loaded_filename", None)
 
     with st.container(
         key=f"reference_component_heading_bar_{active_worksheet_id}"
@@ -18627,6 +24011,8 @@ with left_col:
                     if _saved_project_delete_target
                     else "Select a saved project first"
                 ),
+                on_click=_on_saved_project_delete,
+                args=(active_worksheet_id,),
             )
         with _saved_ppt_col:
             _selected_saved_ppt = st.selectbox(
@@ -18641,25 +24027,44 @@ with left_col:
                 disabled=not bool(_saved_ppt_names),
             )
 
-    if _delete_saved_project_clicked and _saved_project_delete_target:
-        st.session_state["_pending_saved_project_delete_confirm"] = (
-            _saved_project_delete_target
-        )
-        st.rerun()
+    # Start New PPT: ignore a stale/reapplied SAVED selection for this run only.
+    # Do not st.rerun() here — that caused an endless loop when Streamlit kept
+    # returning the just-archived filename, so Start New appeared to do nothing.
+    if st.session_state.pop("_block_saved_ppt_restore_once", False) or st.session_state.pop(
+        "_block_saved_ppt_restore_until_clear", False
+    ):
+        if _selected_saved_ppt:
+            st.session_state.pop(_saved_selector_key, None)
+            for _selector_key in list(st.session_state.keys()):
+                if str(_selector_key).startswith("saved_worksheet_ppt_selector_"):
+                    st.session_state.pop(_selector_key, None)
+            st.session_state.pop("_saved_project_delete_target", None)
+            st.session_state.pop("_saved_project_loaded_filename", None)
+            st.session_state.pop("_saved_ppt_load_message", None)
+            st.session_state["_reset_saved_worksheet_ppt_selector"] = True
+            _selected_saved_ppt = None
 
     if _selected_saved_ppt:
-        st.session_state["_saved_project_delete_target"] = Path(
-            str(_selected_saved_ppt)
-        ).name
-        _saved_ppt_loaded, _saved_ppt_message = _restore_saved_worksheet_ppt(
-            _selected_saved_ppt
-        )
-        st.session_state["_saved_ppt_load_message"] = (
-            bool(_saved_ppt_loaded),
-            str(_saved_ppt_message),
-        )
-        st.session_state["_reset_saved_worksheet_ppt_selector"] = True
-        st.rerun()
+        _selected_saved_name = Path(str(_selected_saved_ppt)).name
+        st.session_state["_saved_project_delete_target"] = _selected_saved_name
+        # Keep the exact library filename visible in Saved after open. Only load
+        # when the choice changes — clearing the selectbox was hiding the name.
+        if (
+            str(st.session_state.get("_saved_project_loaded_filename") or "")
+            != _selected_saved_name
+        ):
+            _saved_ppt_loaded, _saved_ppt_message = _restore_saved_worksheet_ppt(
+                _selected_saved_ppt
+            )
+            st.session_state["_saved_ppt_load_message"] = (
+                bool(_saved_ppt_loaded),
+                str(_saved_ppt_message),
+            )
+            if _saved_ppt_loaded:
+                st.session_state["_saved_project_loaded_filename"] = (
+                    _selected_saved_name
+                )
+            st.rerun()
 
     _saved_project_delete_message = st.session_state.pop(
         "_saved_project_delete_message",
@@ -18749,6 +24154,7 @@ with left_col:
         selected_components = list(
             st.session_state.get("selected_components", []) or []
         )
+        _mark_saved_diagram_user_edit(int(active_worksheet_id))
     else:
         selected_components = []
         for component_name in manual_component_names:
@@ -18756,9 +24162,9 @@ with left_col:
                 [component_name] * max(0, int(current_counts.get(component_name, 0)))
             )
 
-    if list(st.session_state.get("selected_components", []) or []) != selected_components:
-        st.session_state["selected_components"] = list(selected_components)
-        persist_active_worksheet_state()
+    # Do not write this base-only projection back yet. Persisting it would mark
+    # every other component removed and erase the connections that use them.
+    # The requirement merge below saves the combined list once.
 
     component_total_price_placeholder = None
 
@@ -18843,21 +24249,21 @@ with left_col:
                     seen_option_ids.add(option_id)
         valid_connection_ids = {option.id for option in connection_options}
 
-        filtered_connection_ids = [
-            connection_id
-            for connection_id in current_connection_ids
-            if connection_id in valid_connection_ids
-            or _explicit_pair_endpoints(connection_id)
-        ]
+        filtered_connection_ids = _retain_live_connections(
+            current_connection_ids,
+            selected_components,
+        )
         active_transport_setting = _active_connection_transport_setting(
             active_worksheet_id,
             current_transport_settings,
         )
 
+        retained_connection_id_set = set(filtered_connection_ids)
         filtered_transport_settings = {
             connection_id: _sanitize_connection_transport_setting(config)
             for connection_id, config in current_transport_settings.items()
-            if connection_id in valid_connection_ids
+            if connection_id in retained_connection_id_set
+            or connection_id in valid_connection_ids
         }
 
         # A newly added Tank/Unit can create additional valid connection
@@ -18900,12 +24306,10 @@ with left_col:
         candidate_signature = hashlib.sha256(
             "|".join(connection_ids_in_order + requirement_option_ids).encode("utf-8")
         ).hexdigest()[:12]
-        selected_connection_ids = [
-            connection_id
-            for connection_id in current_connection_ids
-            if connection_id in connection_ids_in_order
-            or _explicit_pair_endpoints(connection_id)
-        ]
+        selected_connection_ids = _retain_live_connections(
+            current_connection_ids,
+            selected_components,
+        )
 
         # Every component on the worksheet is listed, including ones added
         # automatically. Choosing a pair still uses the allowed-connection rules.
@@ -18931,16 +24335,34 @@ with left_col:
                 component_choice_labels[node_id] = f"{component_name} {instance_index}"
 
         live_component_ids = set(component_choice_ids)
-        selected_connection_ids = [
-            connection_id
-            for connection_id in selected_connection_ids
-            if connection_id in connection_ids_in_order
-            or (
-                (ends := _explicit_pair_endpoints(connection_id)) is not None
+        # Display/count filter only. Never write this filtered list back over
+        # session state — that was wiping unrelated OHT→LLS / Bore→SMC links.
+        filtered_connection_ids: list[str] = []
+        for connection_id in selected_connection_ids:
+            ends = _connection_endpoint_ids(connection_id) or _connection_id_endpoints(
+                connection_id
+            )
+            if ends is not None and not _valve_flowmeter_pair_allowed(
+                ends[0], ends[1], component_choice_labels
+            ):
+                continue
+            explicit_ends = _explicit_pair_endpoints(connection_id)
+            live_pair = (
+                ends is not None
                 and ends[0] in live_component_ids
                 and ends[1] in live_component_ids
             )
-        ]
+            if connection_id in connection_ids_in_order:
+                filtered_connection_ids.append(connection_id)
+            elif (
+                explicit_ends is not None
+                and explicit_ends[0] in live_component_ids
+                and explicit_ends[1] in live_component_ids
+            ):
+                filtered_connection_ids.append(connection_id)
+            elif live_pair:
+                filtered_connection_ids.append(connection_id)
+        selected_connection_ids = filtered_connection_ids
 
         component_choice_signature = hashlib.sha256(
             "|".join(component_choice_ids).encode("utf-8")
@@ -18957,35 +24379,76 @@ with left_col:
                     key=f"connection_from_{active_worksheet_id}_{candidate_signature}_{component_choice_signature}",
                     label_visibility="collapsed",
                 )
+            to_options = _permitted_connection_targets_for_source(
+                str(from_component or ""),
+                component_choice_ids,
+                component_choice_labels,
+            )
             with to_column:
                 to_component = st.selectbox(
                     "Connect to",
-                    options=component_choice_ids,
+                    options=to_options,
                     index=None,
-                    placeholder="Select Component",
+                    placeholder=(
+                        "Select permitted target"
+                        if from_component
+                        else "Select Component"
+                    ),
                     format_func=lambda node_id: component_choice_labels.get(node_id, node_id),
-                    key=f"connection_to_{active_worksheet_id}_{candidate_signature}_{component_choice_signature}",
+                    key=(
+                        f"connection_to_{active_worksheet_id}_{candidate_signature}_"
+                        f"{component_choice_signature}_{from_component or 'none'}"
+                    ),
                     label_visibility="collapsed",
+                    disabled=not bool(from_component),
                 )
             if from_component and to_component and from_component != to_component:
                 source_id = str(from_component)
                 target_id = str(to_component)
+                if not _valve_flowmeter_pair_allowed(
+                    source_id,
+                    target_id,
+                    component_choice_labels,
+                ):
+                    st.warning(
+                        "That Valve/Flowmeter pair is not allowed. "
+                        "Valves connect to Transmitter, VCT, or an OHT Tank; "
+                        "Flowmeters connect to DWG, VCT, Data Logger, Master, or an OHT Tank."
+                    )
+                    source_id = ""
+                    target_id = ""
                 tank_id = ""
                 sensor_id = ""
                 if source_id.startswith("oht_") and target_id.startswith("lls_"):
                     tank_id, sensor_id = source_id, target_id
                 elif source_id.startswith("lls_") and target_id.startswith("oht_"):
                     tank_id, sensor_id = target_id, source_id
-                chosen_connection_id = connection_by_pair.get(
-                    (str(from_component), str(to_component))
-                ) or connection_by_pair.get(
-                    (str(to_component), str(from_component))
-                )
-                if not chosen_connection_id:
-                    chosen_connection_id = _explicit_pair_connection_id(
-                        source_id,
-                        target_id,
+                chosen_connection_id = ""
+                if source_id and target_id:
+                    chosen_connection_id = connection_by_pair.get(
+                        (str(from_component), str(to_component))
+                    ) or connection_by_pair.get(
+                        (str(to_component), str(from_component))
                     )
+                if source_id and target_id and not chosen_connection_id:
+                    # Only invent a pair__ id for catalog-valid or unrestricted pairs.
+                    if _valve_or_flowmeter_family(
+                        _component_family_name(source_id, component_choice_labels)
+                    ) or _valve_or_flowmeter_family(
+                        _component_family_name(target_id, component_choice_labels)
+                    ):
+                        if _valve_flowmeter_pair_allowed(
+                            source_id, target_id, component_choice_labels
+                        ):
+                            chosen_connection_id = _explicit_pair_connection_id(
+                                source_id,
+                                target_id,
+                            )
+                    else:
+                        chosen_connection_id = _explicit_pair_connection_id(
+                            source_id,
+                            target_id,
+                        )
                 deleted_connection_ids = {
                     str(value)
                     for value in st.session_state.get(
@@ -18993,11 +24456,43 @@ with left_col:
                     )
                     or []
                 }
-                connection_is_live = bool(
-                    chosen_connection_id
-                    and chosen_connection_id not in deleted_connection_ids
-                    and f"edge__{chosen_connection_id}" not in deleted_connection_ids
-                )
+                if chosen_connection_id:
+                    deleted_connection_ids.difference_update(
+                        {
+                            str(chosen_connection_id),
+                            f"edge__{chosen_connection_id}",
+                        }
+                    )
+                    st.session_state[
+                        _deleted_connection_ids_key(active_worksheet_id)
+                    ] = sorted(deleted_connection_ids)
+                    _forget_deleted_connection_pair(
+                        active_worksheet_id,
+                        source_id,
+                        target_id,
+                    )
+                connection_is_live = bool(chosen_connection_id)
+                if connection_is_live:
+                    _remember_explicit_user_connection(
+                        active_worksheet_id,
+                        chosen_connection_id,
+                    )
+                if (
+                    connection_is_live
+                    and not tank_id
+                    and _node_pair_is_transmitter_lls(source_id, target_id)
+                ):
+                    sensor_only = (
+                        source_id if source_id.startswith("lls_") else target_id
+                    )
+                    oht_ids = [
+                        node_id
+                        for node_id in live_component_ids
+                        if str(node_id).startswith("oht_")
+                    ]
+                    if len(oht_ids) == 1:
+                        tank_id = oht_ids[0]
+                        sensor_id = sensor_only
                 if tank_id and sensor_id and connection_is_live:
                     embed_key = f"oht_sensor_embeds_{active_worksheet_id}"
                     embeds = [
@@ -19009,16 +24504,26 @@ with left_col:
                     if embed_pair not in embeds:
                         embeds.append(embed_pair)
                         st.session_state[embed_key] = embeds
-                if (
-                    connection_is_live
-                    and chosen_connection_id not in selected_connection_ids
-                ):
-                    selected_connection_ids.append(chosen_connection_id)
-                    st.session_state["selected_connections"] = list(
-                        selected_connection_ids
+                if connection_is_live:
+                    # Append onto the full session list only. Never assign the
+                    # filtered display list — that deleted independent edges.
+                    appended = _append_selected_connection(
+                        active_worksheet_id,
+                        chosen_connection_id,
+                        remember=True,
                     )
-                    persist_active_worksheet_state()
-                    st.rerun()
+                    if appended or chosen_connection_id not in selected_connection_ids:
+                        if chosen_connection_id not in selected_connection_ids:
+                            selected_connection_ids = [
+                                *selected_connection_ids,
+                                chosen_connection_id,
+                            ]
+                        _lock_visible_component_positions(active_worksheet_id)
+                        persist_active_worksheet_state()
+                        _store_connection_identity(
+                            active_worksheet_id,
+                            chosen_connection_id,
+                        )
 
         # The pair list is gone. This box only offers extra control components.
         configuration_choices = list(requirement_option_ids)
@@ -19028,42 +24533,38 @@ with left_col:
         # The second configuration/control box and its existing transport controls
         # are shown only after the user selects at least one base component.
         if base_selected_components and configuration_choices:
-            config_target = st.selectbox(
-                "Configure connection",
-                options=configuration_choices,
-                index=None,
-                placeholder="Select connection or control option...",
-                format_func=lambda option_id: (
+            _consume_pending_connection_control_selection(active_worksheet_id)
+            config_select_key = _connection_control_widget_key(active_worksheet_id)
+
+            def _format_connection_control_option(option_id: str) -> str:
+                if option_id == CONNECTION_CONTROL_PLACEHOLDER:
+                    return "Select connection or control option..."
+                return (
                     requirement_option_labels.get(option_id)
                     or connection_labels.get(option_id, option_id)
-                ),
-                key=(
-                    f"connection_config_target_{active_worksheet_id}_"
-                    f"{candidate_signature}"
-                ),
+                )
+
+            config_target = st.selectbox(
+                "Configure connection",
+                options=[CONNECTION_CONTROL_PLACEHOLDER, *configuration_choices],
+                format_func=_format_connection_control_option,
+                key=config_select_key,
+                on_change=_on_connection_control_option_change,
+                args=(int(active_worksheet_id),),
                 label_visibility="collapsed",
             )
-
+            current_requirement_components = _sanitize_requirement_components(
+                st.session_state.get("selected_requirement_components", []) or []
+            )
+            selected_components = list(
+                st.session_state.get("selected_components", []) or []
+            )
             requested_requirement_component = (
                 _requirement_component_from_option_id(config_target)
                 if config_target is not None
                 else None
             )
-            if requested_requirement_component is not None:
-                if requested_requirement_component not in current_requirement_components:
-                    current_requirement_components.append(requested_requirement_component)
-                    current_requirement_components = _sanitize_requirement_components(
-                        current_requirement_components
-                    )
-                    st.session_state["selected_requirement_components"] = list(
-                        current_requirement_components
-                    )
-                    if requested_requirement_component not in selected_components:
-                        selected_components.append(requested_requirement_component)
-                    st.session_state["selected_components"] = list(selected_components)
-                    persist_active_worksheet_state()
-                    st.rerun()
-            else:
+            if requested_requirement_component is None:
                 # Visibility-only behavior: once a base component is selected, keep
                 # the existing Type / Distance / Interference controls visible even
                 # before a specific connection/control target is chosen. Until a
@@ -19168,29 +24669,42 @@ with left_col:
                 for connection_id in connection_ids_in_order
             }
             selected_connection_ids_list = list(selected_connection_ids)
-            connection_state_changed = (
-                list(st.session_state.get("selected_connections", []) or [])
-                != selected_connection_ids_list
-                or dict(st.session_state.get("connection_transport_settings", {}) or {})
-                != sanitized_settings
+            stored_connections = list(
+                st.session_state.get("selected_connections", []) or []
             )
-            if connection_state_changed:
+            merged_connection_ids: list[str] = []
+            seen_connection_ids: set[str] = set()
+            for raw_connection_id in list(stored_connections) + list(selected_connection_ids_list):
+                connection_id = str(raw_connection_id or "").strip()
+                if not connection_id or connection_id in seen_connection_ids:
+                    continue
+                seen_connection_ids.add(connection_id)
+                merged_connection_ids.append(connection_id)
+            selected_connection_ids_list = merged_connection_ids
+            stored_transport = dict(
+                st.session_state.get("connection_transport_settings", {}) or {}
+            )
+            merged_transport = dict(stored_transport)
+            for connection_id, setting in sanitized_settings.items():
+                current_setting = dict(merged_transport.get(connection_id) or {})
+                current_setting.update(dict(setting or {}))
+                merged_transport[connection_id] = current_setting
+            if (
+                stored_connections != selected_connection_ids_list
+                or stored_transport != merged_transport
+            ):
                 st.session_state["selected_connections"] = selected_connection_ids_list
-                st.session_state["connection_transport_settings"] = sanitized_settings
+                _merge_session_dict("connection_transport_settings", sanitized_settings)
+                _lock_visible_component_positions(active_worksheet_id)
                 persist_active_worksheet_state()
 
         if not connection_options and selected_components:
-            kept_pairs = [
-                connection_id
-                for connection_id in list(
-                    st.session_state.get("selected_connections", []) or []
-                )
-                if _explicit_pair_endpoints(connection_id)
-            ]
-            if list(st.session_state.get("selected_connections", []) or []) != kept_pairs:
-                st.session_state["selected_connections"] = kept_pairs
-                if not kept_pairs:
-                    st.session_state["connection_transport_settings"] = {}
+            kept_connections = _retain_live_connections(
+                list(st.session_state.get("selected_connections", []) or []),
+                selected_components,
+            )
+            if list(st.session_state.get("selected_connections", []) or []) != kept_connections:
+                st.session_state["selected_connections"] = kept_connections
                 persist_active_worksheet_state()
 
 
@@ -19281,22 +24795,104 @@ elif selected_components:
         ).encode("utf-8")
     ).hexdigest()
 
-    # Keep the existing generation gate unchanged, but run it silently.
-    # Normal worksheet interactions no longer display or invoke any custom
-    # Worksheet update/loading event UI.
+    # One generation when the selection hash changes. Do not clear the hash
+    # again on later runs, or the worksheet loader stays up while generation
+    # restarts.
     if st.session_state.get("processed_hash") != current_hash:
-        try:
-            # Performance only: after the first successful render, ordinary
-            # component/connection/transport changes update the live Worksheet
-            # from the diagram model and defer PNG/PDF/PPT export work until it
-            # is actually requested. This reuses the existing fast path already
-            # used by Worksheet +/- actions.
-            if st.session_state.get("preview_png") is not None:
-                st.session_state[
-                    f"_fast_worksheet_component_change_{int(active_worksheet_id)}"
-                ] = True
+        _gen_worksheet_id = int(active_worksheet_id)
+        _routes_locked_for_generate = bool(
+            st.session_state.get(
+                f"_saved_project_routes_locked_{_gen_worksheet_id}"
+            )
+        )
+        _saved_diagram_user_edit = bool(
+            st.session_state.pop(
+                _saved_diagram_user_edit_key(_gen_worksheet_id),
+                False,
+            )
+        )
+        # Exact overwrite point: generate_selected_components rebuilt a different
+        # topology/canvas and invented trunk/branch edges. While Saved-locked,
+        # never regenerate — even if session diagram is briefly missing.
+        if _routes_locked_for_generate and not _saved_diagram_user_edit:
+            _freeze_comps = st.session_state.get(
+                _freeze_selected_components_key(_gen_worksheet_id)
+            )
+            _freeze_conns = st.session_state.get(
+                _freeze_selected_connections_key(_gen_worksheet_id)
+            )
+            if isinstance(_freeze_comps, list):
+                st.session_state["selected_components"] = list(_freeze_comps)
+                selected_components = list(_freeze_comps)
+            if isinstance(_freeze_conns, list):
+                st.session_state["selected_connections"] = list(_freeze_conns)
+                selected_connection_ids = list(_freeze_conns)
+            # Re-hydrate freeze-at-save diagram if session lost it before generate.
+            if st.session_state.get("diagram") is None:
+                try:
+                    _freeze_sheet = get_active_worksheet()
+                    if _freeze_sheet.get("diagram") is not None:
+                        st.session_state["diagram"] = _freeze_sheet.get("diagram")
+                except Exception:
+                    pass
+            _keep_hash = hashlib.sha256(
+                (
+                    f"selection|{'|'.join(selected_components)}|"
+                    f"connections|{'|'.join(sorted(selected_connection_ids))}|"
+                    f"transport|{transport_signature}|inline_flow|{inline_flow_signature}|"
+                    f"assets|{asset_signature}"
+                ).encode("utf-8")
+            ).hexdigest()
+            st.session_state["processed_hash"] = _keep_hash
+            try:
+                _active_sheet = get_active_worksheet()
+                _active_sheet["processed_hash"] = _keep_hash
+                if st.session_state.get("diagram") is not None:
+                    _active_sheet["diagram"] = st.session_state.get("diagram")
+                if isinstance(_freeze_comps, list):
+                    _active_sheet["selected_components"] = list(_freeze_comps)
+                if isinstance(_freeze_conns, list):
+                    _active_sheet["selected_connections"] = list(_freeze_conns)
+                if st.session_state.get("preview_png") is not None:
+                    _active_sheet["preview_png"] = st.session_state.get(
+                        "preview_png"
+                    )
+            except Exception:
+                pass
+        else:
+            if _routes_locked_for_generate and _saved_diagram_user_edit:
+                # Explicit user edit after Saved open — release freeze-at-save.
+                st.session_state.pop(
+                    f"_saved_project_routes_locked_{_gen_worksheet_id}",
+                    None,
+                )
+                st.session_state.pop(
+                    _saved_diagram_input_signature_key(_gen_worksheet_id),
+                    None,
+                )
+                st.session_state.pop(
+                    _freeze_selected_components_key(_gen_worksheet_id),
+                    None,
+                )
+                st.session_state.pop(
+                    _freeze_selected_connections_key(_gen_worksheet_id),
+                    None,
+                )
+                st.session_state.pop(
+                    _freeze_canvas_size_key(_gen_worksheet_id),
+                    None,
+                )
+            try:
+                # Performance only: after the first successful render, ordinary
+                # component/connection/transport changes update the live Worksheet
+                # from the diagram model and defer PNG/PDF/PPT export work until it
+                # is actually requested. This reuses the existing fast path already
+                # used by Worksheet +/- actions.
+                if st.session_state.get("preview_png") is not None:
+                    st.session_state[
+                        f"_fast_worksheet_component_change_{int(active_worksheet_id)}"
+                    ] = True
 
-            with st.spinner("Updating worksheet..."):
                 generate_selected_components(
                     selected_components,
                     selected_connection_ids,
@@ -19304,22 +24900,22 @@ elif selected_components:
                     inline_flow_meter_settings,
                 )
 
-            # Preserve the generated component list used by Price Details.
-            # On later navigation-only reruns, the manual component controls can
-            # temporarily rebuild selected_components from only Sump/Bore/OHT.
-            # This worksheet-specific cache keeps the already-generated priced
-            # components available without changing any generation/calculation.
-            st.session_state[
-                f"price_details_components_{int(active_worksheet_id)}"
-            ] = list(
-                st.session_state.get("selected_components", []) or []
-            )
+                # Preserve the generated component list used by Price Details.
+                # On later navigation-only reruns, the manual component controls can
+                # temporarily rebuild selected_components from only Sump/Bore/OHT.
+                # This worksheet-specific cache keeps the already-generated priced
+                # components available without changing any generation/calculation.
+                st.session_state[
+                    f"price_details_components_{int(active_worksheet_id)}"
+                ] = list(
+                    st.session_state.get("selected_components", []) or []
+                )
 
-            st.session_state["processed_hash"] = current_hash
-            persist_active_worksheet_state()
-        except Exception as exc:
-            log_app_error("Component selection / automatic diagram generation", exc)
-            show_friendly_error("generating the selected-component diagram")
+                st.session_state["processed_hash"] = current_hash
+                persist_active_worksheet_state()
+            except Exception as exc:
+                log_app_error("Component selection / automatic diagram generation", exc)
+                show_friendly_error("generating the selected-component diagram")
 else:
     # Nothing is selected and no sketch exists, therefore an earlier output should
     # not remain visible as if it still represented the current input state.
@@ -19330,6 +24926,9 @@ else:
     if st.session_state.get("diagram") is not None:
         reset_outputs()
 
+
+# The delete update has finished. Later saves may sync identities again.
+st.session_state.pop("_skip_connection_identity_sync", None)
 
 # Update only the requested selected-component total price.
 #
@@ -19375,6 +24974,7 @@ with center_col:
     worksheet_ids = [sheet["id"] for sheet in worksheets]
     worksheet_names = {sheet["id"]: sheet["name"] for sheet in worksheets}
 
+    # Download immediately to the right of Manual Draw.
     (
         title_col,
         worksheet_col,
@@ -19388,13 +24988,26 @@ with center_col:
         manual_draw_col,
         download_col,
     ) = st.columns(
-        [0.18, 0.24, 0.045, 0.10, 0.050, 0.040, 0.050, 0.045, 0.070, 0.12, 0.13],
+        [
+            0.20,
+            0.20,
+            0.045,
+            0.09,
+            0.045,
+            0.040,
+            0.045,
+            0.045,
+            0.065,
+            0.11,
+            0.06,
+        ],
         gap="small",
     )
 
     with title_col:
         st.markdown(
-            '<div class="panel-title" style="white-space:nowrap;overflow:visible;">3. Generated Diagram</div>',
+            '<div class="panel-title generated-diagram-toolbar-title">'
+            "3. Generated Diagram</div>",
             unsafe_allow_html=True,
         )
 
@@ -19438,6 +25051,13 @@ with center_col:
                 disabled=st.session_state.get("diagram") is None,
                 help="Save current worksheet",
             ):
+                try:
+                    _freeze_worksheet_layout_for_persistence(
+                        active_worksheet_id,
+                        mark_restored=True,
+                    )
+                except Exception as exc:
+                    log_app_error("Freeze layout before worksheet save", exc)
                 persist_active_worksheet_state()
                 _sync_pending_worksheet_render_if_needed(active_worksheet_id)
                 _sync_pending_ppt_if_needed(active_worksheet_id)
@@ -19474,13 +25094,17 @@ with center_col:
             st.rerun()
 
     with start_new_col:
-        if st.button(
+        # on_click runs at the start of the script run. Required because an
+        # earlier SAVED-selectbox path can st.rerun() before this button's
+        # `if st.button:` body would execute, which made the click look dead.
+        st.button(
             "Start New PPT",
             key="start_new_combined_ppt",
             use_container_width=True,
             help="Save the current project and open a separate blank PPT workspace",
-        ):
-            start_new_ppt_session()
+            on_click=_on_start_new_ppt_click,
+        )
+        if st.session_state.pop("_start_new_ppt_do_rerun", False):
             st.rerun()
 
     with delete_col:
@@ -19586,7 +25210,13 @@ with center_col:
 
     with download_col:
         if st.session_state.get("diagram") is not None:
-            with st.popover("⬇ Download", use_container_width=True):
+            with st.popover(
+                "",
+                icon=":material/download:",
+                use_container_width=True,
+                help="Download",
+                key=f"top_download_menu_{active_worksheet_id}",
+            ):
                 st.download_button(
                     "Download PNG",
                     _deferred_current_png_download(active_worksheet_id),
@@ -19605,9 +25235,11 @@ with center_col:
                 )
         else:
             st.button(
-                "⬇ Download",
+                "",
+                icon=":material/download:",
                 disabled=True,
                 use_container_width=True,
+                help="Download",
                 key=f"top_download_disabled_{active_worksheet_id}",
             )
 
