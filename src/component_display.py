@@ -14,23 +14,18 @@ __all__ = (
     "component_acronym_for_name",
 )
 
-# Core host components must always render as graphic icons — never acronym boxes.
-_ICON_ONLY_COMPONENT_NAMES = frozenset(
-    {
-        "Sump",
-        "Bore Well",
-        "OHT Tank",
-        # Legacy catalog aliases still present on older worksheets.
-        "OHT Tank with Valve",
-        "OHT Tank without Valve",
-    }
-)
-
 # Industrial label overrides used on schematic acronym plates.
 _DISPLAY_ACRONYM_OVERRIDES = {
     "MOTOR": "M",
     "TX": "Tx",
     "MASTER": "MST",
+}
+_COMPONENT_ACRONYMS = {
+    "sump": "SMP",
+    "bore well": "BWL",
+    "borewell": "BWL",
+    "oht": "OHT",
+    "oht tank": "OHT",
 }
 
 
@@ -43,9 +38,9 @@ def normalize_component_display_mode(value: object) -> str:
 
 
 def component_allows_acronym_display(component_name: object) -> bool:
-    """Return False for Sump / Bore Well / OHT Tank (graphic icons only)."""
+    """Return whether a named component can use the Acronym Box display."""
     name = str(component_name or "").strip()
-    return bool(name) and name not in _ICON_ONLY_COMPONENT_NAMES
+    return bool(name)
 
 
 def resolve_component_display_mode(*candidates: object, component_name: object = None) -> str:
@@ -53,7 +48,7 @@ def resolve_component_display_mode(*candidates: object, component_name: object =
 
     Accepts one or more candidate values (override, canvas sheet, payload field,
     or the toolbar Icons/Acronyms selection). Empty / missing candidates are skipped.
-    Core components (Sump, Bore Well, OHT Tank) are always forced to ``icons``.
+    Components with a usable name may be shown as Acronym Boxes.
     """
     if component_name is not None and not component_allows_acronym_display(component_name):
         return "icons"
@@ -72,6 +67,9 @@ def component_acronym_for_name(component_name: object) -> str:
     name = str(component_name or "").strip()
     if not name:
         return "?"
+    normalized_name = " ".join(name.casefold().split())
+    if normalized_name in _COMPONENT_ACRONYMS:
+        return _COMPONENT_ACRONYMS[normalized_name]
 
     code = ""
     try:

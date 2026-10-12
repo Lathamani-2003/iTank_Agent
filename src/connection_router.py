@@ -5642,6 +5642,212 @@ def _separate_route_from_components(
     return current
 
 
+def _header_component_kind(node) -> str:
+    """Classify the three components that share the top header."""
+    node_type = str(getattr(node, "node_type", "") or "").strip().lower()
+    label = str(getattr(node, "label", "") or "").strip().lower()
+    node_id = str(getattr(node, "id", "") or "").strip().lower()
+    if node_type == "sump" or node_id.startswith("sump_") or label.startswith("sump"):
+        return "sump"
+    if (
+        node_type == "bore"
+        or node_id.startswith("bore_")
+        or node_id.startswith("well_")
+        or "bore" in label
+        or label == "well"
+    ):
+        return "bore"
+    if node_type == "oht" or node_id.startswith("oht_") or label.startswith("oht"):
+        return "oht"
+    return ""
+
+
+def _clean_orthogonal_points(points: list[Point]) -> list[Point]:
+    cleaned: list[Point] = [points[0]]
+    for point in points[1:]:
+        previous = cleaned[-1]
+        if abs(point[0] - previous[0]) < 1e-6 and abs(point[1] - previous[1]) < 1e-6:
+            continue
+        cleaned.append(point)
+    return cleaned
+
+
+def shared_sump_oht_header_y(
+    boxes: Mapping[str, Box],
+    kinds: Mapping[str, str],
+    *,
+    canvas_height: float = 7.5,
+) -> float | None:
+    """One header Y shared by the sump riser and every OHT tank drop."""
+    tops: list[float] = []
+    for node_id, kind in dict(kinds or {}).items():
+        if str(kind or "") not in {"sump", "oht"}:
+            continue
+        box = boxes.get(str(node_id))
+        if box is None or len(box) < 4:
+            continue
+        tops.append(float(box[1]))
+    if not tops:
+        return None
+    gap = max(0.32, float(canvas_height or 7.5) * 0.045)
+    return max(0.18, min(tops) - gap)
+
+
+def water_loop_polyline(
+    source_box: Box,
+    target_box: Box,
+    source_kind: str,
+    target_kind: str,
+    *,
+    canvas_height: float = 7.5,
+    header_y: float | None = None,
+) -> list[Point] | None:
+    """Build the Sump header and Borewell return from the boxes on the canvas.
+
+    Coordinates come from the components' current boxes. A saved polyline is
+    not used here, so a reload cannot leave the loop at an old position.
+    When ``header_y`` is provided, every Sump→OHT branch shares that continuous
+    top header across all tanks.
+    """
+    pair = {str(source_kind or ""), str(target_kind or "")}
+    if pair == {"sump", "oht"}:
+        sump = source_box if source_kind == "sump" else target_box
+        tank = target_box if source_kind == "sump" else source_box
+        sx, sy, sw, _sh = (float(value) for value in sump)
+        tx, ty, tw, th = (float(value) for value in tank)
+        sump_x = sx + sw / 2.0
+        gap = max(0.32, float(canvas_height) * 0.045)
+        if header_y is None:
+            header_y = min(sy, ty) - gap
+        else:
+            header_y = min(float(header_y), min(sy, ty) - gap)
+        header_y = max(0.08, header_y)
+        tank_x = tx + tw / 2.0
+        # Match the visible OHT icon, which is inset below the layout-box top.
+        margin_y = max(0.02, (18.0 / 550.0) * float(canvas_height or 7.5))
+        inlet_y = min(ty + max(0.0, th) * 0.42, max(ty, margin_y))
+        # One continuous orthogonal run ending on the OHT inlet.
+        path = [
+            (sump_x, sy),
+            (sump_x, header_y),
+            (tank_x, header_y),
+            (tank_x, inlet_y),
+        ]
+        if source_kind != "sump":
+            path = list(reversed(path))
+        return _clean_orthogonal_points(path)
+    if pair == {"bore", "sump"}:
+        bore = source_box if source_kind == "bore" else target_box
+        sump = target_box if source_kind == "bore" else source_box
+        bx, by, bw, bh = (float(value) for value in bore)
+        sx, sy, sw, sh = (float(value) for value in sump)
+        # Each end is the center of that component's facing side, not a shared
+        # Y that can sit in the gap between the two boxes.
+        bore_point = (bx, by + bh / 2.0) if bx >= sx else (bx + bw, by + bh / 2.0)
+        sump_point = (sx + sw, sy + sh / 2.0) if (sx + sw) <= bx else (sx, sy + sh / 2.0)
+        if abs(bore_point[1] - sump_point[1]) <= 1e-3:
+            path = [bore_point, sump_point]
+        else:
+            mid_x = (bore_point[0] + sump_point[0]) / 2.0
+            path = [
+                bore_point,
+                (mid_x, bore_point[1]),
+                (mid_x, sump_point[1]),
+                sump_point,
+            ]
+        if source_kind != "bore":
+            path = list(reversed(path))
+        return _clean_orthogonal_points(path)
+    if pair == {"oht", "bore"}:
+        tank = source_box if source_kind == "oht" else target_box
+        bore = target_box if source_kind == "oht" else source_box
+        tx, ty, tw, th = (float(value) for value in tank)
+        bx, by, bw, bh = (float(value) for value in bore)
+        tank_x = tx + tw / 2.0
+        bore_y = by + bh / 2.0
+        bore_face = bx + bw if tank_x >= bx + bw else bx
+        points = [
+            (tank_x, ty + th),
+            (tank_x, bore_y),
+            (bore_face, bore_y),
+        ]
+        if source_kind != "oht":
+            points = list(reversed(points))
+        return _clean_orthogonal_points(points)
+    return None
+
+
+def sump_borewell_oht_header_routes(
+    diagram: DiagramSpec,
+    boxes: Mapping[str, Box],
+    *,
+    canvas_height: float = 7.5,
+) -> dict[int, list[Point]]:
+    """Draw the Sump→OHT header branches and optional Borewell return.
+
+    Every selected Sump→OHT Tank edge shares one continuous top header Y and
+    drops an orthogonal vertical into that tank's top port. Borewell→Sump
+    return geometry is included when a borewell is present. Points come from
+    the live component boxes.
+    """
+    kinds: dict[str, str] = {}
+    for node in getattr(diagram, "nodes", []) or []:
+        kind = _header_component_kind(node)
+        if kind:
+            kinds[str(node.id)] = kind
+    usable = {
+        node_id
+        for node_id, kind in kinds.items()
+        if kind and boxes.get(node_id) is not None and len(boxes.get(node_id) or ()) == 4
+    }
+    has_sump = any(kinds.get(node_id) == "sump" for node_id in usable)
+    has_oht = any(kinds.get(node_id) == "oht" for node_id in usable)
+    has_bore = any(kinds.get(node_id) == "bore" for node_id in usable)
+    if not has_sump or not has_oht:
+        return {}
+
+    header_y = shared_sump_oht_header_y(boxes, kinds, canvas_height=canvas_height)
+    routed: dict[int, list[Point]] = {}
+    for index, edge in enumerate(getattr(diagram, "edges", []) or []):
+        source = str(getattr(edge, "source", "") or "")
+        target = str(getattr(edge, "target", "") or "")
+        if source not in usable or target not in usable:
+            continue
+        source_kind = kinds.get(source, "")
+        target_kind = kinds.get(target, "")
+        pair = {source_kind, target_kind}
+        if pair == {"sump", "oht"}:
+            points = water_loop_polyline(
+                boxes[source],
+                boxes[target],
+                source_kind,
+                target_kind,
+                canvas_height=canvas_height,
+                header_y=header_y,
+            )
+        elif pair == {"bore", "sump"} and has_bore:
+            points = water_loop_polyline(
+                boxes[source],
+                boxes[target],
+                source_kind,
+                target_kind,
+                canvas_height=canvas_height,
+            )
+        elif pair == {"oht", "bore"} and has_bore:
+            points = water_loop_polyline(
+                boxes[source],
+                boxes[target],
+                source_kind,
+                target_kind,
+                canvas_height=canvas_height,
+            )
+        else:
+            continue
+        if points and len(points) >= 2:
+            routed[index] = points
+    return routed
+
+
 def _plan_fast_orthogonal_routes(
     diagram: DiagramSpec,
     boxes: Mapping[str, Box],

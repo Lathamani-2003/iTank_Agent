@@ -105,14 +105,7 @@ if normalize_component_display_mode is None:
 if component_allows_acronym_display is None:
 
     def component_allows_acronym_display(component_name: object) -> bool:
-        name = str(component_name or "").strip()
-        return name not in {
-            "Sump",
-            "Bore Well",
-            "OHT Tank",
-            "OHT Tank with Valve",
-            "OHT Tank without Valve",
-        }
+        return bool(str(component_name or "").strip())
 
 if resolve_component_display_mode is None:
 
@@ -137,6 +130,16 @@ if component_acronym_for_name is None:
 
     def component_acronym_for_name(component_name: object) -> str:
         name = str(component_name or "").strip()
+        normalized_name = " ".join(name.casefold().split())
+        component_acronyms = {
+            "sump": "SMP",
+            "bore well": "BWL",
+            "borewell": "BWL",
+            "oht": "OHT",
+            "oht tank": "OHT",
+        }
+        if normalized_name in component_acronyms:
+            return component_acronyms[normalized_name]
         return name[:3].upper() if name else "?"
 
 from src.ppt_template_manager import (
@@ -2924,7 +2927,7 @@ div[data-testid="stHorizontalBlock"]:has(
    ============================================================ */
 [class*="st-key-worksheet_canvas_"]
 [data-testid="stElementContainer"]:has([data-testid="stCustomComponentV1"]) {
-    transform: translateY(-10px) !important;
+    transform: translateY(-76px) !important;
 }
 
 
@@ -10690,6 +10693,8 @@ def _add_component_instance_from_worksheet(
             f"_fast_worksheet_component_change_{int(active_worksheet_id)}"
         ] = True
 
+    _mark_saved_diagram_user_edit(int(active_worksheet_id))
+
     # Force only the existing diagram generation gate to see this Worksheet
     # component change even when the compact manual selection itself is unchanged.
     st.session_state.pop("processed_hash", None)
@@ -11772,7 +11777,7 @@ def _apply_worksheet_component_display_mode(worksheet_id: int, mode: object) -> 
         existing = dict(overrides.get(node_id) or {})
         previous = dict(sheet.get(node_id) or {})
         component_name = existing.get("component") or previous.get("component") or ""
-        # Never push acronym mode onto Sump / Bore Well / OHT Tank.
+        # Resolve the display mode for each component before publishing it.
         existing["display_mode"] = resolve_component_display_mode(
             display_mode,
             component_name=component_name,
@@ -11815,7 +11820,7 @@ def _record_component_display_mode(worksheet_id: int, event: dict) -> bool:
         or previous.get("component")
         or ""
     )
-    # Sump / Bore Well / OHT Tank never persist as acronym boxes.
+    # Keep the component's display choice in sync with its canvas state.
     display_mode = resolve_component_display_mode(
         event.get("display_mode"),
         component_name=component_name,
@@ -14684,7 +14689,7 @@ def _render_blank_worksheet_structure(worksheet_id: int) -> bool:
         edit_mode=False,
         drag_only=True,
         fit_screen=True,
-        fixed_screen_height=700,
+        fixed_screen_height=550,
         expanded=False,
         initial_selected_edge=None,
         pending_connection_source_id=None,
@@ -16085,6 +16090,70 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
     )
     _purge_unsolicited_dotted_routes(worksheet_id, normal_routes)
 
+    route_geometry_key = _saved_worksheet_route_geometry_key(worksheet_id)
+    saved_route_geometry = st.session_state.get(route_geometry_key)
+    if _saved_routes_locked and isinstance(saved_route_geometry, list):
+        normal_routes = copy.deepcopy(saved_route_geometry)
+        deleted_edge_ids = {
+            str(value)
+            for value in st.session_state.get(
+                _deleted_connection_ids_key(worksheet_id), []
+            )
+            or []
+        }
+        for saved_route in normal_routes:
+            if not isinstance(saved_route, dict):
+                continue
+            edge_id = str(saved_route.get("edge_id") or "")
+            source_id = str(saved_route.get("source") or "")
+            target_id = str(saved_route.get("target") or "")
+            aliases = (
+                edge_id,
+                edge_id[6:] if edge_id.startswith("edge__") else f"edge__{edge_id}",
+            )
+            is_deleted = (
+                any(alias in deleted_edge_ids for alias in aliases)
+                or _connection_pair_is_deleted(
+                    worksheet_id,
+                    source_id,
+                    target_id,
+                )
+            )
+            has_saved_geometry = (
+                isinstance(saved_route.get("points"), (list, tuple))
+                and len(saved_route["points"]) >= 2
+            )
+            if not has_saved_geometry:
+                override = next(
+                    (
+                        route_overrides.get(alias)
+                        for alias in aliases
+                        if alias in route_overrides
+                    ),
+                    None,
+                )
+                if isinstance(override, (list, tuple)):
+                    override = {"points": override}
+                if isinstance(override, dict):
+                    points = override.get("points")
+                    if isinstance(points, (list, tuple)) and len(points) >= 2:
+                        saved_route["points"] = copy.deepcopy(points)
+                        saved_route["original_points"] = copy.deepcopy(points)
+                    if "hidden" in override:
+                        saved_route["hidden"] = bool(override.get("hidden"))
+                    if override.get("direction"):
+                        saved_route["direction"] = str(override["direction"])
+            if is_deleted:
+                saved_route["hidden"] = True
+            saved_route["custom"] = True
+            saved_route["stored_geometry"] = True
+            saved_route["manual_drag"] = True
+        st.session_state[route_geometry_key] = copy.deepcopy(normal_routes)
+    else:
+        # Capture the final Worksheet payload after server-side routing helpers
+        # have run. This includes generated routes that have no manual override.
+        st.session_state[route_geometry_key] = copy.deepcopy(normal_routes)
+
     # Wireless visual marker only. The Wi-Fi symbol follows the user's explicit
     # Wireless mode selection only. Automatic and Wired must never display it,
     # even if an older/generated edge still carries wireless metadata.
@@ -16431,7 +16500,7 @@ def _render_normal_diagram_preview(preview_png: bytes, diagram, worksheet_id: in
         # inside the enlarged Worksheet viewport so no selected component image
         # is clipped or pushed outside the visible zoomed area.
         fit_screen=True,
-        fixed_screen_height=700,
+        fixed_screen_height=550,
         # The Streamlit dialog already provides the Zoom In/expanded UI.
         # Keep the editor surface in its normal coordinate mode inside that larger
         # viewport so component images, labels and routes are not shifted/clipped.
@@ -17081,6 +17150,10 @@ def _manual_edit_signature_key(worksheet_id: int) -> str:
 
 def _manual_connection_overrides_key(worksheet_id: int) -> str:
     return f"manual_connection_overrides_{int(worksheet_id)}"
+
+
+def _saved_worksheet_route_geometry_key(worksheet_id: int) -> str:
+    return f"_saved_worksheet_route_geometry_{int(worksheet_id)}"
 
 
 def _deleted_connection_ids_key(worksheet_id: int) -> str:
@@ -18311,6 +18384,7 @@ def _saved_project_auxiliary_state_keys(worksheet_id: int) -> tuple[str, ...]:
         _manual_edit_png_key(worksheet_id),
         _manual_edit_signature_key(worksheet_id),
         _manual_connection_overrides_key(worksheet_id),
+        _saved_worksheet_route_geometry_key(worksheet_id),
         _deleted_connection_ids_key(worksheet_id),
         _deleted_connection_pairs_key(worksheet_id),
         _manual_component_overrides_key(worksheet_id),
@@ -20777,6 +20851,7 @@ def _restore_saved_worksheet_ppt(ppt_filename: str) -> tuple[bool, str]:
         _manual_edit_png_key(worksheet_id),
         _manual_edit_signature_key(worksheet_id),
         _manual_connection_overrides_key(worksheet_id),
+        _saved_worksheet_route_geometry_key(worksheet_id),
         _deleted_connection_ids_key(worksheet_id),
         _deleted_connection_pairs_key(worksheet_id),
         _manual_component_overrides_key(worksheet_id),
@@ -21263,6 +21338,7 @@ def start_new_ppt_session() -> None:
                 "_persisted_component_placement_index_",
                 "_canvas_live_components_",
                 "_saved_project_routes_locked_",
+                "_saved_worksheet_route_geometry_",
                 "_last_worksheet_geometry_",
                 "_auto_layout_component_ids_",
                 "_auto_layout_rule_",
@@ -23412,10 +23488,47 @@ st.markdown(
     fill: #ffffff !important;
 }
 
-/* Remove only the default block gap above the generated worksheet. */
+/* Keep the Worksheet canvas in its previous position within Generated Diagram. */
 [class*="st-key-worksheet_canvas_"] {
-    margin-top: -1rem !important;
+    margin-top: 0 !important;
 }
+
+/* Match Worksheet and Price Details page surfaces to the Welcome sheet. */
+[class*="st-key-worksheet_canvas_"]
+[data-testid="stElementContainer"]:has([data-testid="stCustomComponentV1"]) {
+    position: absolute !important;
+    top: 15px !important;
+    left: 0 !important;
+    right: 0 !important;
+    width: auto !important;
+    height: 550px !important;
+    min-height: 550px !important;
+    max-height: 550px !important;
+    transform: none !important;
+    overflow: hidden !important;
+}
+
+[class*="st-key-worksheet_canvas_"] [data-testid="stCustomComponentV1"],
+[class*="st-key-worksheet_canvas_"] [data-testid="stCustomComponentV1"] > div,
+[class*="st-key-worksheet_canvas_"] [data-testid="stCustomComponentV1"] iframe {
+    height: 550px !important;
+    min-height: 550px !important;
+    max-height: 550px !important;
+}
+
+[class*="st-key-worksheet_canvas_"]
+[data-testid="stElementContainer"]:has(.rts-price-page) {
+    position: absolute !important;
+    top: 15px !important;
+    left: 15px !important;
+    right: 15px !important;
+    width: auto !important;
+    height: 550px !important;
+    min-height: 550px !important;
+    max-height: 550px !important;
+    overflow: hidden !important;
+}
+
 </style>
     """,
     unsafe_allow_html=True,

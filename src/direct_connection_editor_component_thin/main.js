@@ -18,7 +18,6 @@
   };
   let dragOnlyWindowListeners=[];
   let dragOnlyRouteAction=null;
-  let dragOnlyResizeObserver=null;
   let appliedAutoRouteToken="";
   const worksheetTools={setManualDraw(){}};
   // Module-level drag lock: Streamlit remounts must not tear down an active
@@ -27,8 +26,7 @@
   let liveComponentDragWindowListeners=[];
 
   function componentAllowsAcronymDisplay(component){
-    // Sump / Bore Well / OHT Tank must always stay graphic icons.
-    return !isPrimaryCanvasComponent(component);
+    return !!(component&&String(component.component||"").trim());
   }
   function componentDisplayMode(component){
     if(!componentAllowsAcronymDisplay(component))return"icons";
@@ -2856,11 +2854,6 @@
       window.removeEventListener(type,listener);
     }
     dragOnlyWindowListeners=[];
-    if(dragOnlyResizeObserver){
-      dragOnlyResizeObserver.disconnect();
-      dragOnlyResizeObserver=null;
-    }
-
     const addDragOnlyWindowListener=(type,listener)=>{
       window.addEventListener(type,listener);
       dragOnlyWindowListeners.push([type,listener]);
@@ -2876,9 +2869,8 @@
 
     const [cw,ch]=canvasSize();
 
-    // Worksheet fill fix only:
-    // Use the same standard height as the Worksheet container so the
-    // aspect-preserving diagram fit is stable after project restoration.
+    // Keep the renderer height fixed; the stage fills this viewport regardless
+    // of the logical canvas aspect ratio after a component-selection rerun.
     const rawFixedHeight=Number(argsState.fixed_screen_height);
     const hasFixedHeight=Number.isFinite(rawFixedHeight)&&rawFixedHeight>0;
     const fixedScreenHeight=hasFixedHeight?Math.max(1,rawFixedHeight):0;
@@ -2894,30 +2886,9 @@
 
     const stage=document.createElement("div");
     stage.style.cssText=argsState.fit_screen
-      ? "position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);overflow:hidden;touch-action:none;user-select:none;"
+      ? "position:absolute;inset:0;width:100%;height:100%;overflow:hidden;touch-action:none;user-select:none;"
       : `position:relative;width:100%;aspect-ratio:${cw}/${ch};overflow:hidden;touch-action:none;user-select:none;`;
     root.appendChild(stage);
-    if(argsState.fit_screen){
-      const fitStageToViewport=()=>{
-        const bounds=root.getBoundingClientRect();
-        const logicalWidth=Math.max(1,Number(cw)||1);
-        const logicalHeight=Math.max(1,Number(ch)||1);
-        const scale=Math.min(
-          bounds.width/logicalWidth,
-          bounds.height/logicalHeight
-        );
-        if(!Number.isFinite(scale)||scale<=0)return;
-        stage.style.width=`${logicalWidth*scale}px`;
-        stage.style.height=`${logicalHeight*scale}px`;
-      };
-      fitStageToViewport();
-      addDragOnlyWindowListener("resize",fitStageToViewport);
-      if(typeof ResizeObserver==="function"){
-        dragOnlyResizeObserver=new ResizeObserver(fitStageToViewport);
-        dragOnlyResizeObserver.observe(root);
-      }
-      requestAnimationFrame(fitStageToViewport);
-    }
 
     const bg=document.createElement("img");
     bg.src=`data:image/png;base64,${argsState.image_b64||""}`;
@@ -4198,9 +4169,6 @@
         forceUnifiedFluidHeader();
         forceBoreSumpReturn();
         purgeUnsolicitedDottedRoutes();
-      }else{
-        hideEmbeddedOhtSensorRoutes();
-        bindLoadedConnectionGeometry();
       }
       for(const route of Object.values(routes)){
         if(route.hidden||routeLinksEmbeddedOhtSensor(route))continue;
@@ -6843,7 +6811,7 @@
       seedInternalSensorTransmitterLines();
       rebuildRouteConnectionIndex();
       // Saved-project freeze: server payload is the source of truth. Do not
-      // restore a stale browser draft or regenerate water-loop geometry.
+      // restore a stale browser draft or regenerate saved component/route geometry.
       if(argsState.freeze_saved_geometry){
         try{
           const key=movementDraftStorageKey();
@@ -6851,23 +6819,15 @@
         }catch(_){}
       }else{
         restoreMovementDraft();
-      }
-      seatInlinePipeSymbols();
-      prepareOhtTankSensorAttachments();
-      applyClickedOhtSensorEmbeds();
-      if(!argsState.freeze_saved_geometry){
+        seatInlinePipeSymbols();
+        prepareOhtTankSensorAttachments();
+        applyClickedOhtSensorEmbeds();
         separateComponentsFromTanks();
-      }
-      if(!argsState.freeze_saved_geometry){
         seatInlineDevicesOnOhtDrops();
         forceDottedOhtTransmitterOntoSensor();
-      }
-      hideEmbeddedOhtSensorRoutes();
-      if(!argsState.freeze_saved_geometry){
+        hideEmbeddedOhtSensorRoutes();
         forceUnifiedFluidHeader();
         forceBoreSumpReturn();
-      }
-      if(!argsState.freeze_saved_geometry){
         purgeUnsolicitedDottedRoutes();
       }
     }

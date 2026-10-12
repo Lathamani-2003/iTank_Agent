@@ -470,15 +470,31 @@ def _node_is_inline_pipe_symbol(node) -> bool:
     return "flow meter" in label or "flowmeter" in label
 
 
-def _compact_inline_pipe_boxes(diagram: DiagramSpec, boxes: dict) -> dict:
-    """Keep a dragged symbol where it is, and draw it at the compact pipe size."""
+def _compact_inline_pipe_boxes(
+    diagram: DiagramSpec,
+    boxes: dict,
+    manual_component_overrides: dict | None = None,
+) -> dict:
+    """Compact automatic inline symbols without changing saved component boxes."""
     result = dict(boxes or {})
+    overrides = dict(manual_component_overrides or {})
     width, height = _INLINE_PIPE_SIZE
     for node in list(getattr(diagram, "nodes", []) or []):
         node_id = str(getattr(node, "id", "") or "")
         box = result.get(node_id)
         if box is None or len(box) != 4 or not _node_is_inline_pipe_symbol(node):
             continue
+        override = overrides.get(node_id)
+        if isinstance(override, dict):
+            raw_box = override.get("box")
+            if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
+                try:
+                    if all(math.isfinite(float(value)) for value in raw_box) and (
+                        float(raw_box[2]) > 0 and float(raw_box[3]) > 0
+                    ):
+                        continue
+                except (TypeError, ValueError):
+                    pass
         left, top, box_w, box_h = [float(value) for value in box]
         center_x = left + box_w / 2.0
         center_y = top + box_h / 2.0
@@ -6895,6 +6911,71 @@ def _apply_manual_route_overrides(diagram: DiagramSpec, routes, manual_route_ove
     return result
 
 
+def _point_on_box_edge(point, box, tolerance: float = 0.12) -> bool:
+    """True when a route end sits on the current component outline."""
+    if point is None or box is None or len(box) != 4:
+        return False
+    try:
+        x, y, width, height = (float(value) for value in box)
+        px, py = float(point[0]), float(point[1])
+    except (TypeError, ValueError, IndexError):
+        return False
+    if width <= 0 or height <= 0:
+        return False
+    if not (x - tolerance <= px <= x + width + tolerance and y - tolerance <= py <= y + height + tolerance):
+        return False
+    return (
+        abs(px - x) <= tolerance
+        or abs(px - (x + width)) <= tolerance
+        or abs(py - y) <= tolerance
+        or abs(py - (y + height)) <= tolerance
+    )
+
+
+def _box_port(box, toward) -> tuple[float, float]:
+    x, y, width, height = (float(value) for value in box)
+    center_x = x + width / 2.0
+    center_y = y + height / 2.0
+    dx = float(toward[0]) - center_x
+    dy = float(toward[1]) - center_y
+    if abs(dx) >= abs(dy):
+        return (x + width, center_y) if dx >= 0 else (x, center_y)
+    return (center_x, y + height) if dy >= 0 else (center_x, y)
+
+
+def _bind_open_route_to_boxes(points, source_box, target_box):
+    """Move a saved line's ends onto the components' current boxes."""
+    if not points or len(points) < 2:
+        return points
+    bound = [(float(point[0]), float(point[1])) for point in points]
+
+    def _attach(is_source: bool):
+        box = source_box if is_source else target_box
+        end = bound[0] if is_source else bound[-1]
+        if box is None or len(box) != 4 or _point_on_box_edge(end, box):
+            return
+        other = bound[1] if is_source else bound[-2]
+        port = _box_port(box, other)
+        if abs(port[0] - other[0]) > 1e-3 and abs(port[1] - other[1]) > 1e-3:
+            if abs(port[0] - other[0]) >= abs(port[1] - other[1]):
+                corner = (other[0], port[1])
+            else:
+                corner = (port[0], other[1])
+            if is_source:
+                bound[:] = [port, corner, *bound[1:]]
+            else:
+                bound[:] = [*bound[:-1], corner, port]
+            return
+        if is_source:
+            bound[0] = port
+        else:
+            bound[-1] = port
+
+    _attach(True)
+    _attach(False)
+    return bound
+
+
 def _effective_edge_direction(edge, manual_route_overrides=None) -> str:
     config = _manual_route_config(manual_route_overrides, str(getattr(edge, "id", "")))
     direction = str(config.get("direction", "") or "").strip()
@@ -7178,7 +7259,11 @@ def get_preview_route_geometry(
         boxes, hidden_component_ids = _apply_manual_component_overrides(
             boxes, manual_component_overrides
         )
-        boxes = _compact_inline_pipe_boxes(diagram, boxes)
+        boxes = _compact_inline_pipe_boxes(
+            diagram,
+            boxes,
+            manual_component_overrides,
+        )
         boxes, components_were_moved = _shift_junctions_with_moved_components(
             diagram, boxes, base_boxes
         )
